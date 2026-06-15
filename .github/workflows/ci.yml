@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all
+      - name: Failpoint tests
+        run: cargo test -p zydecodb-engine --features failpoints --test crash_matrix --test resilience_failpoints -- --test-threads=1
+      - name: Coverage (informational)
+        continue-on-error: true
+        run: |
+          cargo install cargo-llvm-cov --locked || true
+          cargo llvm-cov -p zydecodb-engine --summary-only || true
+  python-driver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build server
+        run: cargo build -p zydecodb --bin zydecodb
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install driver + test deps
+        working-directory: clients/python
+        run: pip install -e ".[dev]"
+      - name: Unit tests (no server)
+        working-directory: clients/python
+        run: pytest -q tests/test_protocol.py
+      - name: Start ZydecoDB
+        run: |
+          mkdir -p /tmp/zdb/data /tmp/zdb/wal
+          {
+            echo 'listen = "127.0.0.1:9470"'
+            echo 'data_dir = "/tmp/zdb/data"'
+            echo 'wal_dir = "/tmp/zdb/wal"'
+            echo 'block_cache_mb = 64'
+            echo 'max_open_readers = 32'
+            echo 'poll_compaction_ms = 50'
+            echo 'durability = "sync"'
+            echo '[security]'
+            echo 'require_auth = "false"'
+            echo 'keys_file = "/tmp/zdb/keys.toml"'
+          } > /tmp/zdb.toml
+          ./target/debug/zydecodb serve --config /tmp/zdb.toml &
+          echo $! > /tmp/zdb.pid
+          for _ in $(seq 1 50); do
+            (exec 3<>/dev/tcp/127.0.0.1/9470) >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+      - name: Integration tests (live server)
+        working-directory: clients/python
+        env:
+          ZYDECODB_TEST_HOST: 127.0.0.1
+          ZYDECODB_TEST_PORT: "9470"
+        run: pytest -q
+      - name: Stop ZydecoDB
+        if: always()
+        run: kill "$(cat /tmp/zdb.pid)" || true
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz smoke (1000 runs each)
+        run: |
+          for t in wal_parser sstable_reader manifest_parser ipc_envelope; do
+            cargo fuzz run "$t" -- -runs=1000 -max_total_time=60
+          done
+        working-directory: fuzz
+  miri:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - run: cargo miri test -p zydecodb-engine
