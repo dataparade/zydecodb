@@ -100,6 +100,13 @@ enum AdminCommands {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Rewrite on-disk SSTables to the current format (offline). Accelerates the
+    /// migration that background compaction performs over time; legacy-format
+    /// files remain readable in the meantime.
+    Upgrade {
+        #[arg(long, short)]
+        config: PathBuf,
+    },
     /// Restore from a base snapshot + shipped WAL to a point in time.
     Restore {
         /// Base snapshot directory (from `admin snapshot`).
@@ -251,6 +258,7 @@ fn main() {
                 }
             },
             AdminCommands::Snapshot { config, out } => zydecodb::admin::snapshot(&config, &out),
+            AdminCommands::Upgrade { config } => zydecodb::admin::upgrade(&config),
             AdminCommands::Restore {
                 base,
                 wal,

@@ -144,6 +144,65 @@ pub fn snapshot(config: &Path, out: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Count live SSTables by on-disk format, reading each footer offline.
+/// Returns `(current, legacy)`. Files that don't parse as SSTables (partials,
+/// stray files) are skipped.
+fn count_sstable_versions(data_dir: &Path) -> Result<(usize, usize), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use zydecodb_engine::sstable;
+
+    let mut current = 0usize;
+    let mut legacy = 0usize;
+    for entry in std::fs::read_dir(data_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().ends_with(".sst") {
+            continue;
+        }
+        let mut f = std::fs::File::open(entry.path()).map_err(|e| e.to_string())?;
+        let len = f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+        if (len as usize) < sstable::FOOTER_LEN {
+            continue;
+        }
+        f.seek(SeekFrom::End(-(sstable::FOOTER_LEN as i64)))
+            .map_err(|e| e.to_string())?;
+        let mut footer = vec![0u8; sstable::FOOTER_LEN];
+        f.read_exact(&mut footer).map_err(|e| e.to_string())?;
+        match sstable::parse_footer(&footer) {
+            Ok(ft) if ft.version >= sstable::FORMAT_VERSION => current += 1,
+            Ok(_) => legacy += 1,
+            Err(_) => {}
+        }
+    }
+    Ok((current, legacy))
+}
+
+/// Rewrite on-disk SSTables to the current format by forcing a full compaction
+/// (offline). Legacy-format files are readable regardless; this just accelerates
+/// the rewrite that background compaction performs over time. Reports how many
+/// files remain in a legacy format afterward (some settled, non-overlapping
+/// files may not be picked by the planner and are rewritten later organically).
+pub fn upgrade(config: &Path) -> Result<(), String> {
+    let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
+    let data_dir = cfg.data_dir.clone();
+    let mut engine = Engine::open(engine_cfg_from(&cfg)).map_err(|e| e.to_string())?;
+    engine.compact_all().map_err(|e| e.to_string())?;
+    engine.shutdown().map_err(|e| e.to_string())?;
+
+    let (current, legacy) = count_sstable_versions(&data_dir)?;
+    println!(
+        "upgrade complete: {current} SSTable(s) at current format v{}, {legacy} legacy",
+        zydecodb_engine::sstable::FORMAT_VERSION
+    );
+    if legacy > 0 {
+        println!(
+            "note: {legacy} legacy file(s) remain and are fully readable; \
+             they are rewritten as background compaction touches them"
+        );
+    }
+    Ok(())
+}
+
 /// List the configured per-tenant limits.
 pub fn tenant_list(keys_file: PathBuf) -> Result<(), KeyError> {
     let store = KeyStore::load(&keys_file)?;
