@@ -11,11 +11,18 @@
 //!   [8] bloom_offset (0 if absent)
 //!   [8] bloom_length (0 if absent)
 //!   [4] magic 0x50524144 ("PRAD")
-//!   [4] format version 0x00000001
+//!   [4] format version (0x00000001 or 0x00000002)
 //! ```
 //!
 //! Data block entry: `[1] kind [8] seq [4] key_len [4] value_len [8] expires_at [K] key [V] value`.
 //! Entries are globally sorted by InternalKey (user_key ASC, seq DESC).
+//!
+//! Integrity: in format v2 each block (data, bloom, index) carries a trailing
+//! CRC32 over its body, verified on read so silent bit-rot at rest surfaces as
+//! an `Io` error instead of being served as truth or panicking on decode. The
+//! block `length` recorded in the index/footer includes the 4-byte trailer.
+//! Format v1 files (no per-block CRC) remain readable without verification, so
+//! existing data keeps working and is rewritten to v2 by normal compaction.
 
 use crate::block_cache::{BlockCache, BlockKey, CachedBlock};
 use crate::bloom::BloomFilter;
@@ -27,8 +34,43 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const MAGIC: u32 = 0x5052_4144; // "PRAD"
-pub const FORMAT_VERSION: u32 = 0x0000_0001;
+/// Current write format: per-block CRC32 trailers (see module docs).
+pub const FORMAT_VERSION: u32 = 0x0000_0002;
+/// Legacy format: no per-block checksums. Still readable (no verification).
+pub const FORMAT_VERSION_V1: u32 = 0x0000_0001;
 pub const FOOTER_LEN: usize = 40;
+/// Length of the trailing CRC32 appended to each block in format v2.
+const BLOCK_CRC_LEN: usize = 4;
+
+/// Append a CRC32 over `bytes[body_start..]` (the block body just written).
+/// The block's recorded length then includes this 4-byte trailer.
+fn append_block_crc(bytes: &mut Vec<u8>, body_start: usize) {
+    let crc = crc32fast::hash(&bytes[body_start..]);
+    bytes.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Verify and strip a block's CRC32 trailer, returning the body. For v1 files
+/// (no trailer) the raw bytes are returned unverified. `what` names the block
+/// kind for error messages (data / index / bloom).
+fn verify_block_crc(version: u32, raw: &[u8], what: &str) -> EngineResult<Vec<u8>> {
+    if version < FORMAT_VERSION {
+        return Ok(raw.to_vec());
+    }
+    if raw.len() < BLOCK_CRC_LEN {
+        return Err(EngineError::Io(format!(
+            "sstable: {what} block too short for checksum"
+        )));
+    }
+    let split = raw.len() - BLOCK_CRC_LEN;
+    let stored = u32::from_be_bytes(raw[split..].try_into().unwrap());
+    let computed = crc32fast::hash(&raw[..split]);
+    if stored != computed {
+        return Err(EngineError::Io(format!(
+            "sstable: {what} block checksum mismatch (corruption)"
+        )));
+    }
+    Ok(raw[..split].to_vec())
+}
 
 /// Serialize one data-block entry.
 fn encode_entry(key: &InternalKey, entry: &Entry) -> Vec<u8> {
@@ -143,6 +185,8 @@ pub fn build(sorted: &[(InternalKey, Entry)], with_bloom: bool) -> SstableBytes 
             }
         }
 
+        // v2: CRC32 trailer over the block body; recorded length includes it.
+        append_block_crc(&mut bytes, block_start);
         index.push(IndexEntry {
             first_key: first_user_key.clone(),
             first_user_key,
@@ -152,22 +196,24 @@ pub fn build(sorted: &[(InternalKey, Entry)], with_bloom: bool) -> SstableBytes 
         });
     }
 
-    // Bloom block.
+    // Bloom block (with CRC32 trailer).
     let (bloom_offset, bloom_length) = if with_bloom && !bloom_keys.is_empty() {
         let bf = BloomFilter::build(&bloom_keys);
         let enc = bf.encode();
         let off = bytes.len() as u64;
         bytes.extend_from_slice(&enc);
-        (off, enc.len() as u64)
+        append_block_crc(&mut bytes, off as usize);
+        (off, bytes.len() as u64 - off)
     } else {
         (0, 0)
     };
 
-    // Index block.
+    // Index block (with CRC32 trailer).
     let index_offset = bytes.len() as u64;
     let index_bytes = encode_index(&index);
     bytes.extend_from_slice(&index_bytes);
-    let index_length = index_bytes.len() as u64;
+    append_block_crc(&mut bytes, index_offset as usize);
+    let index_length = bytes.len() as u64 - index_offset;
 
     // Footer.
     bytes.extend_from_slice(&index_offset.to_be_bytes());
@@ -250,6 +296,8 @@ pub struct Footer {
     pub index_length: u64,
     pub bloom_offset: u64,
     pub bloom_length: u64,
+    /// On-disk format version (1 = no per-block CRC, 2 = per-block CRC).
+    pub version: u32,
 }
 
 pub fn parse_footer(file_tail: &[u8]) -> EngineResult<Footer> {
@@ -266,16 +314,17 @@ pub fn parse_footer(file_tail: &[u8]) -> EngineResult<Footer> {
     if magic != MAGIC {
         return Err(EngineError::Io("sstable: bad magic".into()));
     }
-    if version != FORMAT_VERSION {
-        return Err(EngineError::Io(
-            "sstable: unsupported format version".into(),
-        ));
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_V1 {
+        return Err(EngineError::Io(format!(
+            "sstable: unsupported format version 0x{version:08x}"
+        )));
     }
     Ok(Footer {
         index_offset,
         index_length,
         bloom_offset,
         bloom_length,
+        version,
     })
 }
 
@@ -288,12 +337,16 @@ enum Source {
         path: PathBuf,
         cache: Arc<BlockCache>,
         sstable_id: u64,
+        /// On-disk format version; gates per-block CRC verification.
+        version: u32,
         /// Decoded at open and pinned on the reader (not in [`BlockCache`]).
         index: Arc<Vec<IndexEntry>>,
         bloom: Option<Arc<BloomFilter>>,
     },
     Memory {
         data: Vec<u8>,
+        /// On-disk format version; gates per-block CRC verification.
+        version: u32,
         index: Arc<Vec<IndexEntry>>,
         bloom: Option<Arc<BloomFilter>>,
     },
@@ -328,17 +381,23 @@ impl SstableReader {
         if idx_end > data.len() {
             return Err(EngineError::Io("sstable: index out of bounds".into()));
         }
-        let index = decode_index(&data[idx_start..idx_end])?;
+        let idx_body = verify_block_crc(footer.version, &data[idx_start..idx_end], "index")?;
+        let index = decode_index(&idx_body)?;
         let bloom = if footer.bloom_length > 0 {
             let bs = footer.bloom_offset as usize;
             let be = bs + footer.bloom_length as usize;
-            data.get(bs..be).and_then(BloomFilter::decode)
+            if be > data.len() {
+                return Err(EngineError::Io("sstable: bloom out of bounds".into()));
+            }
+            let bloom_body = verify_block_crc(footer.version, &data[bs..be], "bloom")?;
+            BloomFilter::decode(&bloom_body)
         } else {
             None
         };
         Ok(SstableReader {
             source: Source::Memory {
                 data,
+                version: footer.version,
                 index: Arc::new(index),
                 bloom: bloom.map(Arc::new),
             },
@@ -367,7 +426,8 @@ impl SstableReader {
             return Err(EngineError::Io("sstable: index out of bounds".into()));
         }
         let idx_buf = read_file_range(path, footer.index_offset, footer.index_length as usize)?;
-        let index = Arc::new(decode_index(&idx_buf)?);
+        let idx_body = verify_block_crc(footer.version, &idx_buf, "index")?;
+        let index = Arc::new(decode_index(&idx_body)?);
 
         let bloom = if footer.bloom_length > 0 {
             if footer.bloom_offset + footer.bloom_length > file_len {
@@ -375,7 +435,8 @@ impl SstableReader {
             }
             let bloom_buf =
                 read_file_range(path, footer.bloom_offset, footer.bloom_length as usize)?;
-            BloomFilter::decode(&bloom_buf).map(Arc::new)
+            let bloom_body = verify_block_crc(footer.version, &bloom_buf, "bloom")?;
+            BloomFilter::decode(&bloom_body).map(Arc::new)
         } else {
             None
         };
@@ -385,6 +446,7 @@ impl SstableReader {
                 path: path.to_path_buf(),
                 cache,
                 sstable_id,
+                version: footer.version,
                 index,
                 bloom,
             },
@@ -400,6 +462,15 @@ impl SstableReader {
     pub fn has_bloom(&self) -> bool {
         match &self.source {
             Source::Memory { bloom, .. } | Source::File { bloom, .. } => bloom.is_some(),
+        }
+    }
+
+    /// On-disk format version of this table (see [`FORMAT_VERSION`]). Used by
+    /// startup logging and the `admin upgrade` path to report how much data is
+    /// still in a legacy format.
+    pub fn format_version(&self) -> u32 {
+        match &self.source {
+            Source::Memory { version, .. } | Source::File { version, .. } => *version,
         }
     }
 
@@ -421,22 +492,26 @@ impl SstableReader {
         populate_cache: bool,
     ) -> EngineResult<BlockBytes> {
         match &self.source {
-            Source::Memory { data, .. } => {
+            Source::Memory { data, version, .. } => {
                 let start = idx.offset as usize;
                 let end = start + idx.length as usize;
                 if end > data.len() {
                     return Err(EngineError::Io("sstable: block out of bounds".into()));
                 }
-                Ok(BlockBytes::Borrowed(data[start..end].to_vec()))
+                let body = verify_block_crc(*version, &data[start..end], "data")?;
+                Ok(BlockBytes::Borrowed(body))
             }
             Source::File {
                 path,
                 cache,
                 sstable_id,
+                version,
                 ..
             } => {
                 let key = BlockKey::data(*sstable_id, idx.offset);
                 if populate_cache {
+                    // Cache holds the verified, trailer-stripped body, so a hit
+                    // needs no re-verification.
                     if let Some(hit) = cache.get(key) {
                         return Ok(BlockBytes::Cached(hit));
                     }
@@ -447,7 +522,10 @@ impl SstableReader {
                 let f = File::open(path)?;
                 let mut buf = vec![0u8; idx.length as usize];
                 f.read_exact_at(&mut buf, idx.offset)?;
-                let arc = Arc::new(buf);
+                // Verify (and strip the CRC trailer) BEFORE caching so a
+                // corrupt block can never be served or persisted in the cache.
+                let body = verify_block_crc(*version, &buf, "data")?;
+                let arc = Arc::new(body);
                 if populate_cache {
                     cache.insert(key, arc.clone());
                 } else {

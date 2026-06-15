@@ -293,12 +293,33 @@ impl Engine {
         let mut max_sstable_id = 0u64;
         let mut max_seq_seen = state.last_durable_seq;
         let mut sstables = Vec::new();
+        let mut legacy_sstables = 0usize;
         for meta in metas {
             max_sstable_id = max_sstable_id.max(meta.id);
             max_seq_seen = max_seq_seen.max(meta.max_seq);
             let path = Self::sstable_path(&cfg.data_dir, meta.id);
             let reader = reader_cache.get_or_open(&path, meta.id, block_cache.clone())?;
+            if reader.format_version() < crate::sstable::FORMAT_VERSION {
+                legacy_sstables += 1;
+            }
             sstables.push(LoadedSstable { meta, reader });
+        }
+        // Surface the on-disk format mix so operators can see when a `data_dir`
+        // still holds pre-upgrade (legacy-format) SSTables. They remain readable;
+        // `zydecodb admin upgrade` (or ongoing compaction) rewrites them forward.
+        if legacy_sstables > 0 {
+            tracing::warn!(
+                legacy_sstables,
+                total_sstables = sstables.len(),
+                current_format = crate::sstable::FORMAT_VERSION,
+                "on-disk SSTables include legacy-format files (readable; run `admin upgrade` to rewrite)"
+            );
+        } else if !sstables.is_empty() {
+            tracing::info!(
+                total_sstables = sstables.len(),
+                format_version = crate::sstable::FORMAT_VERSION,
+                "all SSTables at current on-disk format"
+            );
         }
 
         // 3. Replay WAL segments (Invariant R1: skip seq <= max_seq of live SSTables).

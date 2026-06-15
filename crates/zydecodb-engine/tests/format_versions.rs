@@ -141,9 +141,115 @@ fn sstable_bad_magic_is_rejected() {
 
 #[test]
 fn sstable_current_format_constants_are_pinned() {
+    // If you bump FORMAT_VERSION you MUST keep a read path (and test) for every
+    // prior version still in the supported range. v1 -> v2 added per-block
+    // CRC32 trailers; v1 stays readable (see sstable_v1_reads_without_checksums).
     assert_eq!(sstable::MAGIC, 0x5052_4144); // "PRAD"
-    assert_eq!(sstable::FORMAT_VERSION, 0x0000_0001);
+    assert_eq!(sstable::FORMAT_VERSION, 0x0000_0002);
+    assert_eq!(sstable::FORMAT_VERSION_V1, 0x0000_0001);
     assert_eq!(sstable::FOOTER_LEN, 40);
+}
+
+/// Hand-build a v1-format SSTable (no per-block CRC trailers, footer version
+/// 0x01): one data block with two entries, a one-entry index, and the footer.
+/// The v1 layout no longer exists in code, so it is synthesized inline (same
+/// rationale as the WAL v1 fixture above).
+fn synthesize_v1_sstable() -> Vec<u8> {
+    fn encode_entry_v1(seq: u64, user_key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(0x01); // EntryKind::Value
+        b.extend_from_slice(&seq.to_be_bytes());
+        b.extend_from_slice(&(user_key.len() as u32).to_be_bytes());
+        b.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes()); // expires_at
+        b.extend_from_slice(user_key);
+        b.extend_from_slice(value);
+        b
+    }
+    let key_a: &[u8] = b"\x01a";
+    let key_b: &[u8] = b"\x01b";
+
+    // Single data block at offset 0, no CRC trailer (v1).
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&encode_entry_v1(1, key_a, b"1"));
+    bytes.extend_from_slice(&encode_entry_v1(2, key_b, b"2"));
+    let block_len = bytes.len() as u64;
+
+    // Index: count, then [klen][first_user_key][first_seq][offset][length].
+    let index_offset = bytes.len() as u64;
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&(key_a.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(key_a);
+    bytes.extend_from_slice(&1u64.to_be_bytes()); // first_seq
+    bytes.extend_from_slice(&0u64.to_be_bytes()); // block offset
+    bytes.extend_from_slice(&block_len.to_be_bytes());
+    let index_length = bytes.len() as u64 - index_offset;
+
+    // Footer (v1: no per-block CRC).
+    bytes.extend_from_slice(&index_offset.to_be_bytes());
+    bytes.extend_from_slice(&index_length.to_be_bytes());
+    bytes.extend_from_slice(&0u64.to_be_bytes()); // bloom_offset
+    bytes.extend_from_slice(&0u64.to_be_bytes()); // bloom_length
+    bytes.extend_from_slice(&sstable::MAGIC.to_be_bytes());
+    bytes.extend_from_slice(&sstable::FORMAT_VERSION_V1.to_be_bytes());
+    bytes
+}
+
+#[test]
+fn sstable_v1_reads_without_checksums() {
+    // Backward compatibility: a v1 file (no per-block CRC) must open and read
+    // correctly, with verification simply skipped. This is what keeps existing
+    // on-disk data working across the v2 upgrade.
+    let reader = SstableReader::open(synthesize_v1_sstable()).expect("v1 sstable must open");
+    let all = reader.scan_all().expect("v1 scan must succeed");
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].0.user_key, b"\x01a");
+    assert_eq!(all[1].0.user_key, b"\x01b");
+    let (_, e) = reader
+        .get_latest(b"\x01b")
+        .expect("v1 get must succeed")
+        .expect("key b present");
+    assert_eq!(e.value.as_deref(), Some(b"2".as_ref()));
+}
+
+#[test]
+fn sstable_v2_data_block_corruption_is_detected() {
+    // A bit flip in a v2 data block must surface as an Io error on read, not be
+    // served as a wrong value and not panic on decode.
+    let pairs = vec![
+        (
+            zydecodb_engine::keys::InternalKey::new(
+                b"\x01a".to_vec(),
+                1,
+                zydecodb_engine::keys::EntryKind::Value,
+            ),
+            zydecodb_engine::entry::Entry::value(b"hello".to_vec(), None),
+        ),
+        (
+            zydecodb_engine::keys::InternalKey::new(
+                b"\x01b".to_vec(),
+                2,
+                zydecodb_engine::keys::EntryKind::Value,
+            ),
+            zydecodb_engine::entry::Entry::value(b"world".to_vec(), None),
+        ),
+    ];
+    let sst = sstable::build(&pairs, false);
+    let mut bytes = sst.bytes;
+    // Flip a byte inside data block 0 (block starts at offset 0; offset 0 is the
+    // entry kind byte, well inside the block body that the CRC covers).
+    bytes[0] ^= 0xFF;
+    let reader = SstableReader::open(bytes).expect("footer/index still parse");
+    let err = reader
+        .scan_all()
+        .expect_err("corrupted data block must error, not return a value");
+    let EngineError::Io(msg) = err else {
+        panic!("expected EngineError::Io");
+    };
+    assert!(
+        msg.contains("checksum mismatch"),
+        "must surface the checksum contract; got: {msg}"
+    );
 }
 
 // ---------- Manifest ----------
