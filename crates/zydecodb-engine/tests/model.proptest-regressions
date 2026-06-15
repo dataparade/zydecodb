@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9af49fe70cc428ed7e959606e2286fc7342217d3c916044b81123c9399aee6ec # shrinks to key = [98, 97, 97, 98, 103, 101, 100, 102], values = [[100, 55, 213, 106, 158, 116, 197, 34, 229, 20, 44, 157, 111, 170, 54, 154, 175, 41, 124, 94, 194, 97, 5, 173, 12], [252]]
+cc 01ae48c9626d0fd2ad3684f441fff1c620f6c82dfd5a44b946283c4cf4da3fa8 # shrinks to ops = [Del([103, 97, 97, 99, 99, 102, 101, 99]), Put([104], [154, 221, 193, 209, 227, 148, 197]), Del([102, 103, 102, 98, 103, 99]), Del([98, 101, 98, 103, 103, 104, 104]), Flush, SnapshotGet([98, 98, 103]), Get([97, 103, 103, 104, 100]), Scan([99], [99, 99]), Reopen, Flush, Get([103, 100, 98, 97, 98, 103, 104, 103]), Scan([99, 101], [101]), Scan([100, 101, 101, 102, 103, 104, 98, 99], [102])]

@@ -1,0 +1,37 @@
+[package]
+name = "zydecodb-engine"
+description = "ZydecoDB storage core (WAL, memtable, SSTables, compaction)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[lib]
+name = "zydecodb_engine"
+path = "src/lib.rs"
+
+[features]
+# Compiles `fail_point!` invocations to real fault-injection sites. OFF by
+# default so released binaries are byte-identical and pay zero runtime cost.
+# Tests that exercise the crash matrix enable this feature explicitly.
+failpoints = ["fail/failpoints"]
+
+[dependencies]
+bytes = { workspace = true }
+crossbeam = { workspace = true }
+crc32fast = { workspace = true }
+xxhash-rust = { workspace = true }
+tracing = { workspace = true }
+prometheus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+# `fail` is included unconditionally so call sites can use `fail_point!`
+# without a feature gate at every site. The macros expand to no-ops when the
+# `failpoints` feature is off; see [features] above.
+fail = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
