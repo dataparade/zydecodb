@@ -30,3 +30,11 @@ toml = "0.8"
 opt-level = 3
 lto = true
 codegen-units = 1
+# Controlled-crash poison policy: a panic while holding the engine `Mutex` would
+# otherwise poison it, making every later `lock().unwrap()` panic in turn — a
+# cascade that limps along on half-mutated in-memory state (the worst outcome
+# for a database). Aborting turns any panic into a clean process exit so a
+# supervisor restarts the node and WAL replay restores a consistent state.
+# (Cargo always builds test/bench harnesses with unwind, so this does not affect
+# `cargo test`.)
+panic = "abort"

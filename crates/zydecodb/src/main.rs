@@ -197,10 +197,40 @@ impl From<RoleArg> for KeyRole {
     }
 }
 
+/// Log every panic through `tracing` before the process exits. This complements
+/// the controlled-crash policy (`[profile.release] panic = "abort"`): a panic —
+/// including one taken while holding the engine `Mutex`, which would otherwise
+/// poison it and cascade — is captured in the operator's structured log pipeline
+/// and then the runtime aborts for a clean supervised restart + WAL recovery.
+/// The previous (default) hook is preserved so stderr backtraces still print.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        tracing::error!(
+            panic.location = %location,
+            panic.message = %msg,
+            "process panicked; aborting for supervised restart"
+        );
+        default_hook(info);
+    }));
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
+
+    install_panic_hook();
 
     let cli = Cli::parse();
     let result = match cli.command {
