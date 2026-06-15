@@ -1,0 +1,19 @@
+[package]
+name = "zydecodb-document"
+description = "ZydecoDB document layer — collections, secondary indexes, and queries over the KV engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[lib]
+name = "zydecodb_document"
+path = "src/lib.rs"
+
+[dependencies]
+zydecodb-engine = { path = "../zydecodb-engine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
