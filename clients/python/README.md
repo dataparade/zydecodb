@@ -1,0 +1,76 @@
+# ZydecoDB Python driver
+
+Official Python client for [ZydecoDB](../../README.md) — a MongoDB-style
+document store without the fluff. Pure standard library, no runtime dependencies.
+
+## Install
+
+```bash
+pip install zydecodb            # from PyPI (once published)
+pip install -e clients/python   # from this repo, editable
+```
+
+Requires Python 3.9+.
+
+## Quick start
+
+```python
+from zydecodb import Client
+
+with Client("127.0.0.1", 9470, api_key="YOUR_KEY") as db:
+    users = db.collection("users")
+    users.create_index(["email"], unique=True)
+
+    uid = users.insert_one({"email": "ada@example.com", "name": "Ada", "age": 30})
+
+    for u in users.find({"age": {"$gte": 18}}, sort=[("age", True)]):
+        print(u["name"], u["age"])
+
+    users.update_one({"_id": uid}, {"$inc": {"age": 1}})
+    print(users.count_documents())
+```
+
+## What you get
+
+- **Connection pooling.** `Client` owns a thread-safe pool (`pool_size`,
+  default 8) and is safe to share across threads.
+- **Automatic retries with backoff.** Transient transport failures and server
+  `EngineBusy` responses are retried (full-jitter exponential backoff) for
+  operations that are safe to repeat. Operator updates and deletes are never
+  retried automatically.
+- **Keepalive.** Idle pooled connections are validated with a `Ping` on
+  checkout and transparently replaced if dead.
+- **Typed error taxonomy.** Non-OK responses raise a specific subclass:
+  `ConflictError` (unique-index violation), `AuthError`, `ServerBusyError`,
+  `InvalidRequestError`, or the base `ServerError` — each carrying the wire
+  `status` byte. Transport problems raise `ConnectionError`.
+- **MongoDB-style `Collection` API.** `insert_one/many`, `find`/`find_one`,
+  `update_one/many`, `delete_one/many`, `count_documents`, `distinct`,
+  `create_index`, with `$`-operators, sort, projection, and skip/limit.
+  Pagination is repeatable-read across pages.
+
+## Durability
+
+Writes are durable (fsync-on-commit) by default. For latency-sensitive,
+loss-tolerant writes, pass `relaxed=True` to acknowledge before the fsync:
+
+```python
+users.insert_one(doc, relaxed=True)
+```
+
+## Running the tests
+
+Unit tests for the wire codecs need no server:
+
+```bash
+cd clients/python
+pip install -e ".[dev]"
+pytest tests/test_protocol.py
+```
+
+Integration tests run against a live server selected by environment variables
+(skipped automatically if it is unreachable):
+
+```bash
+ZYDECODB_TEST_HOST=127.0.0.1 ZYDECODB_TEST_PORT=9470 pytest
+```
