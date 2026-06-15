@@ -1,0 +1,66 @@
+# Production-style paths. For local dev, use config/zydecodb.dev.toml instead.
+# LAN: listen = "0.0.0.0:9470" and require_auth = true (or "auto").
+listen = "127.0.0.1:9470"
+data_dir = "/var/lib/zydecodb/data"
+wal_dir = "/var/lib/zydecodb/wal"
+block_cache_mb = 256
+max_open_readers = 128
+poll_compaction_ms = 50
+
+# Durability of acknowledged writes:
+#   "sync"     = ack only after the write is fsynced (safe against power loss).
+#   "periodic" = ack after the buffered append; fsync every fsync_interval_ms
+#                (bounded data-loss window, higher throughput).
+durability = "sync"
+fsync_interval_ms = 100
+
+# WAL shipping: copy/hardlink each sealed WAL segment off-box for disaster
+# recovery or a read replica (see `serve --replica-from`). Disabled unless set.
+[shipping]
+# ship_dir = "/var/lib/zydecodb/ship"
+# mode = "hardlink"   # or "copy" (use copy across filesystems)
+# Heartbeat cadence (ms) refreshed even while idle, so a replica can tell a
+# quiet primary from a dead one. 0 disables it. Default 1000.
+# heartbeat_ms = 1000
+
+# Operability HTTP endpoint: Prometheus /metrics, /healthz, /readyz. Bind to a
+# loopback address and scrape it from a local agent. Disabled unless set.
+[metrics]
+# listen = "127.0.0.1:9471"
+
+# Read-replica mode: replay sha256-verified WAL segments a sidecar delivers from
+# a primary's ship_dir. The node serves reads and rejects writes. Give it its
+# own data_dir/wal_dir (not the primary's). See docs/REPLICATION.md.
+# Also settable via `serve --replica-from <dir>`. Disabled unless `from` is set.
+# Health probe + assisted promotion (with the replica stopped):
+#   zydecodb replica status  --config this.toml   # lag + liveness, non-zero if stale
+#   zydecodb replica promote --config this.toml   # drain + bump epoch, then serve
+[replica]
+# from = "/var/lib/zydecodb/replica_from"
+# poll_ms = 1000
+
+[security]
+# auto = require auth when listen is not loopback
+require_auth = "auto"
+keys_file = "/etc/zydecodb/keys.toml"
+allow_unauthenticated_ping = true
+legacy_single_tenant = true
+max_connections = 256
+rate_limit_rps = 1000
+auth_burst_limit = 10
+# Close connections idle longer than this (0 disables). Pooled clients should
+# send a periodic Ping keepalive to stay under the cap.
+idle_timeout_secs = 300
+
+[security.audit]
+enabled = true
+log_client_key = false
+
+[security.quotas]
+# 0 = unlimited
+max_bytes_per_tenant = 0
+
+[tls]
+enabled = false
+# cert = "/etc/zydecodb/tls.crt"
+# key  = "/etc/zydecodb/tls.key"

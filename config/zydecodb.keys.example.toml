@@ -1,0 +1,21 @@
+# API keys for ZydecoDB. Generate secrets with the admin CLI — never edit hashes by hand.
+#
+#   zydecodb admin keys create --id backend --role read_write --keys-file keys.toml
+#
+# Point security.keys_file in zydecodb.toml at this file.
+
+[[key]]
+id = "backend"
+# Placeholder — replace by running admin keys create
+secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$PLACEHOLDER$PLACEHOLDER"
+role = "read_write"
+tenant = "00000000000000000000000000000000"
+allowed_prefixes = []
+
+# Read-only analytics key scoped to event keys:
+# [[key]]
+# id = "analytics"
+# secret_hash = "..."
+# role = "read_only"
+# tenant = "00000000000000000000000000000000"
+# allowed_prefixes = ["events:", "metrics:"]
