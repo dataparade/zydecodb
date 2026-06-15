@@ -1753,6 +1753,7 @@ dependencies = [
 name = "zydecodb-document"
 version = "0.9.0-beta.1"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
