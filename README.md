@@ -1,6 +1,6 @@
 # ZydecoDB
 
-Open-source database written in Rust. Runs as a standalone server — use any language that speaks TCP.
+Source-available database written in Rust (BSL 1.1). Runs as a standalone server — use any language that speaks TCP.
 
 Two layers, one engine:
 
@@ -107,7 +107,7 @@ Details: [`docs/SECURITY.md`](docs/SECURITY.md).
 ## Expectations, gotchas, advice
 
 - **Beta** (`0.9.0-beta.1`). API, wire protocol, and on-disk format may change before 1.0.
-- **BSL license.** Non-production use is free. Production use may require a commercial license until the change date — see [LICENSE](LICENSE).
+- **BSL license.** Self-hosting (including in production) is free; you may not offer ZydecoDB to third parties as a competing hosted/managed service. Converts to Apache 2.0 on the change date — see [LICENSE](LICENSE).
 - **Security:** run behind your API on localhost or a private network. See [`docs/SECURITY.md`](docs/SECURITY.md). Do not expose `:9470` to the internet without auth.
 - **Keys on the wire** are opaque bytes; the server stores them under the user keyspace (`KS_USER` prefix).
 - **Heavy sustained writes** can leave extra small on-disk files. Cosmetic — no data loss.
