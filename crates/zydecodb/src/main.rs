@@ -36,6 +36,23 @@ enum Commands {
         #[command(subcommand)]
         command: ReplicaCommands,
     },
+    /// Migrate a plain `pg_dump` into read-optimized document collections on a
+    /// fresh (empty) ZydecoDB server.
+    Migrate {
+        /// Path to a plain `pg_dump` file (with COPY data).
+        #[arg(long, short)]
+        file: PathBuf,
+        /// Target server address `host:port`.
+        #[arg(long, default_value = "127.0.0.1:9470")]
+        url: String,
+        /// API key (or set ZYDECODB_API_KEY). Omit when the server allows
+        /// unauthenticated access.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Skip the interactive confirmation prompt (for non-interactive runs).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -345,6 +362,21 @@ fn main() {
                 }
             }
         },
+        Commands::Migrate {
+            file,
+            url,
+            api_key,
+            yes,
+        } => {
+            let api_key = api_key.or_else(|| std::env::var("ZYDECODB_API_KEY").ok());
+            zydecodb_migrate::run(zydecodb_migrate::MigrateOptions {
+                file,
+                url,
+                api_key,
+                assume_yes: yes,
+            })
+            .map_err(|e| e.to_string())
+        }
     };
 
     if let Err(e) = result {

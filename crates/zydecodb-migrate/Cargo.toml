@@ -1,0 +1,17 @@
+[package]
+name = "zydecodb-migrate"
+description = "ZydecoDB migration tool — reshape a Postgres dump into read-optimized documents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[lib]
+name = "zydecodb_migrate"
+path = "src/lib.rs"
+
+[dependencies]
+zydecodb-engine = { path = "../zydecodb-engine" }
+zydecodb-document = { path = "../zydecodb-document" }
+serde = { workspace = true }
+serde_json = { workspace = true }

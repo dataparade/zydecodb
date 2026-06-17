@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/zydecodb-engine", "crates/zydecodb-document", "crates/zydecodb"]
+members = [
+    "crates/zydecodb-engine",
+    "crates/zydecodb-document",
+    "crates/zydecodb",
+    "crates/zydecodb-migrate",
+]
 resolver = "2"
 
 [workspace.package]

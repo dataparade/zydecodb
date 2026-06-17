@@ -1747,6 +1747,7 @@ dependencies = [
  "tracing-subscriber",
  "zydecodb-document",
  "zydecodb-engine",
+ "zydecodb-migrate",
 ]
 
 [[package]]
@@ -1777,4 +1778,14 @@ dependencies = [
  "thiserror",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "zydecodb-migrate"
+version = "0.9.0-beta.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zydecodb-document",
+ "zydecodb-engine",
 ]
