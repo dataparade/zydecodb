@@ -35,3 +35,8 @@ lcov.info
 /.vscode/
 *.swp
 .DS_Store
+
+# Release/packaging tooling (kept local, not yet part of the tracked tree)
+/.github/workflows/release.yml
+/.github/workflows/publish-python.yml
+/install.sh
