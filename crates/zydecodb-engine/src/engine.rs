@@ -334,12 +334,43 @@ impl Engine {
         let mut replayed = 0usize;
         let mut max_wal_id = 0u64;
         let mut sealed_segment_max_seq: BTreeMap<u64, u64> = BTreeMap::new();
+        // Only the highest-id segment was the active one at crash time, so it is
+        // the only segment allowed to end with a torn tail. Any earlier segment
+        // was sealed and fsynced complete before the roll, so damage there is
+        // bit-rot, not a crash artifact.
+        let active_wal_id_at_crash = segments.iter().map(|(id, _)| *id).max();
         for (id, path) in &segments {
             max_wal_id = max_wal_id.max(*id);
-            let (records, torn) = Self::read_segment(path)?;
-            if torn {
-                tracing::info!(segment = %path.display(), "truncated torn WAL tail on replay");
-                Self::truncate_torn_segment(path)?;
+            let is_active = Some(*id) == active_wal_id_at_crash;
+            let (records, outcome) = Self::read_segment(path)?;
+            match outcome {
+                wal::ReplayOutcome::Clean => {}
+                wal::ReplayOutcome::TornTail if is_active => {
+                    tracing::info!(segment = %path.display(), "truncated torn WAL tail on replay");
+                    Self::truncate_torn_segment(path)?;
+                }
+                wal::ReplayOutcome::TornTail => {
+                    // A sealed segment must be intact; an incomplete record here
+                    // means the file was truncated/damaged after sealing.
+                    return Err(EngineError::Io(format!(
+                        "WAL: corruption detected in sealed segment {} \
+                         (incomplete record in a segment that was sealed and \
+                         fsynced; refusing to open to avoid silently dropping \
+                         committed data)",
+                        path.display()
+                    )));
+                }
+                wal::ReplayOutcome::Corruption => {
+                    // A damaged record with intact records after it: truncating
+                    // would silently drop committed data, so refuse loudly.
+                    return Err(EngineError::Io(format!(
+                        "WAL: corruption detected in segment {} \
+                         (a damaged record is followed by intact records; \
+                         refusing to open to avoid silently dropping committed \
+                         data)",
+                        path.display()
+                    )));
+                }
             }
             // Capture this segment's max seq for the cache, regardless of
             // whether its records get replayed into the memtable (a segment
@@ -571,12 +602,12 @@ impl Engine {
         Ok(())
     }
 
-    fn read_segment(path: &Path) -> EngineResult<(Vec<wal::WalEntry>, bool)> {
+    fn read_segment(path: &Path) -> EngineResult<(Vec<wal::WalEntry>, wal::ReplayOutcome)> {
         let mut f = File::open(path)?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
         if buf.len() < wal::SEGMENT_HEADER_LEN {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), wal::ReplayOutcome::Clean));
         }
         // Header: [8] first_seq [1] format version. Reject unknown versions so a
         // v1 segment (with its old, wider record layout) is never misparsed as

@@ -312,13 +312,32 @@ fn decode_batch(buf: &[u8]) -> EngineResult<Option<(WalEntry, usize)>> {
     Ok(Some((WalEntry::Batch(WalBatch { seq, ops }), total)))
 }
 
+/// How a segment body terminated when replayed.
+///
+/// The distinction matters because only the *active* (last) segment at crash
+/// time can legitimately end mid-record — that is a normal torn tail to
+/// truncate. A failure that has intact records *after* it is corruption that
+/// ate committed data, and the engine refuses to open rather than silently
+/// drop it (mirroring the manifest's unknown-record-type refusal contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// Every byte decoded into a complete, CRC-valid record.
+    Clean,
+    /// The body ended with an incomplete or unrecoverable trailing record and
+    /// nothing valid followed it — the classic "crashed mid-append" tail.
+    TornTail,
+    /// A record failed to validate (CRC mismatch / bad command) but at least
+    /// one intact record follows it: the damage is mid-stream, not a torn tail.
+    Corruption,
+}
+
 /// Decode all entries from a segment body (after the segment header). Stops at
-/// the first torn/short tail, returning the entries decoded so far and whether
-/// a torn tail was detected (so the caller can truncate).
-pub fn replay_segment_body(body: &[u8]) -> (Vec<WalEntry>, bool) {
+/// the first record that fails to decode, returning the entries decoded so far
+/// and a [`ReplayOutcome`] classifying *why* it stopped so the caller can tell
+/// a benign torn tail apart from mid-stream corruption.
+pub fn replay_segment_body(body: &[u8]) -> (Vec<WalEntry>, ReplayOutcome) {
     let mut records = Vec::new();
     let mut offset = 0;
-    let mut torn = false;
     while offset < body.len() {
         match WalRecord::decode_one(&body[offset..]) {
             Ok(Some((rec, consumed))) => {
@@ -326,20 +345,83 @@ pub fn replay_segment_body(body: &[u8]) -> (Vec<WalEntry>, bool) {
                 offset += consumed;
             }
             Ok(None) => {
-                // Short tail: trailing bytes that don't form a complete entry.
-                if offset < body.len() {
-                    torn = true;
-                }
-                break;
+                // Short trailing fragment: too few bytes to form a record. This
+                // is the canonical torn tail (a crash mid-append).
+                return (records, ReplayOutcome::TornTail);
             }
             Err(_) => {
-                // CRC mismatch / bad command: torn write. Stop here.
-                torn = true;
-                break;
+                // A framed record failed CRC (or carried a bad command). If
+                // intact records follow it, committed data sits past the damage
+                // and truncating here would silently drop it -> corruption.
+                let outcome = if has_valid_record_after(body, offset) {
+                    ReplayOutcome::Corruption
+                } else {
+                    ReplayOutcome::TornTail
+                };
+                return (records, outcome);
             }
         }
     }
-    (records, torn)
+    (records, ReplayOutcome::Clean)
+}
+
+/// Whether at least one intact, CRC-valid record begins after the (failed)
+/// record framed at `fail_offset`. Reads the failed record's length fields
+/// WITHOUT trusting its CRC so we can step over it; if those fields are
+/// themselves unusable (unknown command, length runs past the buffer) we cannot
+/// prove intact data follows and conservatively report `false` (treat as tail).
+fn has_valid_record_after(body: &[u8], fail_offset: usize) -> bool {
+    let failed = &body[fail_offset..];
+    let len = match frame_len(failed) {
+        Some(l) => l,
+        None => return false,
+    };
+    let next = match fail_offset.checked_add(len) {
+        Some(n) if n < body.len() => n,
+        _ => return false,
+    };
+    matches!(WalRecord::decode_one(&body[next..]), Ok(Some(_)))
+}
+
+/// Total on-disk length (record body + trailing CRC) of the record framed at
+/// the front of `buf`, computed from its length fields without validating the
+/// CRC. Returns `None` when the command byte is unknown, the framing is
+/// incomplete, or a length field would overflow — i.e. when the frame cannot be
+/// stepped over safely.
+fn frame_len(buf: &[u8]) -> Option<usize> {
+    match buf.first()? {
+        &WAL_PUT | &WAL_DEL => {
+            if buf.len() < ENTRY_FIXED {
+                return None;
+            }
+            let key_len = u32::from_be_bytes(buf[17..21].try_into().unwrap()) as usize;
+            let value_len = u32::from_be_bytes(buf[21..25].try_into().unwrap()) as usize;
+            ENTRY_FIXED
+                .checked_add(key_len)?
+                .checked_add(value_len)?
+                .checked_add(4)
+        }
+        &WAL_BATCH => {
+            if buf.len() < BATCH_HEADER {
+                return None;
+            }
+            let count = u32::from_be_bytes(buf[9..13].try_into().unwrap()) as usize;
+            let mut offset = BATCH_HEADER;
+            for _ in 0..count {
+                let op_fixed_end = offset.checked_add(BATCH_OP_FIXED)?;
+                if buf.len() < op_fixed_end {
+                    return None;
+                }
+                let key_len =
+                    u32::from_be_bytes(buf[offset + 9..offset + 13].try_into().unwrap()) as usize;
+                let value_len =
+                    u32::from_be_bytes(buf[offset + 13..offset + 17].try_into().unwrap()) as usize;
+                offset = op_fixed_end.checked_add(key_len)?.checked_add(value_len)?;
+            }
+            offset.checked_add(4)
+        }
+        _ => None,
+    }
 }
 
 /// Segment file naming: `wal-00000001.log`.
@@ -528,9 +610,9 @@ mod tests {
                 &WalRecord::put(i, 0, vec![1u8, i as u8], vec![i as u8]).encode(),
             );
         }
-        let (recs, torn) = replay_segment_body(&body);
+        let (recs, outcome) = replay_segment_body(&body);
         assert_eq!(recs.len(), 5);
-        assert!(!torn);
+        assert_eq!(outcome, ReplayOutcome::Clean);
         assert_eq!(recs[0].seq(), 1);
         assert_eq!(recs[4].seq(), 5);
     }
@@ -540,9 +622,42 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&WalRecord::put(1, 0, vec![1u8, 2], vec![3]).encode());
         body.extend_from_slice(&[0xAB, 0xCD]); // partial trailing garbage
-        let (recs, torn) = replay_segment_body(&body);
+        let (recs, outcome) = replay_segment_body(&body);
         assert_eq!(recs.len(), 1);
-        assert!(torn);
+        assert_eq!(outcome, ReplayOutcome::TornTail);
+    }
+
+    #[test]
+    fn replay_flags_midstream_corruption() {
+        // Three good records; corrupt the middle one's CRC. The third record is
+        // intact and follows the damage, so this is corruption, not a torn tail.
+        let mut body = Vec::new();
+        let r1 = WalRecord::put(1, 0, vec![1u8, b'a'], vec![10]).encode();
+        let mut r2 = WalRecord::put(2, 0, vec![1u8, b'b'], vec![20]).encode();
+        let r3 = WalRecord::put(3, 0, vec![1u8, b'c'], vec![30]).encode();
+        let r2_crc_byte = r2.len() - 1;
+        r2[r2_crc_byte] ^= 0xFF; // break r2's CRC, length fields intact
+        let r1_len = r1.len();
+        body.extend_from_slice(&r1);
+        body.extend_from_slice(&r2);
+        body.extend_from_slice(&r3);
+        let (recs, outcome) = replay_segment_body(&body);
+        // Only the clean prefix (r1) decoded before the damaged r2.
+        assert_eq!(recs.len(), 1);
+        assert!(body.len() > r1_len);
+        assert_eq!(outcome, ReplayOutcome::Corruption);
+    }
+
+    #[test]
+    fn replay_crc_failure_at_tail_is_torn_not_corruption() {
+        // A single record whose CRC is broken, with nothing after it, is a torn
+        // tail (the crash landed mid-record) — not mid-stream corruption.
+        let mut bytes = WalRecord::put(1, 0, vec![1u8, b'a'], vec![10]).encode();
+        let n = bytes.len();
+        bytes[n - 5] ^= 0xFF; // corrupt a value byte; CRC now mismatches
+        let (recs, outcome) = replay_segment_body(&bytes);
+        assert_eq!(recs.len(), 0);
+        assert_eq!(outcome, ReplayOutcome::TornTail);
     }
 
     #[test]
