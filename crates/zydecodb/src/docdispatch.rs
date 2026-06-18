@@ -417,3 +417,150 @@ fn opt(b: &[u8]) -> Option<&[u8]> {
         Some(b)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commit::DurabilityMode;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use zydecodb_engine::engine::EngineConfig;
+
+    fn rand_suffix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    /// A document-layer fixture with a seeded collection and a `Sync`-mode commit
+    /// coordinator whose fsync thread is deliberately NOT spawned. With no
+    /// coordinator running, a durable (`relaxed = false`) commit blocks forever in
+    /// `await_durable`, while a `relaxed` commit must return immediately — which is
+    /// exactly the contrast these tests assert.
+    struct Fixture {
+        engine: SharedEngine,
+        catalog: SharedCatalog,
+        commit: Arc<CommitCoordinator>,
+        prefix: Vec<u8>,
+    }
+
+    fn fixture(seed_ids: &[&str]) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("zydeco-docrelax-{}", rand_suffix()));
+        let engine = Arc::new(Mutex::new(
+            Engine::open(EngineConfig {
+                data_dir: dir.join("data"),
+                wal_dir: dir.join("wal"),
+                ..Default::default()
+            })
+            .unwrap(),
+        ));
+        let catalog = Arc::new(RwLock::new(Catalog::default()));
+        let prefix = vec![KS_USER];
+        catalog.write().unwrap().ensure_collection(&prefix, "c");
+        // Seed documents directly through the store (buffered WAL append; no
+        // commit wait needed — the data is visible from the memtable at once).
+        {
+            let cat = catalog.read().unwrap();
+            let mut e = engine.lock().unwrap();
+            for id in seed_ids {
+                let body = format!("{{\"_id\":\"{id}\",\"n\":1}}");
+                store::upsert(&mut e, &cat, &prefix, "c", id.as_bytes(), body.as_bytes()).unwrap();
+            }
+        }
+        let commit = CommitCoordinator::new(Arc::clone(&engine), DurabilityMode::Sync);
+        Fixture {
+            engine,
+            catalog,
+            commit,
+            prefix,
+        }
+    }
+
+    fn update_payload(id: &str, relaxed: bool) -> Vec<u8> {
+        wire::UpdatePayload {
+            collection: "c".into(),
+            filter: format!("{{\"_id\":\"{id}\"}}").into_bytes(),
+            update: b"{\"$inc\":{\"n\":1}}".to_vec(),
+            multi: false,
+            relaxed,
+        }
+        .encode()
+    }
+
+    #[test]
+    fn relaxed_update_acks_without_durability_wait() {
+        let fx = fixture(&["d1", "d2"]);
+
+        // A relaxed update returns promptly even though no fsync thread is running.
+        let start = Instant::now();
+        let resp = update_cmd(
+            &fx.engine,
+            &fx.catalog,
+            &fx.commit,
+            &fx.prefix,
+            &update_payload("d1", true),
+        )
+        .unwrap();
+        assert_eq!(resp.status, Status::Ok);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "relaxed update must not block on the fsync"
+        );
+
+        // A durable update on the same fixture must block: with no coordinator
+        // thread, its `seq` is never fsynced, so it stays parked until stop().
+        let done = Arc::new(AtomicBool::new(false));
+        let (engine, catalog, commit, prefix, done2) = (
+            Arc::clone(&fx.engine),
+            Arc::clone(&fx.catalog),
+            Arc::clone(&fx.commit),
+            fx.prefix.clone(),
+            Arc::clone(&done),
+        );
+        let h = thread::spawn(move || {
+            let r = update_cmd(
+                &engine,
+                &catalog,
+                &commit,
+                &prefix,
+                &update_payload("d2", false),
+            );
+            done2.store(true, Ordering::SeqCst);
+            r.map(|resp| resp.status)
+        });
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "durable update must block while no fsync thread is running"
+        );
+
+        // Releasing the coordinator unblocks the parked durable write.
+        fx.commit.stop();
+        assert_eq!(h.join().unwrap().unwrap(), Status::Ok);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn relaxed_delete_acks_without_durability_wait() {
+        let fx = fixture(&["d1"]);
+        let payload = wire::DeletePayload {
+            collection: "c".into(),
+            filter: b"{\"_id\":\"d1\"}".to_vec(),
+            multi: false,
+            relaxed: true,
+        }
+        .encode();
+
+        let start = Instant::now();
+        let resp = delete_cmd(&fx.engine, &fx.catalog, &fx.commit, &fx.prefix, &payload).unwrap();
+        assert_eq!(resp.status, Status::Ok);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "relaxed delete must not block on the fsync"
+        );
+        fx.commit.stop();
+    }
+}
