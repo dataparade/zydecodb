@@ -184,7 +184,7 @@ fn order_doc_embeds_items_with_product_snapshot_in_minor_units() {
     assert_eq!(items.len(), 2); // items 1 and 2 belong to order 1000
     let widget = items
         .iter()
-        .find(|it| it["product_id"] == Value::from(50))
+        .find(|it| it["product_id"] == 50)
         .expect("widget line");
     assert_eq!(widget["qty"], Value::from(2));
     // Product snapshot frozen into the line; price is exact minor units.

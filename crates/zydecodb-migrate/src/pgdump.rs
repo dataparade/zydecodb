@@ -111,10 +111,35 @@ pub fn parse(contents: &str) -> MigrateResult<Dump> {
             continue;
         }
 
+        // `pg_dump --inserts` / `--column-inserts` emit data as INSERT
+        // statements instead of COPY. We only understand COPY, and silently
+        // dropping the data would produce an empty migration, so refuse loudly.
+        if is_kw(line, "INSERT INTO ") {
+            return Err(MigrateError::Parse(
+                "this dump uses INSERT statements for data (pg_dump --inserts); \
+                 only the default plain COPY format is supported. Re-run pg_dump \
+                 without --inserts/--column-inserts."
+                    .to_string(),
+            ));
+        }
+
         if is_kw(line, "CREATE TABLE ") {
             let (stmt, next) = take_statement(&lines, i);
             i = next;
             if let Some(table) = parse_create_table(&stmt)? {
+                // Two tables that normalize to the same bare name (e.g. the same
+                // table in different schemas) would clobber each other and
+                // mis-route COPY data. We strip schemas, so this is ambiguous;
+                // refuse rather than corrupt.
+                if index_of.contains_key(&table.name) {
+                    return Err(MigrateError::Parse(format!(
+                        "table name collision: '{}' is defined more than once \
+                         (likely the same name under different schemas); \
+                         multi-schema dumps with duplicate table names are not \
+                         supported",
+                        table.name
+                    )));
+                }
                 index_of.insert(table.name.clone(), tables.len());
                 tables.push(table);
             }
@@ -143,9 +168,11 @@ pub fn parse(contents: &str) -> MigrateResult<Dump> {
 
 // ---- statement assembly ----
 
-/// Collect lines starting at `start` until one whose trimmed end is `;`.
-/// Returns the joined statement (without the trailing newline) and the index of
-/// the line after the terminator.
+/// Collect lines starting at `start` until the statement terminates. A
+/// statement ends at a `;` that is **outside** any quoted string, so a `;`
+/// living inside a single- or double-quoted literal (even one that ends a
+/// physical line) does not truncate the statement. Returns the joined statement
+/// and the index of the line after the terminator.
 fn take_statement(lines: &[&str], start: usize) -> (String, usize) {
     let mut buf = String::new();
     let mut i = start;
@@ -154,13 +181,56 @@ fn take_statement(lines: &[&str], start: usize) -> (String, usize) {
             buf.push(' ');
         }
         buf.push_str(lines[i].trim());
-        if lines[i].trim_end().ends_with(';') {
-            i += 1;
+        i += 1;
+        if statement_complete(&buf) {
             break;
+        }
+    }
+    (buf, i)
+}
+
+/// True when `buf`'s last non-space char is `;` and that `;` sits outside any
+/// quoted string.
+fn statement_complete(buf: &str) -> bool {
+    let trimmed = buf.trim_end();
+    trimmed.ends_with(';') && !ends_inside_quote(trimmed)
+}
+
+/// Scan `s` tracking single- and double-quote state (with SQL `''` / `""`
+/// escaping) and report whether the end of `s` lies inside a string literal.
+fn ends_inside_quote(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2; // escaped quote ''
+                    continue;
+                }
+                in_single = false;
+            }
+        } else if in_double {
+            if c == b'"' {
+                if bytes.get(i + 1) == Some(&b'"') {
+                    i += 2; // escaped quote ""
+                    continue;
+                }
+                in_double = false;
+            }
+        } else {
+            match c {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                _ => {}
+            }
         }
         i += 1;
     }
-    (buf, i)
+    in_single || in_double
 }
 
 // ---- CREATE TABLE ----
