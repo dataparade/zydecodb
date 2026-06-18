@@ -231,20 +231,28 @@ class Client:
                 return
 
     def update(
-        self, collection: str, filt: dict, update_doc: dict, *, multi: bool
+        self,
+        collection: str,
+        filt: dict,
+        update_doc: dict,
+        *,
+        multi: bool,
+        relaxed: bool = False,
     ) -> dict:
         body = self._execute(
             proto.CMD_UPDATE,
-            proto.encode_update(collection, filt, update_doc, multi=multi, relaxed=False),
+            proto.encode_update(collection, filt, update_doc, multi=multi, relaxed=relaxed),
             "Update",
             retryable=False,
         )
         return json.loads(body.decode("utf-8"))
 
-    def delete_by_filter(self, collection: str, filt: dict, *, multi: bool) -> int:
+    def delete_by_filter(
+        self, collection: str, filt: dict, *, multi: bool, relaxed: bool = False
+    ) -> int:
         body = self._execute(
             proto.CMD_DELETE,
-            proto.encode_delete(collection, filt, multi=multi, relaxed=False),
+            proto.encode_delete(collection, filt, multi=multi, relaxed=relaxed),
             "Delete",
             retryable=False,
         )

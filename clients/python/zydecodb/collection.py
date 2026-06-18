@@ -62,17 +62,17 @@ class Collection:
         doc["_id"] = str(doc_id)
         return self._c.put_document(self._name, str(doc_id), doc, relaxed=relaxed)
 
-    def update_one(self, filt: dict, update: dict) -> dict:
-        return self._c.update(self._name, filt, update, multi=False)
+    def update_one(self, filt: dict, update: dict, *, relaxed: bool = False) -> dict:
+        return self._c.update(self._name, filt, update, multi=False, relaxed=relaxed)
 
-    def update_many(self, filt: dict, update: dict) -> dict:
-        return self._c.update(self._name, filt, update, multi=True)
+    def update_many(self, filt: dict, update: dict, *, relaxed: bool = False) -> dict:
+        return self._c.update(self._name, filt, update, multi=True, relaxed=relaxed)
 
-    def delete_one(self, filt: dict) -> int:
-        return self._c.delete_by_filter(self._name, filt, multi=False)
+    def delete_one(self, filt: dict, *, relaxed: bool = False) -> int:
+        return self._c.delete_by_filter(self._name, filt, multi=False, relaxed=relaxed)
 
-    def delete_many(self, filt: dict) -> int:
-        return self._c.delete_by_filter(self._name, filt, multi=True)
+    def delete_many(self, filt: dict, *, relaxed: bool = False) -> int:
+        return self._c.delete_by_filter(self._name, filt, multi=True, relaxed=relaxed)
 
     # --- reads ---
 

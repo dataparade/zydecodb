@@ -52,10 +52,14 @@ with Client("127.0.0.1", 9470, api_key="YOUR_KEY") as db:
 ## Durability
 
 Writes are durable (fsync-on-commit) by default. For latency-sensitive,
-loss-tolerant writes, pass `relaxed=True` to acknowledge before the fsync:
+loss-tolerant writes, pass `relaxed=True` to acknowledge before the fsync.
+It is available on every write: `insert_one`, `replace_one`, `update_one`,
+`update_many`, `delete_one`, and `delete_many`.
 
 ```python
 users.insert_one(doc, relaxed=True)
+users.update_one({"_id": "ada"}, {"$inc": {"hits": 1}}, relaxed=True)
+users.delete_many({"stale": True}, relaxed=True)
 ```
 
 ## Running the tests

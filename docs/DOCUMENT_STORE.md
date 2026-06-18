@@ -193,6 +193,42 @@ consistent snapshot under the lock, then the scan runs lock-free against that
 pinned view, so a long scan does not block other clients' writes. This is why
 pagination can be repeatable-read across pages.
 
+### Single write lane (by design)
+
+ZydecoDB is **single-node, single-write-lane** on purpose. Every mutation
+funnels through the one engine `Mutex`, so writes are totally ordered by a
+single `seq` counter and there is exactly one writer at any instant. The target
+deployment is **one application per database**, where this is the right trade:
+
+- **Reads scale** via the two-phase snapshot path above (lock held only to pin a
+  snapshot; the scan is lock-free).
+- **Write throughput** is bounded by fsync latency, not by core count. It is
+  widened — not by adding writers — through **group commit** (many pending
+  commits share one fsync) and the **relaxed durability** knob below, never by a
+  second write path.
+
+This is a deliberate ceiling, not an oversight. Do **not** introduce a write
+path that bypasses the engine lock or allocates `seq` out of band: it would
+break the total order that crash recovery, snapshots, and pagination all rely
+on. Sharding into multiple independent write lanes is explicitly out of scope
+for the single-node product.
+
+The payoff of one lane is that **multi-document transactions** (opcodes
+`0x10`–`0x12`, reserved) become tractable later: stage N operations under the
+lock and commit them as one atomic WAL batch (the engine's existing
+all-or-nothing `WAL_BATCH` primitive), with no cross-shard coordination to
+reason about.
+
+### Durability is per-write
+
+Durability is chosen per commit, not globally. `sync` mode (default) fsyncs
+before acknowledging; `periodic` mode acks after the buffered append and fsyncs
+on an interval. Independently, any single write may pass a **`relaxed`** flag to
+acknowledge before its fsync (see `crates/zydecodb/src/commit.rs`). `relaxed` is
+available on every user write — inserts, replaces, filter-based updates, and
+filter-based deletes. DDL (`IndexDef`) and delete-by-id (`DocDel`) are always
+made durable before acknowledging.
+
 ---
 
 ## Design notes
