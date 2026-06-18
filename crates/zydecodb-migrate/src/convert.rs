@@ -586,10 +586,7 @@ mod tests {
 
     #[test]
     fn json_passthrough() {
-        assert_eq!(
-            convert_scalar("jsonb", r#"{"a":1}"#),
-            json!({"a": 1})
-        );
+        assert_eq!(convert_scalar("jsonb", r#"{"a":1}"#), json!({"a": 1}));
     }
 
     #[test]

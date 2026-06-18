@@ -273,7 +273,11 @@ fn parse_create_table(stmt: &str) -> MigrateResult<Option<Table>> {
     }
     let close = match stmt.rfind(')') {
         Some(p) if p > open => p,
-        _ => return Err(MigrateError::Parse(format!("unterminated CREATE TABLE {name}"))),
+        _ => {
+            return Err(MigrateError::Parse(format!(
+                "unterminated CREATE TABLE {name}"
+            )))
+        }
     };
     let body = &stmt[open + 1..close];
 
@@ -333,7 +337,16 @@ fn parse_column_def(def: &str) -> Option<Column> {
 fn extract_type(rest: &str) -> String {
     let upper = rest.to_ascii_uppercase();
     let mut cut = rest.len();
-    for kw in [" NOT NULL", " DEFAULT", " PRIMARY KEY", " UNIQUE", " REFERENCES", " CHECK", " COLLATE", " GENERATED"] {
+    for kw in [
+        " NOT NULL",
+        " DEFAULT",
+        " PRIMARY KEY",
+        " UNIQUE",
+        " REFERENCES",
+        " CHECK",
+        " COLLATE",
+        " GENERATED",
+    ] {
         if let Some(p) = upper.find(kw) {
             cut = cut.min(p);
         }
@@ -705,14 +718,23 @@ CREATE INDEX idx_orders_customer ON public.orders USING btree (customer_id);
         assert_eq!(fk.columns, vec!["customer_id".to_string()]);
         assert_eq!(fk.ref_table, "customers");
         assert_eq!(fk.ref_columns, vec!["id".to_string()]);
-        assert_eq!(orders.indexed_columns, vec![vec!["customer_id".to_string()]]);
+        assert_eq!(
+            orders.indexed_columns,
+            vec![vec!["customer_id".to_string()]]
+        );
     }
 
     #[test]
     fn copy_escapes_decoded() {
         assert_eq!(decode_copy_field("\\N"), None);
         assert_eq!(decode_copy_field("a\\tb"), Some("a\tb".to_string()));
-        assert_eq!(decode_copy_field("line\\nbreak"), Some("line\nbreak".to_string()));
-        assert_eq!(decode_copy_field("c:\\\\path"), Some("c:\\path".to_string()));
+        assert_eq!(
+            decode_copy_field("line\\nbreak"),
+            Some("line\nbreak".to_string())
+        );
+        assert_eq!(
+            decode_copy_field("c:\\\\path"),
+            Some("c:\\path".to_string())
+        );
     }
 }

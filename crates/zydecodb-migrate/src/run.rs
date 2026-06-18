@@ -27,9 +27,8 @@ pub struct MigrateOptions {
 
 /// Parse, classify, preview, confirm, then load into the target server.
 pub fn run(opts: MigrateOptions) -> MigrateResult<()> {
-    let contents = std::fs::read_to_string(&opts.file).map_err(|e| {
-        MigrateError::Io(format!("reading {}: {e}", opts.file.display()))
-    })?;
+    let contents = std::fs::read_to_string(&opts.file)
+        .map_err(|e| MigrateError::Io(format!("reading {}: {e}", opts.file.display())))?;
 
     let dump = pgdump::parse(&contents)?;
     if dump.tables.is_empty() {
@@ -136,8 +135,11 @@ fn print_preview(dump: &pgdump::Dump, plan: &Plan) {
             let snap = if embed.snapshots.is_empty() {
                 String::new()
             } else {
-                let names: Vec<&str> =
-                    embed.snapshots.iter().map(|s| s.ref_table.as_str()).collect();
+                let names: Vec<&str> = embed
+                    .snapshots
+                    .iter()
+                    .map(|s| s.ref_table.as_str())
+                    .collect();
                 format!(", snapshot {}", names.join("+"))
             };
             println!("      embed {} as {}{}", embed.child_table, shape, snap);

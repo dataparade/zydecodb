@@ -10,9 +10,7 @@ use crate::error::{MigrateError, MigrateResult};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-use zydecodb_document::wire::{
-    DocPutPayload, FindPayload, IndexDefPayload, WireProjection,
-};
+use zydecodb_document::wire::{DocPutPayload, FindPayload, IndexDefPayload, WireProjection};
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{
     Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN, PROTO_VERSION,
@@ -46,8 +44,7 @@ impl Client {
 
     /// Authenticate the connection with a raw API key (sent as UTF-8 bytes).
     pub fn session_init(&mut self, api_key: &str) -> MigrateResult<()> {
-        let (status, body) =
-            self.request(Command::SessionInit, api_key.as_bytes().to_vec())?;
+        let (status, body) = self.request(Command::SessionInit, api_key.as_bytes().to_vec())?;
         expect_ok(status, &body, "SessionInit")
     }
 
@@ -150,11 +147,7 @@ impl Client {
     }
 
     /// Send one framed request and read the framed response.
-    fn request(
-        &mut self,
-        command: Command,
-        payload: Vec<u8>,
-    ) -> MigrateResult<(Status, Vec<u8>)> {
+    fn request(&mut self, command: Command, payload: Vec<u8>) -> MigrateResult<(Status, Vec<u8>)> {
         let bytes = RequestEnvelope::new(command, payload).encode();
         self.stream
             .write_all(&bytes)

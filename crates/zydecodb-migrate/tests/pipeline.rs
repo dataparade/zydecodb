@@ -136,7 +136,12 @@ fn docs_by_id(dump: &pgdump::Dump, plan: &classify::Plan, coll: &str) -> Vec<(St
     build_collection_docs(dump, cp)
         .expect("docs build")
         .into_iter()
-        .map(|d| (d.id, serde_json::from_slice(&d.body).expect("valid json body")))
+        .map(|d| {
+            (
+                d.id,
+                serde_json::from_slice(&d.body).expect("valid json body"),
+            )
+        })
         .collect()
 }
 
@@ -178,7 +183,10 @@ fn user_doc_embeds_one_to_one_profile_object_and_address_array() {
 fn order_doc_embeds_items_with_product_snapshot_in_minor_units() {
     let (dump, plan) = build_plan();
     let orders = docs_by_id(&dump, &plan, "orders");
-    let (_id, o1000) = orders.iter().find(|(id, _)| id == "1000").expect("order 1000");
+    let (_id, o1000) = orders
+        .iter()
+        .find(|(id, _)| id == "1000")
+        .expect("order 1000");
 
     let items = o1000["order_items"].as_array().expect("items array");
     assert_eq!(items.len(), 2); // items 1 and 2 belong to order 1000
@@ -196,7 +204,10 @@ fn order_doc_embeds_items_with_product_snapshot_in_minor_units() {
 fn product_doc_absorbs_join_table_as_id_list() {
     let (dump, plan) = build_plan();
     let products = docs_by_id(&dump, &plan, "products");
-    let (_id, widget) = products.iter().find(|(id, _)| id == "50").expect("product 50");
+    let (_id, widget) = products
+        .iter()
+        .find(|(id, _)| id == "50")
+        .expect("product 50");
 
     let tag_ids = widget["tag_ids"].as_array().expect("tag_ids array");
     let mut ids: Vec<String> = tag_ids
@@ -253,8 +264,5 @@ fn dropped_report_accounts_for_dropped_constraints() {
         .any(|(t, c)| t == "products" && c == &vec!["sku".to_string()]));
     // NOT NULL is only reported for columns that survive as queryable fields.
     assert!(d.not_null.iter().any(|(t, c)| t == "users" && c == "email"));
-    assert!(d
-        .not_null
-        .iter()
-        .all(|(t, _)| plan.collection(t).is_some()));
+    assert!(d.not_null.iter().all(|(t, _)| plan.collection(t).is_some()));
 }

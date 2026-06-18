@@ -151,9 +151,8 @@ pub fn classify(dump: &Dump, graph: &Graph) -> Plan {
         let role = decide_role(t, dump, graph);
         roles.push((t.name.clone(), role));
     }
-    let role_of = |name: &str| -> Option<&Role> {
-        roles.iter().find(|(n, _)| n == name).map(|(_, r)| r)
-    };
+    let role_of =
+        |name: &str| -> Option<&Role> { roles.iter().find(|(n, _)| n == name).map(|(_, r)| r) };
 
     // --- Build collections for surviving tables ---
     for t in &dump.tables {
@@ -234,9 +233,13 @@ pub fn classify(dump: &Dump, graph: &Graph) -> Plan {
         for u in &t.unique {
             if all_top_level(t, u) {
                 push_unique_index(&mut coll.indexes, unique_index_name(u), u.clone(), true);
-                plan.dropped.preserved_unique.push((t.name.clone(), u.clone()));
+                plan.dropped
+                    .preserved_unique
+                    .push((t.name.clone(), u.clone()));
             } else {
-                plan.dropped.dropped_unique.push((t.name.clone(), u.clone()));
+                plan.dropped
+                    .dropped_unique
+                    .push((t.name.clone(), u.clone()));
             }
         }
 
@@ -261,7 +264,11 @@ pub fn classify(dump: &Dump, graph: &Graph) -> Plan {
 
 /// Decide the role of one table.
 fn decide_role(t: &Table, _dump: &Dump, graph: &Graph) -> Role {
-    if graph.table_stats(&t.name).map(|s| s.is_join_table).unwrap_or(false) {
+    if graph
+        .table_stats(&t.name)
+        .map(|s| s.is_join_table)
+        .unwrap_or(false)
+    {
         return Role::Join;
     }
     // The owning relationship (smallest fan-out among this table's FKs).
@@ -293,15 +300,20 @@ fn decide_role(t: &Table, _dump: &Dump, graph: &Graph) -> Role {
 /// The owning relationship for `child`: among its foreign keys (to in-dump
 /// tables), the one with the smallest observed fan-out. Few-children-per-parent
 /// marks ownership; large fan-out marks a shared entity.
-fn owning_relationship<'a>(graph: &'a Graph, child: &str) -> Option<&'a crate::graph::Relationship> {
+fn owning_relationship<'a>(
+    graph: &'a Graph,
+    child: &str,
+) -> Option<&'a crate::graph::Relationship> {
     graph
         .relationships
         .iter()
         .filter(|r| r.child == child)
         .min_by(|a, b| {
-            a.max_fanout
-                .cmp(&b.max_fanout)
-                .then(a.avg_fanout.partial_cmp(&b.avg_fanout).unwrap_or(std::cmp::Ordering::Equal))
+            a.max_fanout.cmp(&b.max_fanout).then(
+                a.avg_fanout
+                    .partial_cmp(&b.avg_fanout)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         })
 }
 
@@ -449,11 +461,8 @@ fn assign_load_order(plan: &mut Plan, graph: &Graph) {
         }
         coll.load_order = parents.len();
     }
-    plan.collections.sort_by(|a, b| {
-        a.load_order
-            .cmp(&b.load_order)
-            .then(a.name.cmp(&b.name))
-    });
+    plan.collections
+        .sort_by(|a, b| a.load_order.cmp(&b.load_order).then(a.name.cmp(&b.name)));
 }
 
 /// Gather the not-null / check / fk facts for the dropped-constraints report.

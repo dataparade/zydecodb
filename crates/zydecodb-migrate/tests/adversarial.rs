@@ -26,7 +26,10 @@ ALTER TABLE ONLY public.users ADD CONSTRAINT users_pkey PRIMARY KEY (id);
     let err = pgdump::parse(dump).expect_err("must reject --inserts dumps");
     let msg = err.to_string().to_lowercase();
     assert!(msg.contains("insert"), "error should name INSERT: {msg}");
-    assert!(msg.contains("copy"), "error should point at COPY format: {msg}");
+    assert!(
+        msg.contains("copy"),
+        "error should point at COPY format: {msg}"
+    );
 }
 
 /// Two tables with the same name in different schemas both normalize to the bare
@@ -148,7 +151,10 @@ fn array_unquoted_null_element_is_json_null() {
 #[test]
 fn empty_and_numeric_arrays() {
     assert_eq!(convert::convert_scalar("integer[]", "{}"), json!([]));
-    assert_eq!(convert::convert_scalar("integer[]", "{1,2,3}"), json!([1, 2, 3]));
+    assert_eq!(
+        convert::convert_scalar("integer[]", "{1,2,3}"),
+        json!([1, 2, 3])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +222,9 @@ COPY public."My.Table" (id, name) FROM stdin;
 ALTER TABLE ONLY public."My.Table" ADD CONSTRAINT mt_pkey PRIMARY KEY (id);
 "#;
     let parsed = pgdump::parse(dump).expect("quoted dotted identifier parses");
-    let t = parsed.table("My.Table").expect("table keyed by its real name");
+    let t = parsed
+        .table("My.Table")
+        .expect("table keyed by its real name");
     assert_eq!(t.columns.len(), 2);
     // COPY data routed to the same table (name matched).
     assert_eq!(t.rows.len(), 1);
