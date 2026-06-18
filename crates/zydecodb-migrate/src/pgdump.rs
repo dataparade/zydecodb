@@ -126,6 +126,15 @@ pub fn parse(contents: &str) -> MigrateResult<Dump> {
         if is_kw(line, "CREATE TABLE ") {
             let (stmt, next) = take_statement(&lines, i);
             i = next;
+            // Partitioned/inherited tables don't reshape to a single faithful
+            // collection (their data lives in or is split across other tables),
+            // so refuse rather than emit a garbage table from the mangled DDL.
+            if let Some(feature) = unsupported_table_feature(&stmt) {
+                return Err(MigrateError::Parse(format!(
+                    "unsupported table feature ({feature}); partitioned and \
+                     inherited tables cannot be migrated automatically"
+                )));
+            }
             if let Some(table) = parse_create_table(&stmt)? {
                 // Two tables that normalize to the same bare name (e.g. the same
                 // table in different schemas) would clobber each other and
@@ -234,6 +243,22 @@ fn ends_inside_quote(s: &str) -> bool {
 }
 
 // ---- CREATE TABLE ----
+
+/// Detect a `CREATE TABLE` shape we deliberately do not support, returning the
+/// construct's name for the error message. Matched on word boundaries so a mere
+/// column named `partition_key` does not trip it.
+fn unsupported_table_feature(stmt: &str) -> Option<&'static str> {
+    let upper = stmt.to_ascii_uppercase();
+    if upper.contains(" PARTITION OF ") {
+        Some("PARTITION OF")
+    } else if upper.contains(" PARTITION BY ") {
+        Some("PARTITION BY")
+    } else if upper.contains(" INHERITS ") || upper.contains(" INHERITS(") {
+        Some("INHERITS")
+    } else {
+        None
+    }
+}
 
 fn parse_create_table(stmt: &str) -> MigrateResult<Option<Table>> {
     // CREATE TABLE <name> ( <col defs> );
@@ -478,14 +503,51 @@ fn strip_kw<'a>(line: &'a str, kw: &str) -> Option<&'a str> {
 }
 
 /// Normalize an identifier: trim, drop trailing punctuation, strip a schema
-/// qualifier, and remove surrounding double quotes.
+/// qualifier, and remove surrounding double quotes. The schema split happens on
+/// the last `.` that is **outside** double quotes, so a quoted identifier like
+/// `public."My.Table"` resolves to `My.Table`, not `Table`.
 fn norm_ident(s: &str) -> String {
     let mut s = s.trim();
     s = s.trim_end_matches([';', ',', '(']);
     s = s.trim();
-    // Strip schema: take the segment after the last unquoted '.'.
-    let last = s.rsplit('.').next().unwrap_or(s);
-    last.trim().trim_matches('"').to_string()
+    unquote_ident(last_unquoted_segment(s))
+}
+
+/// The segment after the last unquoted `.` (the table part of a qualified name).
+fn last_unquoted_segment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut in_quotes = false;
+    let mut last_dot: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_quotes && bytes.get(i + 1) == Some(&b'"') {
+                    i += 2; // escaped "" inside a quoted identifier
+                    continue;
+                }
+                in_quotes = !in_quotes;
+            }
+            b'.' if !in_quotes => last_dot = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    match last_dot {
+        Some(p) => &s[p + 1..],
+        None => s,
+    }
+}
+
+/// Strip surrounding double quotes from one identifier segment, collapsing the
+/// `""` escape to a single quote.
+fn unquote_ident(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        s[1..s.len() - 1].replace("\"\"", "\"")
+    } else {
+        s.to_string()
+    }
 }
 
 /// True if `s` looks like a bare column identifier (no function call / operator).

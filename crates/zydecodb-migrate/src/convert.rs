@@ -347,25 +347,105 @@ fn decimal_to_minor(raw: &str, scale: u32) -> Option<i128> {
     Some(value)
 }
 
-/// Parse a Postgres array literal like `{1,2,3}` or `{a,b}` into a JSON array.
-/// Element typing is best-effort (numbers parse as numbers, else strings).
+/// Parse a Postgres array literal into a JSON array, honoring the text format's
+/// quoting rules: elements containing commas/braces/spaces are double-quoted,
+/// `\"` and `\\` are escapes inside a quoted element, an unquoted `NULL` is the
+/// SQL null (the quoted string `"NULL"` is just text), and nested `{...}` are
+/// multidimensional arrays. Falls back to the raw string if it is not an array
+/// literal at all. Element typing is best-effort.
 fn convert_array(elem_type: &str, raw: &str) -> Value {
-    let inner = raw.trim();
-    let inner = inner
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .unwrap_or(inner);
-    if inner.is_empty() {
-        return Value::Array(Vec::new());
+    match parse_array_literal(elem_type, raw.trim()) {
+        Some(v) => v,
+        None => Value::String(raw.to_string()),
     }
-    let items = inner
-        .split(',')
-        .map(|p| {
-            let p = p.trim().trim_matches('"');
-            convert_scalar(elem_type, p)
-        })
-        .collect();
-    Value::Array(items)
+}
+
+/// Parse a `{...}` array body (recursively for nested arrays).
+fn parse_array_literal(elem_type: &str, s: &str) -> Option<Value> {
+    let inner = s.strip_prefix('{')?.strip_suffix('}')?;
+    let mut out = Vec::new();
+    if inner.trim().is_empty() {
+        return Some(Value::Array(out));
+    }
+    for tok in split_array_tokens(inner) {
+        out.push(array_token_to_value(elem_type, &tok));
+    }
+    Some(Value::Array(out))
+}
+
+/// Split an array body into top-level element tokens, respecting double quotes
+/// (with `\` escaping) and nested-brace depth. Tokens keep their quotes/braces.
+fn split_array_tokens(inner: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut depth = 0i32;
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            cur.push(c);
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    cur.push(next); // escaped char stays inside the token
+                }
+            } else if c == '"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_quotes = true;
+                cur.push(c);
+            }
+            '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => tokens.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    tokens.push(cur);
+    tokens
+}
+
+/// Interpret one array element token.
+fn array_token_to_value(elem_type: &str, tok: &str) -> Value {
+    let t = tok.trim();
+    if t.starts_with('{') {
+        if let Some(v) = parse_array_literal(elem_type, t) {
+            return v;
+        }
+    }
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        let unescaped = unescape_array_element(&t[1..t.len() - 1]);
+        return convert_scalar(elem_type, &unescaped);
+    }
+    if t.eq_ignore_ascii_case("null") {
+        return Value::Null;
+    }
+    convert_scalar(elem_type, t)
+}
+
+/// Undo `\"` / `\\` escaping inside a quoted array element.
+fn unescape_array_element(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Parse `YYYY-MM-DD[ HH:MM:SS[.fff]]` (optionally `T`-separated, optional tz)
