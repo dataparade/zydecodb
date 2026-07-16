@@ -28,7 +28,9 @@ Most document databases suffer from a "parse tax" during unindexed queries, wast
 ZydecoDB bypasses this entirely using a custom binary format (`ZDoc`) and a zero-copy evaluation struct called `ValueView`. When evaluating a query, `ValueView` navigates the raw byte array by jumping pointers based on field lengths. It skips irrelevant fields without allocating memory or parsing strings.
 
 ### Performance Impact
-In local benchmarks, ZydecoDB performs an unindexed full collection scan of 5,000 complex documents in **~80ms** (evaluating roughly **62,500 documents per second**), entirely bypassing the overhead of `JSON.parse()`.
+In local benchmarks, ZydecoDB performs an unindexed full collection scan of 50,000 complex documents in **~10,215ms** (evaluating roughly **4,894 documents per second**).
+
+*Note: While 5,000 documents evaluate in ~80ms (62,500 docs/sec) when fully cached in L1/L2 CPU cache, the 50,000 document benchmark (10.2s) reflects the true performance when the working set exceeds the CPU cache and requires traversing the 64MB block cache and streaming 10,000 matching JSON objects over the TCP socket to the client.*
 
 ### Implementation
 The evaluation path defers full materialization until the document is confirmed to match the filter:
