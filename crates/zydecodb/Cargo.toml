@@ -38,6 +38,7 @@ rustls-pemfile = "2"
 tiny_http = "0.12"
 signal-hook = "0.3"
 polling = "3"
+arc-swap = "1.9.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -11,7 +11,7 @@ pub struct SecurityRuntime {
     pub require_auth: bool,
     pub allow_unauthenticated_ping: bool,
     pub legacy_single_tenant: bool,
-    pub keys: Arc<KeyStore>,
+    pub keys: Arc<arc_swap::ArcSwap<KeyStore>>,
     pub audit: crate::config::AuditConfig,
     pub rate_limit_rps: u32,
     pub max_connections: usize,
@@ -28,8 +28,8 @@ pub struct SecurityRuntime {
 
 impl SecurityRuntime {
     pub fn from_config(config: &Config) -> Result<Self, super::keys::KeyError> {
-        let keys = Arc::new(KeyStore::load(&config.security.keys_file)?);
-        let tenant_limits = Arc::new(TenantLimits::from_records(keys.tenant_records()));
+        let keys = Arc::new(arc_swap::ArcSwap::from_pointee(KeyStore::load(&config.security.keys_file)?));
+        let tenant_limits = Arc::new(TenantLimits::from_records(keys.load().tenant_records()));
         Ok(SecurityRuntime {
             require_auth: config.effective_require_auth(),
             allow_unauthenticated_ping: config.security.allow_unauthenticated_ping,
@@ -67,7 +67,7 @@ impl Default for SecurityRuntime {
             require_auth: false,
             allow_unauthenticated_ping: true,
             legacy_single_tenant: true,
-            keys: Arc::new(KeyStore::load(std::path::Path::new("/nonexistent")).unwrap()),
+            keys: Arc::new(arc_swap::ArcSwap::from_pointee(KeyStore::load(std::path::Path::new("/nonexistent")).unwrap())),
             audit: crate::config::AuditConfig::default(),
             rate_limit_rps: 1000,
             max_connections: 256,

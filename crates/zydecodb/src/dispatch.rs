@@ -138,7 +138,7 @@ fn handle_session_init(
     if req.payload.is_empty() || req.payload.len() > 512 {
         return unauthorized(session, Command::SessionInit, "invalid api key");
     }
-    match security.keys.verify(&req.payload) {
+    match security.keys.load().verify(&req.payload) {
         Some(record) => {
             let new_session = SessionState::from_key_record(&record);
             InnerOutcome {

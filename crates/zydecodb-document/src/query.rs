@@ -16,7 +16,7 @@ use crate::catalog::Catalog;
 use crate::error::{DocError, DocResult};
 use crate::filter::Filter;
 use crate::planner::{self, AccessPath};
-use crate::store::strip_value_kind;
+use crate::store::{strip_value_kind, stored_to_json_vec, VK_ZDOC};
 use crate::{encoding, keys};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
@@ -71,7 +71,7 @@ pub fn get_by_id(
     let dk = keys::doc_key(prefix, coll.id, doc_id);
     Ok(snap
         .get(&dk)?
-        .map(|stored| strip_value_kind(&stored).to_vec()))
+        .map(|stored| stored_to_json_vec(&stored)))
 }
 
 /// Build a scan spec from the catalog and (optional) JSON-array bounds. Bounds
@@ -161,7 +161,7 @@ pub fn execute_index_scan(snap: &SnapshotHandle, spec: &ScanSpec) -> DocResult<Q
             let mut dk = spec.doc_prefix.clone();
             dk.extend_from_slice(&doc_id);
             snap.get(&dk)?
-                .map(|stored| strip_value_kind(&stored).to_vec())
+                .map(|stored| stored_to_json_vec(&stored))
         } else {
             None
         };
@@ -276,12 +276,55 @@ fn sort_matches_index(sort: &[(String, bool)], fields: &[String]) -> bool {
 /// (raw-wire writes) did not include it. A body that already has `_id` keeps
 /// its value (the driver convention).
 fn materialize(stored: &[u8], doc_id: &[u8]) -> Option<Value> {
-    let mut v: Value = serde_json::from_slice(strip_value_kind(stored)).ok()?;
+    let mut v: Value = if stored[0] == VK_ZDOC {
+        crate::binary::ValueView::new(strip_value_kind(stored)).to_value()
+    } else {
+        serde_json::from_slice(strip_value_kind(stored)).ok()?
+    };
     if let Value::Object(map) = &mut v {
         map.entry(planner::ID_FIELD.to_string())
             .or_insert_with(|| Value::String(String::from_utf8_lossy(doc_id).into_owned()));
     }
     Some(v)
+}
+
+fn check_filter<'a>(stored: &'a [u8], filter: &crate::filter::Filter, doc_id: &[u8]) -> bool {
+    let kind = stored[0];
+    let payload = crate::store::strip_value_kind(stored);
+    let mut temp_zdoc = Vec::new();
+    let view = if kind == crate::store::VK_ZDOC {
+        crate::binary::ValueView::new(payload)
+    } else {
+        let val: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+        temp_zdoc = crate::binary::ZDocBuilder::from_value(&val);
+        crate::binary::ValueView::new(&temp_zdoc)
+    };
+    
+    filter.matches(view, Some(doc_id))
+}
+
+fn parse_doc(stored: &[u8], doc_id: &[u8]) -> Option<serde_json::Value> {
+    let kind = stored[0];
+    let payload = crate::store::strip_value_kind(stored);
+    let mut v = if kind == crate::store::VK_ZDOC {
+        crate::binary::ValueView::new(payload).to_value()
+    } else {
+        serde_json::from_slice(payload).ok()?
+    };
+    
+    if let serde_json::Value::Object(map) = &mut v {
+        map.entry(crate::planner::ID_FIELD.to_string())
+            .or_insert_with(|| serde_json::Value::String(String::from_utf8_lossy(doc_id).into_owned()));
+    }
+    Some(v)
+}
+
+fn append_id(mut v: serde_json::Value, doc_id: &[u8]) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut v {
+        map.entry(crate::planner::ID_FIELD.to_string())
+            .or_insert_with(|| serde_json::Value::String(String::from_utf8_lossy(doc_id).into_owned()));
+    }
+    v
 }
 
 fn make_row(doc_id: Vec<u8>, body: &Value, proj: &Option<Projection>) -> DocResult<QueryRow> {
@@ -315,9 +358,11 @@ pub fn execute_find(
             let dk = keys::doc_key(prefix, coll.id, id);
             let mut rows = Vec::new();
             if let Some(stored) = snap.get(&dk)? {
-                if let Some(v) = materialize(&stored, id) {
-                    if spec.filter.matches(&v) && spec.skip == 0 {
-                        rows.push(make_row(id.clone(), &v, &spec.projection)?);
+                if check_filter(&stored, &spec.filter, id) {
+                    if spec.skip == 0 {
+                        if let Some(v) = parse_doc(&stored, id) {
+                            rows.push(make_row(id.clone(), &v, &spec.projection)?);
+                        }
                     }
                 }
             }
@@ -371,22 +416,18 @@ fn key_mode_page(
         let (ikey, doc_id) = item?;
         let mut dk = doc_prefix.to_vec();
         dk.extend_from_slice(&doc_id);
-        let v = match snap.get(&dk)? {
-            Some(stored) => match materialize(&stored, &doc_id) {
-                Some(v) => v,
-                None => continue,
-            },
-            None => continue,
-        };
-        if !spec.filter.matches(&v) {
-            continue;
+        if let Some(stored) = snap.get(&dk)? {
+            if check_filter(&stored, &spec.filter, &doc_id) {
+                if rows.len() == limit {
+                    next_cursor = last_match_key.map(|k| encode_key_cursor(snap.seq_upper(), &k));
+                    break;
+                }
+                if let Some(v) = parse_doc(&stored, &doc_id) {
+                    rows.push(make_row(doc_id, &v, &spec.projection)?);
+                    last_match_key = Some(ikey);
+                }
+            }
         }
-        if rows.len() == limit {
-            next_cursor = last_match_key.map(|k| encode_key_cursor(snap.seq_upper(), &k));
-            break;
-        }
-        rows.push(make_row(doc_id, &v, &spec.projection)?);
-        last_match_key = Some(ikey);
     }
 
     Ok(QueryPage { rows, next_cursor })
@@ -421,7 +462,7 @@ fn offset_mode_page(
 /// and call `f(doc_id, body)` for each match (return `false` to stop early).
 /// Bodies that fail to parse are skipped. `ById` is materialized as a single
 /// point lookup so callers (count/distinct/find_ids) work for every path.
-fn for_each_match<F: FnMut(Vec<u8>, &Value) -> DocResult<bool>>(
+fn for_each_match<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
     snap: &SnapshotHandle,
     filter: &Filter,
     path: &AccessPath,
@@ -434,10 +475,8 @@ fn for_each_match<F: FnMut(Vec<u8>, &Value) -> DocResult<bool>>(
             let mut dk = doc_prefix.to_vec();
             dk.extend_from_slice(id);
             if let Some(stored) = snap.get(&dk)? {
-                if let Some(v) = materialize(&stored, id) {
-                    if filter.matches(&v) {
-                        f(id.clone(), &v)?;
-                    }
+                if check_filter(&stored, filter, id) {
+                    f(id.clone(), &stored)?;
                 }
             }
         }
@@ -448,8 +487,8 @@ fn for_each_match<F: FnMut(Vec<u8>, &Value) -> DocResult<bool>>(
                 let mut dk = doc_prefix.to_vec();
                 dk.extend_from_slice(&doc_id);
                 if let Some(stored) = snap.get(&dk)? {
-                    if let Some(v) = materialize(&stored, &doc_id) {
-                        if filter.matches(&v) && !f(doc_id, &v)? {
+                    if check_filter(&stored, filter, &doc_id) {
+                        if !f(doc_id, &stored)? {
                             return Ok(());
                         }
                     }
@@ -462,8 +501,8 @@ fn for_each_match<F: FnMut(Vec<u8>, &Value) -> DocResult<bool>>(
             for item in iter {
                 let (doc_key, stored) = item?;
                 let doc_id = keys::doc_id_from_doc_key(prefix_len, &doc_key);
-                if let Some(v) = materialize(&stored, &doc_id) {
-                    if filter.matches(&v) && !f(doc_id, &v)? {
+                if check_filter(&stored, filter, &doc_id) {
+                    if !f(doc_id, &stored)? {
                         return Ok(());
                     }
                 }
@@ -579,16 +618,18 @@ pub fn distinct(
 ) -> DocResult<Vec<Value>> {
     let (path, doc_prefix, prefix_len) = plan_scan(catalog, prefix, collection, filter)?;
     let mut seen: Vec<Value> = Vec::new();
-    for_each_match(snap, filter, &path, &doc_prefix, prefix_len, |_id, v| {
-        let val = encoding::extract_path(v, field);
-        if seen
-            .binary_search_by(|probe| encoding::cmp_values(probe, &val))
-            .is_err()
-        {
-            let pos = seen
+    for_each_match(snap, filter, &path, &doc_prefix, prefix_len, |doc_id, stored| {
+        if let Some(v) = parse_doc(stored, &doc_id) {
+            let val = encoding::extract_path(&v, field);
+            if seen
                 .binary_search_by(|probe| encoding::cmp_values(probe, &val))
-                .unwrap_or_else(|e| e);
-            seen.insert(pos, val);
+                .is_err()
+            {
+                let pos = seen
+                    .binary_search_by(|probe| encoding::cmp_values(probe, &val))
+                    .unwrap_or_else(|e| e);
+                seen.insert(pos, val);
+            }
         }
         Ok(true)
     })?;
@@ -614,7 +655,7 @@ fn stream_offset_page(
         path,
         doc_prefix,
         prefix_len,
-        |doc_id, v| {
+        |doc_id, stored| {
             if seen < offset {
                 seen += 1;
                 return Ok(true);
@@ -623,13 +664,40 @@ fn stream_offset_page(
                 has_more = true;
                 return Ok(false);
             }
-            rows.push(make_row(doc_id, v, &spec.projection)?);
+            if let Some(v) = parse_doc(stored, &doc_id) {
+                rows.push(make_row(doc_id, &v, &spec.projection)?);
+            }
             Ok(true)
         },
     )?;
 
     let next_cursor = has_more.then(|| encode_offset_cursor(snap.seq_upper(), offset + limit));
     Ok(QueryPage { rows, next_cursor })
+}
+
+fn extract_sort_keys(stored: &[u8], sort: &[(String, bool)]) -> Vec<Vec<u8>> {
+    let kind = stored[0];
+    let payload = crate::store::strip_value_kind(stored);
+    let mut temp_zdoc = Vec::new();
+    let view = if kind == crate::store::VK_ZDOC {
+        crate::binary::ValueView::new(payload)
+    } else {
+        let val: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+        temp_zdoc = crate::binary::ZDocBuilder::from_value(&val);
+        crate::binary::ValueView::new(&temp_zdoc)
+    };
+
+    let mut keys = Vec::with_capacity(sort.len());
+    for (path, _) in sort {
+        if let Some(v) = view.get_path(path) {
+            let mut out = Vec::new();
+            crate::encoding::encode_value(&v.to_value(), &mut out);
+            keys.push(out);
+        } else {
+            keys.push(vec![0x00]); // TAG_NULL
+        }
+    }
+    keys
 }
 
 fn buffered_sort_page(
@@ -641,7 +709,7 @@ fn buffered_sort_page(
     limit: usize,
 ) -> DocResult<QueryPage> {
     let prefix_len = doc_prefix.len().saturating_sub(1 + 4);
-    let mut all: Vec<(Vec<u8>, Value)> = Vec::new();
+    let mut all: Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
     let mut overflow = false;
 
     for_each_match(
@@ -650,12 +718,13 @@ fn buffered_sort_page(
         path,
         doc_prefix,
         prefix_len,
-        |doc_id, v| {
+        |doc_id, stored| {
             if all.len() >= MAX_SORT_BUFFER {
                 overflow = true;
                 return Ok(false);
             }
-            all.push((doc_id, v.clone()));
+            let keys = extract_sort_keys(stored, &spec.sort);
+            all.push((doc_id, stored.to_vec(), keys));
             Ok(true)
         },
     )?;
@@ -667,24 +736,24 @@ fn buffered_sort_page(
     }
 
     let sort = spec.sort.clone();
-    all.sort_by(|a, b| compare_docs(&a.1, &b.1, &sort));
+    all.sort_by(|a, b| compare_sort_keys(&a.2, &b.2, &sort));
 
     let total = all.len();
     let end = offset.saturating_add(limit).min(total);
     let slice_start = offset.min(total);
     let mut rows = Vec::with_capacity(end - slice_start);
-    for (doc_id, v) in &all[slice_start..end] {
-        rows.push(make_row(doc_id.clone(), v, &spec.projection)?);
+    for (doc_id, stored, _) in &all[slice_start..end] {
+        if let Some(v) = parse_doc(stored, doc_id) {
+            rows.push(make_row(doc_id.clone(), &v, &spec.projection)?);
+        }
     }
     let next_cursor = (end < total).then(|| encode_offset_cursor(snap.seq_upper(), end));
     Ok(QueryPage { rows, next_cursor })
 }
 
-fn compare_docs(a: &Value, b: &Value, sort: &[(String, bool)]) -> Ordering {
-    for (path, asc) in sort {
-        let av = encoding::extract_path(a, path);
-        let bv = encoding::extract_path(b, path);
-        let ord = encoding::cmp_values(&av, &bv);
+fn compare_sort_keys(a: &[Vec<u8>], b: &[Vec<u8>], sort: &[(String, bool)]) -> Ordering {
+    for (i, (_, asc)) in sort.iter().enumerate() {
+        let ord = a[i].cmp(&b[i]);
         let ord = if *asc { ord } else { ord.reverse() };
         if ord != Ordering::Equal {
             return ord;

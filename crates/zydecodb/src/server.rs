@@ -523,6 +523,7 @@ impl Server {
             let wake = Arc::clone(&self.wake);
             let poller = Arc::clone(&poller);
             let tenant_limits = Arc::clone(&security.tenant_limits);
+            let security_keys = Arc::clone(&security.keys);
             let keys_file = config.security.keys_file.clone();
             thread::Builder::new()
                 .name("zydecodb-signal".into())
@@ -532,7 +533,8 @@ impl Server {
                             match crate::security::keys::KeyStore::load(&keys_file) {
                                 Ok(store) => {
                                     tenant_limits.reload(store.tenant_records());
-                                    info!("reloaded per-tenant limits on SIGHUP");
+                                    security_keys.store(Arc::new(store));
+                                    info!("reloaded keys and per-tenant limits on SIGHUP");
                                 }
                                 Err(e) => warn!(error = %e, "SIGHUP reload failed"),
                             }
