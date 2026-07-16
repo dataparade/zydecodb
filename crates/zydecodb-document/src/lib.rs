@@ -23,6 +23,7 @@ pub mod query;
 pub mod store;
 pub mod update;
 pub mod wire;
+pub mod binary;
 
 pub use catalog::{Catalog, CollectionMeta, IndexMeta, SharedCatalog};
 pub use error::{DocError, DocResult};

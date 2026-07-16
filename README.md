@@ -24,10 +24,7 @@ Default listen: `127.0.0.1:9470`. Wire protocol: length-prefixed binary frames (
 ```bash
 # Terminal 1 — database (above)
 
-# Terminal 2 — demo client
-python3 examples/zydecodb_client.py
-
-# Or — user-management HTTP API
+# Terminal 2 — user-management HTTP API
 pip install -r examples/user_backend/requirements.txt
 python3 examples/user_backend/app.py --seed
 ```
@@ -58,7 +55,8 @@ users.delete_many({"age": {"$lt": 18}})
 ```bash
 zydecodb admin keys create --id backend --role read_write --keys-file /tmp/zydecodb-keys.toml
 export ZYDECODB_API_KEY="zdk_..."   # save the key printed once
-python3 examples/zydecodb_client.py --api-key "$ZYDECODB_API_KEY"
+export PYTHONPATH=clients/python
+python3 examples/user_backend/app.py --seed
 ```
 
 Details: [`docs/SECURITY.md`](docs/SECURITY.md).
@@ -74,12 +72,12 @@ Details: [`docs/SECURITY.md`](docs/SECURITY.md).
 - Secondary indexes maintained automatically and atomically on every write; synchronous backfill when added to an existing collection
 - **Unique indexes** enforced server-side (`create_index(..., unique=True)` → `Conflict` on duplicates)
 - **Repeatable-read pagination** — a cursor pins its snapshot, so later pages never shift under concurrent writes
-- An official, pip-installable Python driver with connection pooling, retries, and a typed error taxonomy ([`clients/python`](clients/python))
+- Official drivers for Python ([`clients/python`](clients/python)), Go ([`clients/go`](clients/go)), and TypeScript/Node ([`clients/typescript`](clients/typescript)) — connection pooling, retries, and a typed error taxonomy, all verified byte-for-byte against shared [conformance vectors](clients/conformance)
 
 **Key-value core**
-- `put`, `get`, `delete` over TCP
-- Atomic multi-key writes (`write_batch`) — one WAL record, all-or-nothing on crash
-- Ordered range scans and point-in-time snapshots
+- `put`, `get`, `delete` over TCP with optional TTL (`expires_at`)
+- *(Engine/Admin only)* Atomic multi-key writes (`write_batch`) — one WAL record, all-or-nothing on crash
+- *(Engine/Admin only)* Ordered range scans and point-in-time snapshots
 - Crash recovery (WAL replay)
 - Optional off-box WAL backup — [`docs/SHIPPING.md`](docs/SHIPPING.md)
 
@@ -100,7 +98,7 @@ Details: [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ## Beta scope
 
-**Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). MongoDB-style filters, sort, projection, pagination, partial updates, `count`/`distinct`, and automatic index maintenance; an example Python driver. Queries are correct on any field (collection scan) and fast when an index fits.
+**Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). MongoDB-style filters, sort, projection, pagination, partial updates, `count`/`distinct`, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits.
 
 **Not yet:** aggregation pipeline (`$group`/`$lookup`/`$unwind`), `$regex`/`$type`/array operators, upsert, document TTL, MVCC/multi-document transactions, and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). See [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) for the gap list and roadmap.
 
@@ -124,8 +122,9 @@ cargo test --workspace
 
 ## More docs
 
-- [`clients/python/README.md`](clients/python/README.md) — official Python driver (pooling, retries, typed errors)
-- [`examples/README.md`](examples/README.md) — Python client and user-backend walkthrough
+- Official drivers: [`clients/python`](clients/python/README.md), [`clients/go`](clients/go/README.md), [`clients/typescript`](clients/typescript/README.md) — each with pooling, retries, and typed errors
+- [`clients/conformance/README.md`](clients/conformance/README.md) — shared wire conformance vectors that keep every driver byte-compatible with the server
+- [`examples/README.md`](examples/README.md) — client and user-backend walkthroughs
 - [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) — document layer architecture, gaps, and roadmap
 - [`docs/SECURITY.md`](docs/SECURITY.md) — auth, TLS, tenants, deployment
 - [`docs/SHIPPING.md`](docs/SHIPPING.md) — off-box WAL durability for disaster recovery

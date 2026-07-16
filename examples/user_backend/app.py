@@ -39,13 +39,10 @@ import os
 import sys
 from pathlib import Path
 
-# Allow `from zydecodb_client import ...` when run from repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from flask import Flask, g, jsonify, request
 
 from store import AuthError, Conflict, NotFound, StoreError, UserStore, open_store
-from zydecodb_client import ZydecoDBClient, ZydecoDBError
+from zydecodb import Client, ZydecoError
 
 DEFAULT_ZYDECO_HOST = "127.0.0.1"
 DEFAULT_ZYDECO_PORT = 9470
@@ -60,12 +57,10 @@ def create_app(zydeco_host: str, zydeco_port: int, api_key: str | None = None) -
 
     @app.before_request
     def connect_db() -> None:
-        db = ZydecoDBClient(
-            app.config["ZYDECO_HOST"],
-            app.config["ZYDECO_PORT"],
+        db = Client(
+            f"{app.config['ZYDECO_HOST']}:{app.config['ZYDECO_PORT']}",
             api_key=app.config["ZYDECO_API_KEY"],
         )
-        db.connect()
         g.db = db
         g.store = UserStore(db)
         # Define the collection + indexes once per process, on first request.
@@ -167,8 +162,8 @@ def create_app(zydeco_host: str, zydeco_port: int, api_key: str | None = None) -
             g.store.logout(token)
         return "", 204
 
-    @app.errorhandler(ZydecoDBError)
-    def zydeco_error(exc: ZydecoDBError):
+    @app.errorhandler(ZydecoError)
+    def zydeco_error(exc: ZydecoError):
         return jsonify({"error": f"database error: {exc}"}), 503
 
     return app

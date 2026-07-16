@@ -14,6 +14,7 @@ use zydecodb_engine::keys::MAX_BATCH_KEYS;
 
 /// `value_kind` for a raw/JSON body (first byte of the stored value).
 pub const VK_RAW: u8 = 0x00;
+pub const VK_ZDOC: u8 = 0x01;
 
 /// Build the set of index keys this document occupies across all of the
 /// collection's indexes.
@@ -40,6 +41,18 @@ fn index_keys_for(
 /// Drop the leading `value_kind` byte, yielding the raw body payload.
 pub fn strip_value_kind(stored: &[u8]) -> &[u8] {
     stored.get(1..).unwrap_or(&[])
+}
+
+pub fn stored_to_json_vec(stored: &[u8]) -> Vec<u8> {
+    if stored.is_empty() { return Vec::new(); }
+    let kind = stored[0];
+    let payload = strip_value_kind(stored);
+    if kind == VK_ZDOC {
+        let val = crate::binary::ValueView::new(payload).to_value();
+        serde_json::to_vec(&val).unwrap_or_default()
+    } else {
+        payload.to_vec()
+    }
 }
 
 /// Reject a write that would place two different documents at the same value of
@@ -93,13 +106,16 @@ pub fn upsert_ops(
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
-    json: &[u8],
+    payload: &[u8], is_zdoc: bool,
 ) -> DocResult<Vec<BatchOp>> {
     let coll = catalog
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
-    let new_doc: Value =
-        serde_json::from_slice(json).map_err(|e| DocError::InvalidJson(e.to_string()))?;
+    let new_doc: Value = if is_zdoc {
+        crate::binary::ValueView::new(payload).to_value()
+    } else {
+        serde_json::from_slice(payload).map_err(|e| DocError::InvalidJson(e.to_string()))?
+    };
 
     // Reject unique-index violations before mutating anything.
     enforce_unique(engine, coll, prefix, doc_id, &new_doc)?;
@@ -109,12 +125,23 @@ pub fn upsert_ops(
     // Old index footprint (empty for an insert; best-effort if the old body is
     // unparseable, in which case its index entries are simply not cleaned up).
     let old_keys: BTreeSet<Vec<u8>> = match engine.get(&doc_key)? {
-        Some(stored) => match serde_json::from_slice::<Value>(strip_value_kind(&stored)) {
-            Ok(old) => index_keys_for(coll, prefix, doc_id, &old)
-                .into_iter()
-                .collect(),
-            Err(_) => BTreeSet::new(),
-        },
+        Some(stored) => {
+            if stored.is_empty() {
+                BTreeSet::new()
+            } else {
+                let old_kind = stored[0];
+                let old_payload = &stored[1..];
+                let old_val = if old_kind == VK_ZDOC {
+                    Some(crate::binary::ValueView::new(old_payload).to_value())
+                } else {
+                    serde_json::from_slice::<Value>(old_payload).ok()
+                };
+                match old_val {
+                    Some(old) => index_keys_for(coll, prefix, doc_id, &old).into_iter().collect(),
+                    None => BTreeSet::new(),
+                }
+            }
+        }
         None => BTreeSet::new(),
     };
     let new_keys: BTreeSet<Vec<u8>> = index_keys_for(coll, prefix, doc_id, &new_doc)
@@ -122,9 +149,9 @@ pub fn upsert_ops(
         .collect();
 
     let mut ops: Vec<BatchOp> = Vec::with_capacity(1 + old_keys.len() + new_keys.len());
-    let mut value = Vec::with_capacity(1 + json.len());
-    value.push(VK_RAW);
-    value.extend_from_slice(json);
+    let mut value = Vec::with_capacity(1 + payload.len());
+    value.push(if is_zdoc { VK_ZDOC } else { VK_RAW });
+    value.extend_from_slice(payload);
     ops.push(BatchOp::Put {
         key: doc_key,
         value,
@@ -158,9 +185,9 @@ pub fn upsert(
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
-    json: &[u8],
+    payload: &[u8], is_zdoc: bool,
 ) -> DocResult<u64> {
-    let ops = upsert_ops(engine, catalog, prefix, collection, doc_id, json)?;
+    let ops = upsert_ops(engine, catalog, prefix, collection, doc_id, payload, is_zdoc)?;
     Ok(engine.write_batch(ops)?)
 }
 
@@ -183,7 +210,12 @@ pub fn delete_ops(
     };
 
     let mut ops: Vec<BatchOp> = vec![BatchOp::Del { key: doc_key }];
-    if let Ok(old) = serde_json::from_slice::<Value>(strip_value_kind(&stored)) {
+    let old_val = if stored[0] == VK_ZDOC {
+        Some(crate::binary::ValueView::new(strip_value_kind(&stored)).to_value())
+    } else {
+        serde_json::from_slice::<Value>(strip_value_kind(&stored)).ok()
+    };
+    if let Some(old) = old_val {
         for k in index_keys_for(coll, prefix, doc_id, &old) {
             ops.push(BatchOp::Del { key: k });
         }
@@ -244,18 +276,27 @@ pub(crate) fn commit_batches(engine: &mut Engine, per_doc: Vec<Vec<BatchOp>>) ->
     if total == 0 {
         return Ok(());
     }
-    if total <= MAX_BATCH_KEYS {
-        let mut all = Vec::with_capacity(total);
-        for ops in per_doc {
-            all.extend(ops);
+    
+    let mut all = Vec::with_capacity(std::cmp::min(total, MAX_BATCH_KEYS));
+    for mut ops in per_doc {
+        // If adding this doc's ops would exceed the chunk limit, flush what we have
+        if all.len() + ops.len() > MAX_BATCH_KEYS && !all.is_empty() {
+            engine.write_batch(std::mem::take(&mut all))?;
         }
+        
+        // A single doc's ops should never exceed MAX_BATCH_KEYS in practice (unless 
+        // there are hundreds of indexes), but if it somehow does, we write it alone
+        // and it'll get caught by the engine's internal check if it's strictly > MAX_BATCH_KEYS.
+        if ops.len() > MAX_BATCH_KEYS {
+            engine.write_batch(ops)?;
+            continue;
+        }
+        
+        all.append(&mut ops);
+    }
+    
+    if !all.is_empty() {
         engine.write_batch(all)?;
-    } else {
-        for ops in per_doc {
-            if !ops.is_empty() {
-                engine.write_batch(ops)?;
-            }
-        }
     }
     Ok(())
 }
@@ -315,9 +356,13 @@ fn backfill_index(
     for item in rows.by_ref() {
         let (doc_key, stored) = item?;
         let doc_id = keys::doc_id_from_doc_key(prefix_len, &doc_key);
-        let doc: Value = match serde_json::from_slice(strip_value_kind(&stored)) {
-            Ok(d) => d,
-            Err(_) => continue, // skip unparseable bodies
+        let doc: Value = if stored[0] == VK_ZDOC {
+            crate::binary::ValueView::new(strip_value_kind(&stored)).to_value()
+        } else {
+            match serde_json::from_slice(strip_value_kind(&stored)) {
+                Ok(d) => d,
+                Err(_) => continue, // skip unparseable bodies
+            }
         };
         let vals: Vec<Value> = idx
             .fields

@@ -53,7 +53,7 @@ fn seed(indexed: bool) -> (TempDir, Engine, Catalog) {
     ];
     for (id, doc) in docs {
         let body = serde_json::to_vec(&doc).unwrap();
-        store::upsert(&mut e, &cat, PREFIX, "people", id, &body).unwrap();
+        store::upsert(&mut e, &cat, PREFIX, "people", id, &body, false).unwrap();
     }
     (dir, e, cat)
 }
@@ -213,7 +213,7 @@ fn pagination_is_repeatable_read_across_inserts() {
         (b"f".as_slice(), json!({"name": "Fi", "age": 33})),
     ] {
         let body = serde_json::to_vec(&doc).unwrap();
-        store::upsert(&mut e, &cat, PREFIX, "people", id, &body).unwrap();
+        store::upsert(&mut e, &cat, PREFIX, "people", id, &body, false).unwrap();
     }
 
     // Drain remaining pages from the pinned snapshot.

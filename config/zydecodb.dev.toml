@@ -12,8 +12,8 @@ durability = "sync"
 listen = "127.0.0.1:9471"
 
 [security]
-require_auth = false
-keys_file = "/tmp/zydecodb/keys.toml"
+require_auth = "false"
+keys_file = "/tmp/zdb/keys.toml"
 allow_unauthenticated_ping = true
 legacy_single_tenant = true
 

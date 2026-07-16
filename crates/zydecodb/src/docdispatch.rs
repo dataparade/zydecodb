@@ -121,11 +121,19 @@ fn doc_put(
         Ok(p) => p,
         Err(e) => return err_response(&e),
     };
+    
+    // Parse incoming JSON and build ZDoc
+    let json_val: serde_json::Value = match serde_json::from_slice(&p.body) {
+        Ok(v) => v,
+        Err(e) => return err_response(&DocError::InvalidJson(e.to_string())),
+    };
+    let zdoc_bytes = zydecodb_document::binary::ZDocBuilder::from_value(&json_val);
+
     // Lock order: catalog (read) then engine, consistent across all writers.
     let outcome = {
         let cat = catalog.read().unwrap();
         let mut guard = engine.lock().unwrap();
-        store::upsert(&mut guard, &cat, prefix, &p.collection, &p.doc_id, &p.body)
+        store::upsert(&mut guard, &cat, prefix, &p.collection, &p.doc_id, &zdoc_bytes, true)
     };
     match outcome {
         Ok(seq) => {

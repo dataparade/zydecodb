@@ -6,8 +6,7 @@ document store without the fluff. Pure standard library, no runtime dependencies
 ## Install
 
 ```bash
-pip install zydecodb            # from PyPI (once published)
-pip install -e clients/python   # from this repo, editable
+pip install -e clients/python
 ```
 
 Requires Python 3.9+.
@@ -48,6 +47,7 @@ with Client("127.0.0.1", 9470, api_key="YOUR_KEY") as db:
   `update_one/many`, `delete_one/many`, `count_documents`, `distinct`,
   `create_index`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.
+- **Raw KV with TTL.** Side-channel `put` (with `expires_at`), `get`, and `delete` methods on `Client` for session data that needs a time-to-live.
 
 ## Durability
 

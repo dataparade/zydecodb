@@ -6,7 +6,6 @@ Runnable references for building on top of ZydecoDB. Start here before writing y
 
 | Example | What it shows |
 |---------|----------------|
-| [`zydecodb_client.py`](zydecodb_client.py) | TCP client + Mongo-inspired document driver: `insert`/`find`/`update`/`delete`, `$`-operators, indexes |
 | [`user_backend/`](user_backend/) | Full HTTP API — users as documents, login + TTL sessions |
 
 Security model: **ZydecoDB handles connection auth; your app handles human login.** See [`docs/SECURITY.md`](../docs/SECURITY.md).
@@ -43,12 +42,7 @@ Point `keys_file` in your server config at `/tmp/zydecodb-keys.toml`.
 
 ## 2. Python TCP client
 
-```bash
-python3 examples/zydecodb_client.py
-python3 examples/zydecodb_client.py --api-key "$ZYDECODB_API_KEY"
-```
-
-Creates a collection, inserts JSON documents (with auto-generated `_id`), and runs filtered finds, an update, `count`/`distinct`, and a filtered delete. No dependencies beyond the stdlib.
+Check out the official Python package in [`clients/python`](../clients/python).
 
 If you know MongoDB, the `Collection` API will feel familiar:
 
@@ -123,9 +117,25 @@ Internet  →  your-api.example.com (HTTPS)  →  ZydecoDB on 127.0.0.1:9470
 
 ---
 
+## Official clients in other languages
+
+Prefer a maintained driver over hand-rolling one. Each ships its own quickstart
+and a small HTTP backend example:
+
+| Language | Driver | Examples |
+|----------|--------|----------|
+| Python | [`clients/python`](../clients/python) | [`zydecodb_client.py`](zydecodb_client.py), [`user_backend/`](user_backend/) |
+| Go | [`clients/go`](../clients/go) | [`clients/go/examples`](../clients/go/examples) |
+| TypeScript / Node | [`clients/typescript`](../clients/typescript) | [`clients/typescript/examples`](../clients/typescript/examples) |
+
+All three implement the same wire protocol and are verified byte-for-byte
+against shared [conformance vectors](../clients/conformance) generated from the
+Rust server's own encoders — so the drivers can never silently drift from the
+server or from each other.
+
 ## Building your own client
 
-Wire format: length-prefixed frames — see `zydecodb-engine::frame` or copy [`zydecodb_client.py`](zydecodb_client.py).
+Wire format: length-prefixed frames — see `zydecodb-engine::frame` or copy [`zydecodb_client.py`](zydecodb_client.py). If you implement a new client, run its codec against [`clients/conformance/vectors.json`](../clients/conformance) to guarantee byte-level compatibility.
 
 Handshake when auth is enabled:
 

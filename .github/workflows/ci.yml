@@ -75,6 +75,101 @@ jobs:
         if: always()
         run: kill "$(cat /tmp/zdb.pid)" || true
 
+  go-driver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build server
+        run: cargo build -p zydecodb --bin zydecodb
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Unit tests (no server)
+        working-directory: clients/go
+        run: go test -v ./proto_conformance_test.go ./proto.go ./errors.go
+      - name: Start ZydecoDB
+        run: |
+          mkdir -p /tmp/zdb/data /tmp/zdb/wal
+          {
+            echo 'listen = "127.0.0.1:9470"'
+            echo 'data_dir = "/tmp/zdb/data"'
+            echo 'wal_dir = "/tmp/zdb/wal"'
+            echo 'block_cache_mb = 64'
+            echo 'max_open_readers = 32'
+            echo 'poll_compaction_ms = 50'
+            echo 'durability = "sync"'
+            echo '[security]'
+            echo 'require_auth = "false"'
+            echo 'keys_file = "/tmp/zdb/keys.toml"'
+          } > /tmp/zdb.toml
+          ./target/debug/zydecodb serve --config /tmp/zdb.toml &
+          echo $! > /tmp/zdb.pid
+          for _ in $(seq 1 50); do
+            (exec 3<>/dev/tcp/127.0.0.1/9470) >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+      - name: Integration tests (live server)
+        working-directory: clients/go
+        env:
+          ZYDECODB_TEST_HOST: 127.0.0.1
+          ZYDECODB_TEST_PORT: "9470"
+        run: go test -v ./...
+      - name: Stop ZydecoDB
+        if: always()
+        run: kill "$(cat /tmp/zdb.pid)" || true
+
+  typescript-driver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build server
+        run: cargo build -p zydecodb --bin zydecodb
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        working-directory: clients/typescript
+        run: npm ci
+      - name: Unit tests (no server)
+        working-directory: clients/typescript
+        run: npm test test/conformance.test.ts
+      - name: Start ZydecoDB
+        run: |
+          mkdir -p /tmp/zdb/data /tmp/zdb/wal
+          {
+            echo 'listen = "127.0.0.1:9470"'
+            echo 'data_dir = "/tmp/zdb/data"'
+            echo 'wal_dir = "/tmp/zdb/wal"'
+            echo 'block_cache_mb = 64'
+            echo 'max_open_readers = 32'
+            echo 'poll_compaction_ms = 50'
+            echo 'durability = "sync"'
+            echo '[security]'
+            echo 'require_auth = "false"'
+            echo 'keys_file = "/tmp/zdb/keys.toml"'
+          } > /tmp/zdb.toml
+          ./target/debug/zydecodb serve --config /tmp/zdb.toml &
+          echo $! > /tmp/zdb.pid
+          for _ in $(seq 1 50); do
+            (exec 3<>/dev/tcp/127.0.0.1/9470) >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+      - name: Integration tests (live server)
+        working-directory: clients/typescript
+        env:
+          ZYDECODB_TEST_HOST: 127.0.0.1
+          ZYDECODB_TEST_PORT: "9470"
+        run: npm test test/live.test.ts
+      - name: Stop ZydecoDB
+        if: always()
+        run: kill "$(cat /tmp/zdb.pid)" || true
+
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:

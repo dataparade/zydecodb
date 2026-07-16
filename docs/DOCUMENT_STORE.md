@@ -49,7 +49,7 @@ in [`docs/archive/`](archive/) and are lineage only.
 | Collection | A named namespace; documents and indexes live under a per-collection key prefix from the catalog |
 | Document | A JSON object |
 | `_id` | Auto-generated, time-ordered (sortable, roughly insertion-ordered); a virtual always-present field equal to the document key. Filterable like any field |
-| Body storage | The document body is stored as **JSON bytes** behind a one-byte `value_kind` discriminator (`VK_RAW = 0x00`). The byte reserves room for a future typed format (e.g. FlatBuffers = `0x01`) without an on-disk migration; only `VK_RAW` is written today |
+| Body storage | The document body is stored as a **zero-copy ZDoc binary format** behind a one-byte `value_kind` discriminator (`VK_ZDOC = 0x01`). Legacy JSON bytes (`VK_RAW = 0x00`) are still supported for backwards compatibility, but all new writes and updates are compiled to ZDoc. The ZDoc format eliminates JSON parsing overhead during queries and updates by allowing O(log N) field lookups directly against raw bytes. |
 | Index entry | Order-preserving encoded field value(s) → document id (see [Indexes](#indexes)) |
 
 The engine itself stays byte-opaque: it stores values as bytes and never parses
@@ -158,8 +158,7 @@ indexer.
 | `0x10`–`0x12` | `Begin`/`Commit`/`Rollback` | Reserved (no multi-doc transactions) |
 | `0x31` | `SchemaDef` | Reserved (no enforced schemas) |
 
-Payload codecs are in `zydecodb-document/src/wire.rs`. The Python driver is the
-intended product surface; the binary wire sits behind it.
+Payload codecs are in `zydecodb-document/src/wire.rs`. The official drivers (Python, Go, TypeScript) are the intended product surface; the binary wire sits behind them.
 
 ### Storage key layout
 
@@ -249,10 +248,11 @@ body.
 ### `value_kind` and typed bodies
 
 The first byte of every stored document value is a `value_kind` tag owned by the
-document layer (`VK_RAW = 0x00` = JSON today). A future typed format can claim
-another tag and coexist with existing raw documents without touching the engine's
-WAL/SSTable format. JSON is the only body format written today; index performance
-claims are about the index keys, not the body encoding.
+document layer (`VK_ZDOC = 0x01` = ZDoc binary format, `VK_RAW = 0x00` = Legacy JSON). The new ZDoc format stores nested objects and arrays with length prefixes and sorted key offsets, allowing O(log N) zero-copy field extraction during query filtering.
+
+### ZDoc Performance Trade-offs
+
+There is a slight CPU cost during initial ingestion to compile incoming JSON to the ZDoc binary byte array. However, this unlocks massive CPU and memory savings on read and update paths, as filters can be evaluated directly against binary slices (`ValueView`) without allocating `serde_json::Value` trees. In the future, the ZDoc binary protocol could be exposed directly to the client drivers (Go, TypeScript, Python) to eliminate JSON serialization edge-to-edge.
 
 ---
 
@@ -267,7 +267,6 @@ claims are about the index keys, not the body encoding.
 - MVCC / multi-document transactions (opcodes `0x10`–`0x12` reserved; `seq` is
   ordering only)
 - Enforced collection schemas (`SchemaDef`, `0x31`, reserved)
-- A typed (non-JSON) document body format
 
 ---
 

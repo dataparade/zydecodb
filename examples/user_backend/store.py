@@ -20,11 +20,6 @@ Database auth (ZYDECODB_API_KEY) is handled by ZydecoDBClient on connect.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import hashlib
 import hmac
 import json
@@ -34,7 +29,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
-from zydecodb_client import STATUS_CONFLICT, ZydecoDBClient, ZydecoDBError
+from zydecodb import Client, ConflictError as DbConflictError, ZydecoError
 
 
 class StoreError(Exception):
@@ -76,7 +71,7 @@ class UserStore:
 
     COLLECTION = "users"
 
-    def __init__(self, db: ZydecoDBClient):
+    def __init__(self, db: Client):
         self._db = db
         self._users = db.collection(self.COLLECTION)
 
@@ -176,10 +171,8 @@ class UserStore:
         # with a Conflict status, with no check-then-insert race.
         try:
             self._users.insert_one(self._to_doc(user))
-        except ZydecoDBError as exc:
-            if exc.status == STATUS_CONFLICT:
-                raise Conflict(f"an account already exists for {email}") from exc
-            raise
+        except DbConflictError as exc:
+            raise Conflict(f"an account already exists for {email}") from exc
         return user
 
     def get_user(self, user_id: str) -> User:
@@ -236,9 +229,8 @@ class UserStore:
 
 def open_store(
     host: str, port: int, api_key: str | None = None
-) -> tuple[ZydecoDBClient, UserStore]:
-    db = ZydecoDBClient(host, port, api_key=api_key)
-    db.connect()
+) -> tuple[Client, UserStore]:
+    db = Client(f"{host}:{port}", api_key=api_key)
     db.ping()
     store = UserStore(db)
     store.ensure_schema()

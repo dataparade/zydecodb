@@ -45,7 +45,7 @@ fn upsert_get_and_index_orders_by_field() {
         PREFIX,
         "users",
         b"u1",
-        br#"{"age":30,"name":"alice"}"#,
+        br#"{"age":30,"name":"alice"}"#, false,
     )
     .unwrap();
     store::upsert(
@@ -54,7 +54,7 @@ fn upsert_get_and_index_orders_by_field() {
         PREFIX,
         "users",
         b"u2",
-        br#"{"age":25,"name":"bob"}"#,
+        br#"{"age":25,"name":"bob"}"#, false,
     )
     .unwrap();
 
@@ -83,7 +83,7 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
 
     let ids: Vec<Vec<u8>> = (0..5u8).map(|i| vec![b'u', b'0' + i]).collect();
     for id in &ids {
-        store::upsert(&mut e, &cat, PREFIX, "users", id, br#"{"age":30}"#).unwrap();
+        store::upsert(&mut e, &cat, PREFIX, "users", id, br#"{"age":30}"#, false).unwrap();
     }
 
     // Atomic bulk update: every matching doc moves to the new age bucket.
@@ -138,7 +138,7 @@ fn unique_index_rejects_duplicate_value() {
         PREFIX,
         "users",
         b"u1",
-        br#"{"email":"a@x.com"}"#,
+        br#"{"email":"a@x.com"}"#, false,
     )
     .unwrap();
 
@@ -149,7 +149,7 @@ fn unique_index_rejects_duplicate_value() {
         PREFIX,
         "users",
         b"u2",
-        br#"{"email":"a@x.com"}"#,
+        br#"{"email":"a@x.com"}"#, false,
     )
     .unwrap_err();
     assert!(matches!(err, DocError::DuplicateKey(_)));
@@ -161,7 +161,7 @@ fn unique_index_rejects_duplicate_value() {
         PREFIX,
         "users",
         b"u1",
-        br#"{"email":"a@x.com"}"#,
+        br#"{"email":"a@x.com"}"#, false,
     )
     .unwrap();
 
@@ -172,7 +172,7 @@ fn unique_index_rejects_duplicate_value() {
         PREFIX,
         "users",
         b"u2",
-        br#"{"email":"b@x.com"}"#,
+        br#"{"email":"b@x.com"}"#, false,
     )
     .unwrap();
 
@@ -183,7 +183,7 @@ fn unique_index_rejects_duplicate_value() {
         PREFIX,
         "users",
         b"u1",
-        br#"{"email":"b@x.com"}"#,
+        br#"{"email":"b@x.com"}"#, false,
     )
     .unwrap_err();
     assert!(matches!(err, DocError::DuplicateKey(_)));
@@ -198,8 +198,8 @@ fn updating_indexed_field_moves_the_entry() {
         .unwrap();
     cat.persist(&mut e).unwrap();
 
-    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":30}"#).unwrap();
-    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":40}"#).unwrap();
+    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":30}"#, false).unwrap();
+    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":40}"#, false).unwrap();
 
     let snap = e.snapshot_owned();
     // Old bucket [30,31) is empty; new bucket [40,41) has u1.
@@ -247,7 +247,7 @@ fn delete_removes_doc_and_index_entries() {
         .unwrap();
     cat.persist(&mut e).unwrap();
 
-    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":30}"#).unwrap();
+    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":30}"#, false).unwrap();
     assert!(store::delete(&mut e, &cat, PREFIX, "users", b"u1").unwrap());
     assert!(!store::delete(&mut e, &cat, PREFIX, "users", b"u1").unwrap());
 
@@ -281,7 +281,7 @@ fn pagination_walks_all_rows_in_order() {
             PREFIX,
             "users",
             id.as_bytes(),
-            body.as_bytes(),
+            body.as_bytes(), false,
         )
         .unwrap();
     }
@@ -331,8 +331,8 @@ fn define_index_backfills_existing_documents() {
     cat.ensure_collection(PREFIX, "users");
     cat.persist(&mut e).unwrap();
 
-    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":30}"#).unwrap();
-    store::upsert(&mut e, &cat, PREFIX, "users", b"u2", br#"{"age":25}"#).unwrap();
+    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":30}"#, false).unwrap();
+    store::upsert(&mut e, &cat, PREFIX, "users", b"u2", br#"{"age":25}"#, false).unwrap();
 
     // Define the index after the data exists -> must backfill.
     store::define_index(
@@ -375,7 +375,7 @@ fn orphan_index_keys_without_catalog_entry_are_invisible() {
     let mut cat = Catalog::default();
     let coll_id = cat.ensure_collection(PREFIX, "users");
     cat.persist(&mut e).unwrap();
-    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":30}"#).unwrap();
+    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"age":30}"#, false).unwrap();
 
     // Simulate a backfill that wrote index entries but crashed BEFORE the
     // catalog commit: write an orphan index entry for an index id the
@@ -417,7 +417,7 @@ fn oversized_document_batch_is_rejected() {
     }
     cat.persist(&mut e).unwrap();
 
-    let err = store::upsert(&mut e, &cat, PREFIX, "users", b"u1", b"{}").unwrap_err();
+    let err = store::upsert(&mut e, &cat, PREFIX, "users", b"u1", b"{}", false).unwrap_err();
     assert!(matches!(err, DocError::BatchTooLarge(_)));
     // Nothing persisted.
     let snap = e.snapshot_owned();
