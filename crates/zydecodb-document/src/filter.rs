@@ -14,8 +14,8 @@
 //! secondary indexes use. Equality on arrays/objects falls back to structural
 //! JSON equality; ordering operators only apply to scalars.
 
-use crate::encoding;
 use crate::error::{DocError, DocResult};
+use crate::binary::ValueView;
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
 
@@ -71,13 +71,13 @@ impl Filter {
     }
 
     /// Evaluate the filter against a document.
-    pub fn matches(&self, doc: &Value) -> bool {
+    pub fn matches(&self, doc: ValueView<'_>, doc_id: Option<&[u8]>) -> bool {
         match self {
             Filter::MatchAll => true,
-            Filter::And(fs) => fs.iter().all(|f| f.matches(doc)),
-            Filter::Or(fs) => fs.iter().any(|f| f.matches(doc)),
-            Filter::Not(f) => !f.matches(doc),
-            Filter::Field(fp) => fp.matches(doc),
+            Filter::And(fs) => fs.iter().all(|f| f.matches(doc, doc_id)),
+            Filter::Or(fs) => fs.iter().any(|f| f.matches(doc, doc_id)),
+            Filter::Not(f) => !f.matches(doc, doc_id),
+            Filter::Field(fp) => fp.matches(doc, doc_id),
         }
     }
 
@@ -188,30 +188,41 @@ fn parse_atom(op: &str, operand: &Value) -> DocResult<Atom> {
 }
 
 impl FieldPred {
-    fn matches(&self, doc: &Value) -> bool {
-        let field = lookup(doc, &self.path);
+    fn matches(&self, doc: ValueView<'_>, doc_id: Option<&[u8]>) -> bool {
+        if self.path == crate::planner::ID_FIELD {
+            if let Some(id_bytes) = doc_id {
+                let id_str = String::from_utf8_lossy(id_bytes).into_owned();
+                let id_val = serde_json::Value::String(id_str);
+                
+                // We evaluate atoms against this Value
+                // But atoms expect Option<ValueView>, which we can't easily make from an owned String without a ZDocBuilder
+                // Let's just build a tiny ZDoc for the ID
+                let temp_zdoc = crate::binary::ZDocBuilder::from_value(&id_val);
+                let view = crate::binary::ValueView::new(&temp_zdoc);
+                return self.atoms.iter().all(|atom| atom.matches(Some(view)));
+            }
+        }
+        let field = doc.get_path(&self.path);
         self.atoms.iter().all(|atom| atom.matches(field))
     }
 }
 
 impl Atom {
-    fn matches(&self, field: Option<&Value>) -> bool {
+    fn matches(&self, field: Option<ValueView<'_>>) -> bool {
         match self {
-            Atom::Exists(should) => field.is_some() == *should,
             Atom::Eq(target) => eq_match(field, target),
             Atom::Ne(target) => !eq_match(field, target),
             Atom::Gt(target) => ordering_match(field, target, &[Ordering::Greater]),
-            Atom::Gte(target) => {
-                ordering_match(field, target, &[Ordering::Greater, Ordering::Equal])
-            }
+            Atom::Gte(target) => ordering_match(field, target, &[Ordering::Greater, Ordering::Equal]),
             Atom::Lt(target) => ordering_match(field, target, &[Ordering::Less]),
             Atom::Lte(target) => ordering_match(field, target, &[Ordering::Less, Ordering::Equal]),
+            Atom::Exists(want) => field.is_some() == *want,
             Atom::In(list) => match field {
-                Some(v) => list.iter().any(|t| value_eq(v, t)),
+                Some(v) => list.iter().any(|t| value_eq_view(v, t)),
                 None => list.iter().any(Value::is_null),
             },
             Atom::Nin(list) => match field {
-                Some(v) => !list.iter().any(|t| value_eq(v, t)),
+                Some(v) => !list.iter().any(|t| value_eq_view(v, t)),
                 None => !list.iter().any(Value::is_null),
             },
         }
@@ -219,17 +230,17 @@ impl Atom {
 }
 
 /// `$eq` semantics: a missing field matches only `$eq: null`.
-fn eq_match(field: Option<&Value>, target: &Value) -> bool {
+fn eq_match(field: Option<crate::binary::ValueView<'_>>, target: &Value) -> bool {
     match field {
-        Some(v) => value_eq(v, target),
+        Some(v) => value_eq_view(v, target),
         None => target.is_null(),
     }
 }
 
 /// Ordering operators require both sides to be scalars; missing or non-scalar
 /// fields never match.
-fn ordering_match(field: Option<&Value>, target: &Value, accept: &[Ordering]) -> bool {
-    match field.and_then(|v| cmp_scalar(v, target)) {
+fn ordering_match(field: Option<crate::binary::ValueView<'_>>, target: &Value, accept: &[Ordering]) -> bool {
+    match field.and_then(|v| cmp_scalar_view(v, target)) {
         Some(ord) => accept.contains(&ord),
         None => false,
     }
@@ -242,39 +253,83 @@ fn is_scalar(v: &Value) -> bool {
     )
 }
 
-/// Compare two scalars using the index encoding order; None if either is an
-/// array or object.
-fn cmp_scalar(a: &Value, b: &Value) -> Option<Ordering> {
-    if !is_scalar(a) || !is_scalar(b) {
+fn cmp_scalar_view(a: crate::binary::ValueView<'_>, b: &Value) -> Option<Ordering> {
+    if !is_scalar(b) {
         return None;
     }
-    let mut ea = Vec::new();
-    let mut eb = Vec::new();
-    encoding::encode_value(a, &mut ea);
-    encoding::encode_value(b, &mut eb);
-    Some(ea.cmp(&eb))
-}
-
-/// Equality: scalars compare via the encoding order (so `1` == `1.0`);
-/// arrays/objects compare structurally.
-fn value_eq(a: &Value, b: &Value) -> bool {
-    match cmp_scalar(a, b) {
-        Some(ord) => ord == Ordering::Equal,
-        None => a == b,
+    
+    let a_type = match a.type_byte() {
+        crate::binary::TYPE_NULL => 0,
+        crate::binary::TYPE_BOOL_FALSE | crate::binary::TYPE_BOOL_TRUE => 1,
+        crate::binary::TYPE_I64 | crate::binary::TYPE_F64 => 2,
+        crate::binary::TYPE_STRING => 3,
+        _ => return None,
+    };
+    
+    let b_type = match b {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 2,
+        Value::String(_) => 3,
+        _ => return None,
+    };
+    
+    if a_type != b_type {
+        return Some(a_type.cmp(&b_type));
     }
-}
-
-/// Resolve a dotted path to the referenced value, or None if any segment is
-/// missing or traverses a non-object.
-fn lookup<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut cur = doc;
-    for seg in path.split('.') {
-        match cur {
-            Value::Object(map) => cur = map.get(seg)?,
-            _ => return None,
+    
+    match a_type {
+        0 => Some(Ordering::Equal),
+        1 => {
+            let ab = a.as_bool().unwrap();
+            let bb = b.as_bool().unwrap();
+            Some(ab.cmp(&bb))
         }
+        2 => {
+            let af = a.as_f64().unwrap();
+            let bf = b.as_f64().unwrap();
+            af.partial_cmp(&bf)
+        }
+        3 => {
+            let a_str = a.as_str().unwrap();
+            let b_str = b.as_str().unwrap();
+            Some(a_str.cmp(b_str))
+        }
+        _ => None,
     }
-    Some(cur)
+}
+
+fn value_eq_view(a: crate::binary::ValueView<'_>, b: &Value) -> bool {
+    if a.type_byte() == crate::binary::TYPE_ARRAY && b.is_array() {
+        let a_arr = a.as_array().unwrap();
+        let b_arr = b.as_array().unwrap();
+        if a_arr.len() != b_arr.len() { return false; }
+        for i in 0..a_arr.len() {
+            if !value_eq_view(a_arr.get(i).unwrap(), &b_arr[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if a.type_byte() == crate::binary::TYPE_OBJECT && b.is_object() {
+        let a_obj = a.as_object().unwrap();
+        let b_obj = b.as_object().unwrap();
+        if a_obj.len() != b_obj.len() { return false; }
+        for i in 0..a_obj.len() {
+            let (k, v) = a_obj.get_at(i).unwrap();
+            if let Some(bv) = b_obj.get(k) {
+                if !value_eq_view(v, bv) { return false; }
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    match cmp_scalar_view(a, b) {
+        Some(Ordering::Equal) => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -282,73 +337,78 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn check_matches(f: &Filter, val: &Value) -> bool {
+        let bytes = crate::binary::ZDocBuilder::from_value(val);
+        f.matches(crate::binary::ValueView::new(&bytes), None)
+    }
+
     fn parse(v: Value) -> Filter {
         Filter::parse(&v).unwrap()
     }
 
     #[test]
     fn empty_filter_matches_all() {
-        assert!(parse(json!({})).matches(&json!({"a": 1})));
+        assert!(check_matches(&parse(json!({})), &json!({"a": 1})));
     }
 
     #[test]
     fn equality_and_implicit_and() {
         let f = parse(json!({"city": "NOLA", "age": 30}));
-        assert!(f.matches(&json!({"city": "NOLA", "age": 30})));
-        assert!(!f.matches(&json!({"city": "NOLA", "age": 31})));
+        assert!(check_matches(&f, &json!({"city": "NOLA", "age": 30})));
+        assert!(!check_matches(&f, &json!({"city": "NOLA", "age": 31})));
         // int vs float equality
-        assert!(f.matches(&json!({"city": "NOLA", "age": 30.0})));
+        assert!(check_matches(&f, &json!({"city": "NOLA", "age": 30.0})));
     }
 
     #[test]
     fn comparison_operators() {
         let f = parse(json!({"age": {"$gt": 18, "$lt": 65}}));
-        assert!(f.matches(&json!({"age": 30})));
-        assert!(!f.matches(&json!({"age": 18})));
-        assert!(!f.matches(&json!({"age": 65})));
-        assert!(!f.matches(&json!({"age": 70})));
+        assert!(check_matches(&f, &json!({"age": 30})));
+        assert!(!check_matches(&f, &json!({"age": 18})));
+        assert!(!check_matches(&f, &json!({"age": 65})));
+        assert!(!check_matches(&f, &json!({"age": 70})));
         // non-scalar / missing never match ordering
-        assert!(!f.matches(&json!({"age": [1, 2]})));
-        assert!(!f.matches(&json!({})));
+        assert!(!check_matches(&f, &json!({"age": [1, 2]})));
+        assert!(!check_matches(&f, &json!({})));
     }
 
     #[test]
     fn in_nin_and_exists() {
-        assert!(parse(json!({"c": {"$in": ["a", "b"]}})).matches(&json!({"c": "b"})));
-        assert!(!parse(json!({"c": {"$in": ["a", "b"]}})).matches(&json!({"c": "z"})));
-        assert!(parse(json!({"c": {"$nin": ["a"]}})).matches(&json!({"c": "z"})));
-        assert!(parse(json!({"c": {"$exists": true}})).matches(&json!({"c": null})));
-        assert!(!parse(json!({"c": {"$exists": true}})).matches(&json!({"d": 1})));
-        assert!(parse(json!({"c": {"$exists": false}})).matches(&json!({"d": 1})));
+        assert!(check_matches(&parse(json!({"c": {"$in": ["a", "b"]}})), &json!({"c": "b"})));
+        assert!(!check_matches(&parse(json!({"c": {"$in": ["a", "b"]}})), &json!({"c": "z"})));
+        assert!(check_matches(&parse(json!({"c": {"$nin": ["a"]}})), &json!({"c": "z"})));
+        assert!(check_matches(&parse(json!({"c": {"$exists": true}})), &json!({"c": null})));
+        assert!(!check_matches(&parse(json!({"c": {"$exists": true}})), &json!({"d": 1})));
+        assert!(check_matches(&parse(json!({"c": {"$exists": false}})), &json!({"d": 1})));
     }
 
     #[test]
     fn ne_semantics() {
         let f = parse(json!({"status": {"$ne": "done"}}));
-        assert!(f.matches(&json!({"status": "open"})));
-        assert!(!f.matches(&json!({"status": "done"})));
+        assert!(check_matches(&f, &json!({"status": "open"})));
+        assert!(!check_matches(&f, &json!({"status": "done"})));
         // missing field is treated as null, so $ne:"done" matches it
-        assert!(f.matches(&json!({})));
+        assert!(check_matches(&f, &json!({})));
     }
 
     #[test]
     fn logical_and_or_not() {
         let f = parse(json!({"$or": [{"a": 1}, {"b": 2}]}));
-        assert!(f.matches(&json!({"a": 1})));
-        assert!(f.matches(&json!({"b": 2})));
-        assert!(!f.matches(&json!({"a": 9, "b": 9})));
+        assert!(check_matches(&f, &json!({"a": 1})));
+        assert!(check_matches(&f, &json!({"b": 2})));
+        assert!(!check_matches(&f, &json!({"a": 9, "b": 9})));
 
         let f = parse(json!({"$not": {"a": 1}}));
-        assert!(f.matches(&json!({"a": 2})));
-        assert!(!f.matches(&json!({"a": 1})));
+        assert!(check_matches(&f, &json!({"a": 2})));
+        assert!(!check_matches(&f, &json!({"a": 1})));
     }
 
     #[test]
     fn nested_path() {
         let f = parse(json!({"address.city": "London"}));
-        assert!(f.matches(&json!({"address": {"city": "London"}})));
-        assert!(!f.matches(&json!({"address": {"city": "Paris"}})));
-        assert!(!f.matches(&json!({"address": "London"})));
+        assert!(check_matches(&f, &json!({"address": {"city": "London"}})));
+        assert!(!check_matches(&f, &json!({"address": {"city": "Paris"}})));
+        assert!(!check_matches(&f, &json!({"address": "London"})));
     }
 
     #[test]

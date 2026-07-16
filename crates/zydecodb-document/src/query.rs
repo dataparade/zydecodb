@@ -16,7 +16,7 @@ use crate::catalog::Catalog;
 use crate::error::{DocError, DocResult};
 use crate::filter::Filter;
 use crate::planner::{self, AccessPath};
-use crate::store::{strip_value_kind, stored_to_json_vec, VK_ZDOC};
+use crate::store::stored_to_json_vec;
 use crate::{encoding, keys};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
@@ -275,23 +275,10 @@ fn sort_matches_index(sort: &[(String, bool)], fields: &[String]) -> bool {
 /// the document key, so filters/projections on `_id` work even when the body
 /// (raw-wire writes) did not include it. A body that already has `_id` keeps
 /// its value (the driver convention).
-fn materialize(stored: &[u8], doc_id: &[u8]) -> Option<Value> {
-    let mut v: Value = if stored[0] == VK_ZDOC {
-        crate::binary::ValueView::new(strip_value_kind(stored)).to_value()
-    } else {
-        serde_json::from_slice(strip_value_kind(stored)).ok()?
-    };
-    if let Value::Object(map) = &mut v {
-        map.entry(planner::ID_FIELD.to_string())
-            .or_insert_with(|| Value::String(String::from_utf8_lossy(doc_id).into_owned()));
-    }
-    Some(v)
-}
-
 fn check_filter<'a>(stored: &'a [u8], filter: &crate::filter::Filter, doc_id: &[u8]) -> bool {
     let kind = stored[0];
     let payload = crate::store::strip_value_kind(stored);
-    let mut temp_zdoc = Vec::new();
+    let temp_zdoc;
     let view = if kind == crate::store::VK_ZDOC {
         crate::binary::ValueView::new(payload)
     } else {
@@ -317,14 +304,6 @@ fn parse_doc(stored: &[u8], doc_id: &[u8]) -> Option<serde_json::Value> {
             .or_insert_with(|| serde_json::Value::String(String::from_utf8_lossy(doc_id).into_owned()));
     }
     Some(v)
-}
-
-fn append_id(mut v: serde_json::Value, doc_id: &[u8]) -> serde_json::Value {
-    if let serde_json::Value::Object(map) = &mut v {
-        map.entry(crate::planner::ID_FIELD.to_string())
-            .or_insert_with(|| serde_json::Value::String(String::from_utf8_lossy(doc_id).into_owned()));
-    }
-    v
 }
 
 fn make_row(doc_id: Vec<u8>, body: &Value, proj: &Option<Projection>) -> DocResult<QueryRow> {
@@ -678,7 +657,7 @@ fn stream_offset_page(
 fn extract_sort_keys(stored: &[u8], sort: &[(String, bool)]) -> Vec<Vec<u8>> {
     let kind = stored[0];
     let payload = crate::store::strip_value_kind(stored);
-    let mut temp_zdoc = Vec::new();
+    let temp_zdoc;
     let view = if kind == crate::store::VK_ZDOC {
         crate::binary::ValueView::new(payload)
     } else {

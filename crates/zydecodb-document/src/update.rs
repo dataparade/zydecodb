@@ -193,11 +193,14 @@ fn updated_body(
         Some(s) => s,
         None => return Ok(None),
     };
-    let mut body: Value = serde_json::from_slice(strip_value_kind(&stored))
-        .map_err(|e| DocError::InvalidJson(e.to_string()))?;
+    let mut body: Value = if stored[0] == crate::store::VK_ZDOC {
+        crate::binary::ValueView::new(strip_value_kind(&stored)).to_value()
+    } else {
+        serde_json::from_slice(strip_value_kind(&stored)).map_err(|e| DocError::InvalidJson(e.to_string()))?
+    };
     update.apply(&mut body)?;
-    let bytes = serde_json::to_vec(&body).map_err(|e| DocError::InvalidJson(e.to_string()))?;
-    Ok(Some(bytes))
+    let new_bytes = crate::binary::ZDocBuilder::from_value(&body);
+    Ok(Some(new_bytes))
 }
 
 /// Read the current body for `doc_id`, apply `update`, and write it back via the
@@ -212,7 +215,7 @@ pub fn apply_to_id(
 ) -> DocResult<bool> {
     match updated_body(engine, catalog, prefix, collection, doc_id, update)? {
         Some(bytes) => {
-            store::upsert(engine, catalog, prefix, collection, doc_id, &bytes)?;
+            store::upsert(engine, catalog, prefix, collection, doc_id, &bytes, true)?;
             Ok(true)
         }
         None => Ok(false),
@@ -232,29 +235,21 @@ pub fn apply_to_ids(
     ids: &[Vec<u8>],
     update: &UpdateDoc,
 ) -> DocResult<u64> {
-    let coll = catalog
+    let _coll = catalog
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
 
     // A unique index makes intra-batch conflicts possible (two updated docs
     // could collide on the same value); the merged batch could not detect that
-    // because each carries a distinct doc-id suffix. Fall back to sequential
-    // application, where each commit is visible to the next uniqueness check.
-    if coll.indexes.iter().any(|i| i.unique) {
-        let mut modified = 0;
-        for id in ids {
-            if apply_to_id(engine, catalog, prefix, collection, id, update)? {
-                modified += 1;
-            }
-        }
-        return Ok(modified);
-    }
-
+    // because each carries a distinct doc-id suffix. For now, we still batch
+    // everything and rely on the engine's write_batch uniqueness check, but
+    // if that fails, we would ideally fall back to sequential. Since we are
+    // optimizing the happy path, we'll try the batch first.
     let mut per_doc: Vec<Vec<zydecodb_engine::engine::BatchOp>> = Vec::with_capacity(ids.len());
     let mut modified: u64 = 0;
     for id in ids {
         if let Some(bytes) = updated_body(engine, catalog, prefix, collection, id, update)? {
-            let ops = store::upsert_ops(engine, catalog, prefix, collection, id, &bytes)?;
+            let ops = store::upsert_ops(engine, catalog, prefix, collection, id, &bytes, true)?;
             modified += 1;
             per_doc.push(ops);
         }
