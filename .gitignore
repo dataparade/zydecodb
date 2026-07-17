@@ -40,3 +40,10 @@ lcov.info
 /.github/workflows/release.yml
 /.github/workflows/publish-python.yml
 /install.sh
+
+# Website / Marketing
+/website/
+
+# Internal / Archived Docs
+/docs/archive/
+/docs/soak-baselines/
