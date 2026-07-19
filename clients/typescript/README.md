@@ -8,7 +8,7 @@ no runtime dependencies.
 
 ```bash
 # Add to your project
-npm install file:../paradekv/clients/typescript
+npm install file:../zydecodb/clients/typescript
 ```
 
 Requires Node.js 20+.

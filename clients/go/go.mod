@@ -1,3 +1,3 @@
-module github.com/dataparade/paradekv/clients/go
+module github.com/dataparade/zydecodb/clients/go
 
 go 1.23

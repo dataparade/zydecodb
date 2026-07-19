@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  zydecodb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dataparade/zydecodb:latest
+    container_name: zydecodb
+    ports:
+      - "9470:9470"
+      - "9471:9471"
+    volumes:
+      - zydecodb-data:/var/lib/zydecodb/data
+      - zydecodb-wal:/var/lib/zydecodb/wal
+      - ./config:/etc/zydecodb
+    restart: unless-stopped
+
+volumes:
+  zydecodb-data:
+  zydecodb-wal:

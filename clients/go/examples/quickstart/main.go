@@ -14,7 +14,7 @@ import (
 	"os"
 	"time"
 
-	zydecodb "github.com/dataparade/paradekv/clients/go"
+	zydecodb "github.com/dataparade/zydecodb/clients/go"
 )
 
 func main() {

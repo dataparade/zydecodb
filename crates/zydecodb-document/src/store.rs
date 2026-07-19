@@ -192,13 +192,16 @@ pub fn upsert(
 }
 
 /// Build (but do not write) the batch that deletes `doc_id` and all of its index
-/// entries. Empty if the document does not exist.
+/// entries. Empty if the document does not exist — or, when `filter` is given,
+/// if the CURRENT body no longer matches it (see [`crate::update::apply_to_ids`]
+/// for why the re-check under the lock is required).
 pub fn delete_ops(
     engine: &mut Engine,
     catalog: &Catalog,
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
+    filter: Option<&crate::filter::Filter>,
 ) -> DocResult<Vec<BatchOp>> {
     let coll = catalog
         .collection(prefix, collection)
@@ -208,6 +211,11 @@ pub fn delete_ops(
         Some(v) => v,
         None => return Ok(Vec::new()),
     };
+    if let Some(f) = filter {
+        if !crate::query::check_filter(&stored, f, doc_id) {
+            return Ok(Vec::new());
+        }
+    }
 
     let mut ops: Vec<BatchOp> = vec![BatchOp::Del { key: doc_key }];
     let old_val = if stored[0] == VK_ZDOC {
@@ -235,7 +243,7 @@ pub fn delete(
     collection: &str,
     doc_id: &[u8],
 ) -> DocResult<bool> {
-    let ops = delete_ops(engine, catalog, prefix, collection, doc_id)?;
+    let ops = delete_ops(engine, catalog, prefix, collection, doc_id, None)?;
     if ops.is_empty() {
         return Ok(false);
     }
@@ -247,17 +255,22 @@ pub fn delete(
 /// `write_batch` the whole set is removed atomically (and isolated from
 /// concurrent readers); otherwise it falls back to one batch per document.
 /// Returns the number of documents that existed and were removed.
+///
+/// `filter`, when given, is re-verified per document under the engine lock so
+/// filtered deletes are per-document compare-and-swap (candidates stale since
+/// snapshot selection are skipped and not counted).
 pub fn delete_ids(
     engine: &mut Engine,
     catalog: &Catalog,
     prefix: &[u8],
     collection: &str,
     ids: &[Vec<u8>],
+    filter: Option<&crate::filter::Filter>,
 ) -> DocResult<u64> {
     let mut per_doc: Vec<Vec<BatchOp>> = Vec::with_capacity(ids.len());
     let mut deleted: u64 = 0;
     for id in ids {
-        let ops = delete_ops(engine, catalog, prefix, collection, id)?;
+        let ops = delete_ops(engine, catalog, prefix, collection, id, filter)?;
         if !ops.is_empty() {
             deleted += 1;
             per_doc.push(ops);

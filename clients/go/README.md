@@ -7,7 +7,7 @@ store without the fluff. Standard library only, no third-party dependencies.
 
 ```bash
 # In your go.mod, use a local replace or fetch from the repository once pushed:
-go get github.com/dataparade/paradekv/clients/go@latest
+go get github.com/dataparade/zydecodb/clients/go@latest
 ```
 
 Requires Go 1.23+.
@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"log"
 
-	zydecodb "github.com/dataparade/paradekv/clients/go"
+	zydecodb "github.com/dataparade/zydecodb/clients/go"
 )
 
 func main() {

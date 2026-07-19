@@ -28,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	zydecodb "github.com/dataparade/paradekv/clients/go"
+	zydecodb "github.com/dataparade/zydecodb/clients/go"
 )
 
 const collection = "app_users"

@@ -275,7 +275,7 @@ fn sort_matches_index(sort: &[(String, bool)], fields: &[String]) -> bool {
 /// the document key, so filters/projections on `_id` work even when the body
 /// (raw-wire writes) did not include it. A body that already has `_id` keeps
 /// its value (the driver convention).
-fn check_filter<'a>(stored: &'a [u8], filter: &crate::filter::Filter, doc_id: &[u8]) -> bool {
+pub(crate) fn check_filter(stored: &[u8], filter: &crate::filter::Filter, doc_id: &[u8]) -> bool {
     let kind = stored[0];
     let payload = crate::store::strip_value_kind(stored);
     let temp_zdoc;

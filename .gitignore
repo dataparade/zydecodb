@@ -1,3 +1,11 @@
+# Node.js
+node_modules/
+dist/
+experiments/**/*.js
+
+# Compiled binaries
+experiments/write_heavy/write_heavy
+
 # Rust
 /target
 **/*.rs.bk
@@ -43,6 +51,7 @@ lcov.info
 
 # Website / Marketing
 /website/
+/scripts/
 
 # Internal / Archived Docs
 /docs/archive/

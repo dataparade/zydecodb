@@ -24,8 +24,8 @@ dependencies = []
 dev = ["pytest>=7"]
 
 [project.urls]
-Homepage = "https://github.com/dataparade/paradekv"
-Source = "https://github.com/dataparade/paradekv"
+Homepage = "https://github.com/dataparade/zydecodb"
+Source = "https://github.com/dataparade/zydecodb"
 
 [tool.hatch.build.targets.wheel]
 packages = ["zydecodb"]

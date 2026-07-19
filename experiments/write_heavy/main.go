@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	zydecodb "github.com/dataparade/paradekv/clients/go"
+	zydecodb "github.com/dataparade/zydecodb/clients/go"
 )
 
 // LogEvent represents an append-only log entry

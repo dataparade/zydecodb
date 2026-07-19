@@ -176,7 +176,14 @@ fn unset_path(doc: &mut Value, path: &str) {
 }
 
 /// Read the current body for `doc_id` and apply `update`, returning the new body
-/// bytes (or `None` if the document does not exist). Does not write.
+/// bytes. Returns `None` if the document does not exist — or, when `filter` is
+/// given, if the CURRENT body no longer matches it. Does not write.
+///
+/// The filter re-check closes the TOCTOU between candidate selection and the
+/// write: candidates are chosen from a lock-free snapshot, so by the time the
+/// write runs under the engine lock a concurrent writer may have changed the
+/// document such that it no longer matches. Re-verifying here makes filtered
+/// updates behave as per-document compare-and-swap.
 fn updated_body(
     engine: &mut Engine,
     catalog: &Catalog,
@@ -184,6 +191,7 @@ fn updated_body(
     collection: &str,
     doc_id: &[u8],
     update: &UpdateDoc,
+    filter: Option<&crate::filter::Filter>,
 ) -> DocResult<Option<Vec<u8>>> {
     let coll = catalog
         .collection(prefix, collection)
@@ -193,6 +201,11 @@ fn updated_body(
         Some(s) => s,
         None => return Ok(None),
     };
+    if let Some(f) = filter {
+        if !crate::query::check_filter(&stored, f, doc_id) {
+            return Ok(None);
+        }
+    }
     let mut body: Value = if stored[0] == crate::store::VK_ZDOC {
         crate::binary::ValueView::new(strip_value_kind(&stored)).to_value()
     } else {
@@ -213,7 +226,7 @@ pub fn apply_to_id(
     doc_id: &[u8],
     update: &UpdateDoc,
 ) -> DocResult<bool> {
-    match updated_body(engine, catalog, prefix, collection, doc_id, update)? {
+    match updated_body(engine, catalog, prefix, collection, doc_id, update, None)? {
         Some(bytes) => {
             store::upsert(engine, catalog, prefix, collection, doc_id, &bytes, true)?;
             Ok(true)
@@ -227,6 +240,11 @@ pub fn apply_to_id(
 /// (isolated from concurrent readers). When a unique index is present, updates
 /// run sequentially so each commit is visible to the next uniqueness check
 /// (preserving correct enforcement). Returns the number of documents modified.
+///
+/// `filter`, when given, is re-verified per document under the engine lock:
+/// candidates whose current body no longer matches are skipped (and not
+/// counted), closing the snapshot-selection TOCTOU so filtered updates are
+/// per-document compare-and-swap.
 pub fn apply_to_ids(
     engine: &mut Engine,
     catalog: &Catalog,
@@ -234,6 +252,7 @@ pub fn apply_to_ids(
     collection: &str,
     ids: &[Vec<u8>],
     update: &UpdateDoc,
+    filter: Option<&crate::filter::Filter>,
 ) -> DocResult<u64> {
     let _coll = catalog
         .collection(prefix, collection)
@@ -248,7 +267,7 @@ pub fn apply_to_ids(
     let mut per_doc: Vec<Vec<zydecodb_engine::engine::BatchOp>> = Vec::with_capacity(ids.len());
     let mut modified: u64 = 0;
     for id in ids {
-        if let Some(bytes) = updated_body(engine, catalog, prefix, collection, id, update)? {
+        if let Some(bytes) = updated_body(engine, catalog, prefix, collection, id, update, filter)? {
             let ops = store::upsert_ops(engine, catalog, prefix, collection, id, &bytes, true)?;
             modified += 1;
             per_doc.push(ops);

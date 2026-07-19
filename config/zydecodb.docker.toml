@@ -1,0 +1,25 @@
+# Docker production-ready configuration
+listen = "0.0.0.0:9470"
+data_dir = "/var/lib/zydecodb/data"
+wal_dir = "/var/lib/zydecodb/wal"
+block_cache_mb = 64
+max_open_readers = 32
+poll_compaction_ms = 50
+durability = "sync"
+
+# Prometheus/health endpoint
+[metrics]
+listen = "0.0.0.0:9471"
+
+[security]
+require_auth = "false"
+keys_file = "/etc/zydecodb/keys.toml"
+allow_unauthenticated_ping = true
+legacy_single_tenant = true
+
+[security.audit]
+enabled = true
+log_client_key = false
+
+[tls]
+enabled = false

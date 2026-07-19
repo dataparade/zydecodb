@@ -88,7 +88,7 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
 
     // Atomic bulk update: every matching doc moves to the new age bucket.
     let upd = UpdateDoc::parse_bytes(br#"{"$set":{"age":31}}"#).unwrap();
-    let modified = update::apply_to_ids(&mut e, &cat, PREFIX, "users", &ids, &upd).unwrap();
+    let modified = update::apply_to_ids(&mut e, &cat, PREFIX, "users", &ids, &upd, None).unwrap();
     assert_eq!(modified, 5);
 
     let snap = e.snapshot_owned();
@@ -111,7 +111,7 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
     drop(snap);
 
     // Atomic bulk delete: bodies and index entries all gone.
-    let deleted = store::delete_ids(&mut e, &cat, PREFIX, "users", &ids).unwrap();
+    let deleted = store::delete_ids(&mut e, &cat, PREFIX, "users", &ids, None).unwrap();
     assert_eq!(deleted, 5);
     let snap = e.snapshot_owned();
     let spec =
@@ -121,6 +121,69 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
         .unwrap()
         .rows
         .is_empty());
+}
+
+/// Regression: filtered updates/deletes must re-verify the filter per document
+/// at write time. Candidate ids are selected from a lock-free snapshot, so a
+/// document can stop matching between selection and write — those stale
+/// candidates must be skipped and not counted, making a value-pinning filter a
+/// true per-document compare-and-swap (the DBaaS control plane relies on this
+/// for entitlement caps and revision allocation).
+#[test]
+fn filtered_write_recheck_skips_stale_candidates() {
+    use zydecodb_document::filter::Filter;
+    use zydecodb_document::update::{self, UpdateDoc};
+
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false)
+        .unwrap();
+    cat.persist(&mut e).unwrap();
+
+    store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"count":4}"#, false).unwrap();
+
+    // Phase 1 (as docdispatch does it): select candidates matching count == 4.
+    let filter = Filter::parse_bytes(br#"{"count":4}"#).unwrap();
+    let snap = e.snapshot_owned();
+    let ids = query::find_ids(&snap, &cat, PREFIX, "users", &filter, 100).unwrap();
+    assert_eq!(ids.len(), 1);
+    drop(snap);
+
+    // A concurrent writer bumps the count BEFORE our write runs.
+    let bump = UpdateDoc::parse_bytes(br#"{"$inc":{"count":1}}"#).unwrap();
+    assert!(update::apply_to_id(&mut e, &cat, PREFIX, "users", b"u1", &bump).unwrap());
+
+    // Phase 2 with the stale candidate list: the re-check must skip it.
+    let inc = UpdateDoc::parse_bytes(br#"{"$inc":{"count":1}}"#).unwrap();
+    let modified =
+        update::apply_to_ids(&mut e, &cat, PREFIX, "users", &ids, &inc, Some(&filter)).unwrap();
+    assert_eq!(modified, 0, "stale candidate must not be updated");
+
+    // The document kept the concurrent writer's value (5), not 6.
+    let snap = e.snapshot_owned();
+    let body = query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
+        .unwrap()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["count"], serde_json::json!(5));
+    drop(snap);
+
+    // Same contract for filtered deletes: stale candidates survive.
+    let deleted =
+        store::delete_ids(&mut e, &cat, PREFIX, "users", &ids, Some(&filter)).unwrap();
+    assert_eq!(deleted, 0, "stale candidate must not be deleted");
+    let snap = e.snapshot_owned();
+    assert!(query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
+        .unwrap()
+        .is_some());
+
+    // And with a still-matching filter, the write proceeds normally.
+    drop(snap);
+    let filter5 = Filter::parse_bytes(br#"{"count":5}"#).unwrap();
+    let modified =
+        update::apply_to_ids(&mut e, &cat, PREFIX, "users", &ids, &inc, Some(&filter5)).unwrap();
+    assert_eq!(modified, 1);
 }
 
 #[test]

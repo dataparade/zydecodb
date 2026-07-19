@@ -304,8 +304,11 @@ fn find_cmd(
 }
 
 /// Filter-based update. Phase 1 selects candidate ids from a lock-free
-/// snapshot; phase 2 applies one atomic batch per document (not globally
-/// atomic, matching Mongo).
+/// snapshot; phase 2 re-verifies the filter per document UNDER the engine
+/// lock and applies one atomic batch per document (not globally atomic,
+/// matching Mongo). The re-check makes a filtered update a per-document
+/// compare-and-swap: `matched` reports only documents whose current body
+/// still satisfied the filter at write time.
 fn update_cmd(
     engine: &SharedEngine,
     catalog: &SharedCatalog,
@@ -318,14 +321,24 @@ fn update_cmd(
     let upd = UpdateDoc::parse_bytes(&p.update)?;
 
     let ids = select_candidates(engine, catalog, prefix, &p.collection, &filter, p.multi)?;
-    let matched = ids.len() as u64;
     let (modified, seq) = {
         let cat = catalog.read().unwrap();
         let mut guard = engine.lock().unwrap();
-        let modified = update::apply_to_ids(&mut guard, &cat, prefix, &p.collection, &ids, &upd)?;
+        let modified = update::apply_to_ids(
+            &mut guard,
+            &cat,
+            prefix,
+            &p.collection,
+            &ids,
+            &upd,
+            Some(&filter),
+        )?;
         let seq = guard.last_buffered_seq();
         (modified, seq)
     };
+    // Stale candidates were skipped by the under-lock re-check; every counted
+    // document both matched and was rewritten.
+    let matched = modified;
     // One durability wait covers the whole (possibly atomic) write set above.
     commit.commit(seq, p.relaxed);
     Ok(ResponseEnvelope::ok(
@@ -348,7 +361,8 @@ fn delete_cmd(
     let (deleted, seq) = {
         let cat = catalog.read().unwrap();
         let mut guard = engine.lock().unwrap();
-        let deleted = store::delete_ids(&mut guard, &cat, prefix, &p.collection, &ids)?;
+        let deleted =
+            store::delete_ids(&mut guard, &cat, prefix, &p.collection, &ids, Some(&filter))?;
         let seq = guard.last_buffered_seq();
         (deleted, seq)
     };
@@ -475,7 +489,8 @@ mod tests {
             let mut e = engine.lock().unwrap();
             for id in seed_ids {
                 let body = format!("{{\"_id\":\"{id}\",\"n\":1}}");
-                store::upsert(&mut e, &cat, &prefix, "c", id.as_bytes(), body.as_bytes()).unwrap();
+                store::upsert(&mut e, &cat, &prefix, "c", id.as_bytes(), body.as_bytes(), false)
+                    .unwrap();
             }
         }
         let commit = CommitCoordinator::new(Arc::clone(&engine), DurabilityMode::Sync);
