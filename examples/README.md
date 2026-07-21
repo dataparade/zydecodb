@@ -15,15 +15,16 @@ Security model: **ZydecoDB handles connection auth; your app handles human login
 ## 1. Start the database
 
 ```bash
-cargo build --release -p zydecodb
+# Prebuilt binary (or build from source: cargo build --release -p zydecodb)
+curl -sSL https://zydecodb.com/install.sh | sh
 
-# Dev config (writable paths under /tmp)
-cp config/zydecodb.dev.toml /tmp/zydecodb.toml
-
-./target/release/zydecodb serve --config /tmp/zydecodb.toml
+# No config needed locally: 127.0.0.1:9470, data in ~/.zydecodb
+zydecodb serve
 ```
 
-Default: listens on `127.0.0.1:9470`, auth optional on loopback.
+Default: listens on `127.0.0.1:9470`, auth optional on loopback. For custom
+paths or production settings, pass `--config` (start from
+[`config/zydecodb.dev.toml`](../config/zydecodb.dev.toml)).
 
 ### With API keys (LAN or `require_auth = true`)
 
@@ -42,7 +43,11 @@ Point `keys_file` in your server config at `/tmp/zydecodb-keys.toml`.
 
 ## 2. Python TCP client
 
-Check out the official Python package in [`clients/python`](../clients/python).
+```bash
+pip install zydecodb
+```
+
+(Source lives in [`clients/python`](../clients/python).)
 
 If you know MongoDB, the `Collection` API will feel familiar:
 

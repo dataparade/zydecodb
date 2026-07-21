@@ -271,6 +271,54 @@ fn docput_query_by_id_and_index_range_with_pagination() {
     handle.join().unwrap();
 }
 
+/// The first-run path: DocPut into a collection that was never defined must
+/// create it implicitly (no IndexDef required first), and it must survive a
+/// server restart because the catalog write is durable before the ack.
+#[test]
+fn docput_implicitly_creates_collection() {
+    let (addr, shutdown, handle) = spawn_server();
+    let mut s = connect(addr);
+
+    // No define_index — the very first operation on "fresh" is a write.
+    doc_put(&mut s, "fresh", b"d1", r#"{"name":"Ada","age":30}"#);
+
+    let resp = query(
+        &mut s,
+        wire::QueryPayload::ById {
+            collection: "fresh".into(),
+            doc_id: b"d1".to_vec(),
+        },
+    );
+    assert_eq!(resp.status, Status::Ok);
+    let v: serde_json::Value = serde_json::from_slice(&resp.payload).unwrap();
+    assert_eq!(v["name"], serde_json::json!("Ada"));
+
+    // Filtered reads work on the implicitly created collection (scan path).
+    let hits = find(&mut s, "fresh", r#"{"age":{"$gte":18}}"#);
+    assert_eq!(hits.len(), 1);
+
+    // Indexes can still be added afterwards and backfill the existing doc.
+    define_index(&mut s, "fresh", "by_age", &["age"]);
+    let resp = query(
+        &mut s,
+        wire::QueryPayload::IndexRange {
+            collection: "fresh".into(),
+            index_name: "by_age".into(),
+            lo: Vec::new(),
+            hi: Vec::new(),
+            cursor: Vec::new(),
+            limit: 10,
+        },
+    );
+    assert_eq!(resp.status, Status::Ok);
+    let (rows, _) = wire::decode_query_page(&resp.payload).unwrap();
+    assert_eq!(rows.len(), 1);
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
 #[test]
 fn find_update_delete_count_over_wire() {
     let (addr, shutdown, handle) = spawn_server();

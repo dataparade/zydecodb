@@ -12,14 +12,50 @@ Two layers, one engine:
 ## Quick start
 
 ```bash
+# 1. Install the prebuilt binary (Linux/macOS, x86_64/arm64)
+curl -sSL https://zydecodb.com/install.sh | sh
+
+# 2. Start the server — no config needed for local use
+zydecodb serve          # listens on 127.0.0.1:9470, data in ~/.zydecodb
+```
+
+Then grab a driver and make your first write (Python shown; also on [npm](clients/typescript) and [Go](clients/go)):
+
+```bash
+pip install zydecodb
+```
+
+```python
+from zydecodb import Client
+
+with Client("127.0.0.1", 9470) as db:
+    users = db.collection("users")
+
+    users.insert_one({"name": "Ada", "age": 30, "city": "London"})   # auto _id, returned
+    users.insert_many([{ "name": "Bo", "age": 25 }, { "name": "Cy", "age": 40 }])
+
+    users.find_one({"name": "Ada"})                                  # filter by any field
+    users.find({"age": {"$gte": 30}}, sort=[("age", True)], limit=10) # operators + sort, auto-paginated
+    users.find({"city": "London"}, projection={"name": 1})           # works even with no index on city
+
+    users.update_one({"name": "Ada"}, {"$inc": {"age": 1}})          # partial update
+    users.count_documents({"age": {"$gte": 30}})
+    users.distinct("city")
+    users.delete_many({"age": {"$lt": 18}})
+```
+
+If you know MongoDB, you already know the driver. Wire protocol: length-prefixed binary frames (see `zydecodb-engine::frame`) on `127.0.0.1:9470`.
+
+### Build from source
+
+```bash
 cargo build --release -p zydecodb
+./target/release/zydecodb serve                          # local defaults, or:
 cp config/zydecodb.dev.toml /tmp/zydecodb.toml
 ./target/release/zydecodb serve --config /tmp/zydecodb.toml
 ```
 
-Default listen: `127.0.0.1:9470`. Wire protocol: length-prefixed binary frames (see `zydecodb-engine::frame`).
-
-### Try the Python examples
+### Try the examples
 
 ```bash
 # Terminal 1 — database (above)
@@ -31,35 +67,27 @@ python3 examples/user_backend/app.py --seed
 
 See [`examples/README.md`](examples/README.md) for the full walkthrough.
 
-If you know MongoDB, you already know the driver (Python client shown):
-
-```python
-users = db.collection("users")
-users.create_index(["age"])                          # optional; speeds up age queries
-
-users.insert_one({"name": "Ada", "age": 30, "city": "London"})   # auto _id, returned
-users.insert_many([{ "name": "Bo", "age": 25 }, { "name": "Cy", "age": 40 }])
-
-users.find_one({"name": "Ada"})                                  # filter by any field
-users.find({"age": {"$gte": 30}}, sort=[("age", True)], limit=10) # operators + sort, auto-paginated
-users.find({"city": "London"}, projection={"name": 1})           # works even with no index on city
-
-users.update_one({"name": "Ada"}, {"$inc": {"age": 1}})          # partial update
-users.count_documents({"age": {"$gte": 30}})
-users.distinct("city")
-users.delete_many({"age": {"$lt": 18}})
-```
-
 ### API keys (when auth is required)
 
 ```bash
 zydecodb admin keys create --id backend --role read_write --keys-file /tmp/zydecodb-keys.toml
 export ZYDECODB_API_KEY="zdk_..."   # save the key printed once
-export PYTHONPATH=clients/python
 python3 examples/user_backend/app.py --seed
 ```
 
 Details: [`docs/SECURITY.md`](docs/SECURITY.md).
+
+### Docker
+
+```bash
+# Create API keys first (auth is required in the Docker config)
+./target/release/zydecodb admin keys create \
+  --id docker --role admin --keys-file config/keys.toml
+
+docker compose up -d --build
+```
+
+Compose publishes `:9470` only. Metrics stay on loopback inside the container. See [`docs/SECURITY.md`](docs/SECURITY.md#docker).
 
 ## Features
 

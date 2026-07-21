@@ -7,17 +7,18 @@ no runtime dependencies.
 ## Install
 
 ```bash
-# Add to your project
-npm install file:../zydecodb/clients/typescript
+npm install zydecodb
 ```
 
-Requires Node.js 20+.
+Requires Node.js 20+. (Working from a checkout of this repo:
+`npm install file:clients/typescript`.)
 
 ## Quick start
 
 ```ts
 import { Client } from "zydecodb";
 
+// Plain TCP (localhost). For TLS: { apiKey: "YOUR_KEY", tls: true }
 const db = new Client("127.0.0.1:9470", { apiKey: "YOUR_KEY" });
 try {
   const users = db.collection("users");
@@ -54,6 +55,8 @@ try {
   `createIndex`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.
 - **Raw KV with TTL.** Side-channel `put` (with `expiresAt`), `get`, and `delete` methods on `Client` for session data that needs a time-to-live.
+- **TLS.** Pass `tls: true` for system CA defaults, or a `tls.ConnectionOptions`
+  object for custom roots / SNI / `rejectUnauthorized`.
 
 ## Durability
 

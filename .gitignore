@@ -38,20 +38,35 @@ __pycache__/
 *.profraw
 lcov.info
 
+# Secrets / credentials (never commit)
+.env
+.env.*
+!.env.example
+keys.toml
+**/keys.toml
+!config/zydecodb.keys.example.toml
+*.pem
+*.key
+*.p12
+*.pfx
+tls.crt
+tls.key
+
 # IDE
 /.idea/
 /.vscode/
 *.swp
 .DS_Store
 
-# Release/packaging tooling (kept local, not yet part of the tracked tree)
-/.github/workflows/release.yml
+# Empty stub left over from an earlier packaging experiment
 /.github/workflows/publish-python.yml
-/install.sh
 
-# Website / Marketing
+# Website / Marketing (deployed from this tree via scripts/deploy-website.sh;
+# keep the marketing site and ops scripts local unless explicitly force-added)
 /website/
-/scripts/
+/scripts/*
+!/scripts/install.sh
+!/scripts/deploy-website.sh
 
 # Internal / Archived Docs
 /docs/archive/

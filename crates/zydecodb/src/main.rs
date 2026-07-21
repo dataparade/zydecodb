@@ -12,10 +12,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Load config and start the TCP server.
+    /// Start the TCP server. With no --config, runs with local defaults:
+    /// listen 127.0.0.1:9470, state under ~/.zydecodb/ (auth optional on
+    /// loopback).
     Serve {
+        /// Config file (TOML). Omit for zero-config local defaults.
         #[arg(long, short)]
-        config: PathBuf,
+        config: Option<PathBuf>,
         /// Run as a read-only replica, ingesting sha256-verified WAL segments
         /// shipped by a primary into this directory. Overrides `[replica].from`.
         #[arg(long, value_name = "DIR")]
@@ -256,7 +259,10 @@ fn main() {
             replica_from,
             replica_poll_ms,
         } => {
-            let mut cfg = load_config(&config);
+            let mut cfg = match config {
+                Some(path) => load_config(&path),
+                None => load_local_default_config(),
+            };
             if let Some(from) = replica_from {
                 cfg.replica.from = Some(from);
             }
@@ -390,6 +396,28 @@ fn load_config(path: &Path) -> zydecodb::config::Config {
         eprintln!("failed to load config {}: {e}", path.display());
         std::process::exit(1);
     })
+}
+
+/// Zero-config path: resolve local defaults under `~/.zydecodb/`, create the
+/// state directories up front, and log where everything lives.
+fn load_local_default_config() -> zydecodb::config::Config {
+    let cfg = zydecodb::config::Config::local_default().unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    for dir in [&cfg.data_dir, &cfg.wal_dir] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("failed to create {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    }
+    tracing::info!(
+        listen = %cfg.listen,
+        data_dir = %cfg.data_dir.display(),
+        wal_dir = %cfg.wal_dir.display(),
+        "no --config given; using local defaults (state under ~/.zydecodb)"
+    );
+    cfg
 }
 
 /// Resolve the shipped-stream source: an explicit `--from` overrides the config;

@@ -75,6 +75,11 @@ pub struct ReplicaConfig {
     /// How often to poll `from` for newly shipped segments.
     #[serde(default = "default_replica_poll_ms")]
     pub poll_ms: u64,
+    /// File holding the shared HMAC secret that authenticates each shipped
+    /// manifest entry (must match the primary's `[shipping] hmac_key_file`).
+    /// Required whenever `from` is set.
+    #[serde(default)]
+    pub hmac_key_file: Option<PathBuf>,
 }
 
 impl Default for ReplicaConfig {
@@ -82,6 +87,7 @@ impl Default for ReplicaConfig {
         ReplicaConfig {
             from: None,
             poll_ms: default_replica_poll_ms(),
+            hmac_key_file: None,
         }
     }
 }
@@ -100,11 +106,28 @@ pub struct ShippingConfig {
     /// Defaults to 1000ms when a config file omits it.
     #[serde(default = "default_heartbeat_ms")]
     pub heartbeat_ms: u64,
+    /// File holding the shared HMAC secret. Each `shipped.log` entry carries an
+    /// HMAC-SHA256 over the entry so a writable ship directory cannot forge
+    /// segments plus matching manifest lines. Required when `ship_dir` is set.
+    /// Generate with e.g.: `head -c 32 /dev/urandom > ship.hmac && chmod 600 ship.hmac`
+    #[serde(default)]
+    pub hmac_key_file: Option<PathBuf>,
+}
+
+/// Load a shipping/replica HMAC key file: raw bytes, must be non-empty.
+pub fn load_hmac_key(path: &PathBuf) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("hmac_key_file {}: {}", path.display(), e))?;
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return Err(format!("hmac_key_file {} is empty", path.display()));
+    }
+    Ok(bytes)
 }
 
 /// Operational HTTP endpoint (Prometheus `/metrics`, `/healthz`, `/readyz`).
 /// Disabled unless `listen` is set; bind to a loopback address in production
-/// and scrape it from a local agent.
+/// and scrape it from a local agent. A non-loopback bind is refused unless
+/// `allow_remote = true`, and remote binds require a bearer `token`.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MetricsConfig {
     pub listen: Option<SocketAddr>,
@@ -113,6 +136,14 @@ pub struct MetricsConfig {
     /// off for deployments with very many tenants per process.
     #[serde(default)]
     pub per_tenant: bool,
+    /// Allow binding the metrics endpoint to a non-loopback address. Off by
+    /// default; when enabled, a non-empty `token` is required.
+    #[serde(default)]
+    pub allow_remote: bool,
+    /// Bearer token required on `/metrics` when set (`Authorization: Bearer
+    /// <token>`). `/healthz` and `/readyz` stay open for probes.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// Durability model selector (mirrors [`crate::commit::DurabilityMode`]).
@@ -158,6 +189,11 @@ pub struct SecurityConfig {
     /// 0 disables the idle cap entirely.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    /// Max documents one query may buffer for an in-memory sort or a filtered
+    /// multi-write candidate set. Beyond this the request is rejected so a
+    /// single authenticated client cannot exhaust server memory.
+    #[serde(default = "default_max_sort_buffer")]
+    pub max_sort_buffer: usize,
     #[serde(default)]
     pub audit: AuditConfig,
     #[serde(default)]
@@ -175,10 +211,15 @@ impl Default for SecurityConfig {
             rate_limit_rps: default_rate_limit_rps(),
             auth_burst_limit: default_auth_burst_limit(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            max_sort_buffer: default_max_sort_buffer(),
             audit: AuditConfig::default(),
             quotas: QuotasConfig::default(),
         }
     }
+}
+
+fn default_max_sort_buffer() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -278,6 +319,30 @@ impl Config {
         let mut cfg: Config = toml::from_str(&text)?;
         cfg.apply_runtime_profile();
         Ok(cfg)
+    }
+
+    /// Zero-config local defaults so `zydecodb serve` works with no config file
+    /// and no root: loopback listen (`127.0.0.1:9470`), state under
+    /// `~/.zydecodb/` (`data/`, `wal/`, `keys.toml`), and every other knob at
+    /// its standard default. Auth stays on `auto`, which resolves to
+    /// unauthenticated on a loopback bind.
+    pub fn local_default() -> Result<Self, Box<dyn std::error::Error>> {
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .ok_or("cannot resolve local defaults: HOME is not set (pass --config <file>)")?;
+        Ok(Self::local_default_with_home(std::path::Path::new(&home)))
+    }
+
+    /// [`Config::local_default`] with an explicit home directory (testable
+    /// without mutating process-global env).
+    pub fn local_default_with_home(home: &std::path::Path) -> Self {
+        // Empty TOML yields the same serde defaults a config file would.
+        let mut cfg: Config = toml::from_str("").expect("empty config deserializes to defaults");
+        let base = home.join(".zydecodb");
+        cfg.data_dir = base.join("data");
+        cfg.wal_dir = base.join("wal");
+        cfg.security.keys_file = base.join("keys.toml");
+        cfg
     }
 
     /// Apply the low-footprint profile by shrinking per-process budgets — but only

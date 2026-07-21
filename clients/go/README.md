@@ -6,7 +6,6 @@ store without the fluff. Standard library only, no third-party dependencies.
 ## Install
 
 ```bash
-# In your go.mod, use a local replace or fetch from the repository once pushed:
 go get github.com/dataparade/zydecodb/clients/go@latest
 ```
 
@@ -26,6 +25,7 @@ import (
 )
 
 func main() {
+	// Plain TCP (localhost). For TLS: add zydecodb.WithTLS(nil).
 	db := zydecodb.NewClient("127.0.0.1:9470", zydecodb.WithAPIKey("YOUR_KEY"))
 	defer db.Close()
 
@@ -72,6 +72,7 @@ func main() {
   `CreateIndex`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.
 - **Raw KV with TTL.** Side-channel `Put` (with `expiresAt`), `Get`, and `Delete` methods on `Client` for session data that needs a time-to-live.
+- **TLS.** `WithTLS(nil)` uses system roots and infers SNI from the dial address; pass a custom `*tls.Config` when you need private CAs or other settings.
 
 ## Durability
 

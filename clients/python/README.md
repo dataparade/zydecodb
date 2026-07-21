@@ -6,16 +6,18 @@ document store without the fluff. Pure standard library, no runtime dependencies
 ## Install
 
 ```bash
-pip install -e clients/python
+pip install zydecodb
 ```
 
-Requires Python 3.9+.
+Requires Python 3.9+. (Working from a checkout of this repo:
+`pip install -e clients/python`.)
 
 ## Quick start
 
 ```python
 from zydecodb import Client
 
+# Plain TCP (localhost). For TLS: Client(..., api_key="YOUR_KEY", tls=True)
 with Client("127.0.0.1", 9470, api_key="YOUR_KEY") as db:
     users = db.collection("users")
     users.create_index(["email"], unique=True)
@@ -48,6 +50,7 @@ with Client("127.0.0.1", 9470, api_key="YOUR_KEY") as db:
   `create_index`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.
 - **Raw KV with TTL.** Side-channel `put` (with `expires_at`), `get`, and `delete` methods on `Client` for session data that needs a time-to-live.
+- **TLS.** Pass `tls=True` for system CA defaults, or an `ssl.SSLContext` for custom roots / verification.
 
 ## Durability
 
