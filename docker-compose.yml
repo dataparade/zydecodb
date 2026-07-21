@@ -1,5 +1,12 @@
 version: '3.8'
 
+# Before first start, create API keys (host binary or one-shot container):
+#   zydecodb admin keys create --id docker --role admin --keys-file config/keys.toml
+# keys.toml is gitignored; never commit real secrets.
+#
+# :9470 is the database port — keep it on a private network or behind a firewall.
+# Metrics stay on 127.0.0.1 inside the container and are not published.
+
 services:
   zydecodb:
     build:
@@ -9,12 +16,22 @@ services:
     container_name: zydecodb
     ports:
       - "9470:9470"
-      - "9471:9471"
     volumes:
       - zydecodb-data:/var/lib/zydecodb/data
       - zydecodb-wal:/var/lib/zydecodb/wal
-      - ./config:/etc/zydecodb
+      - ./config:/etc/zydecodb:ro
+    environment:
+      # Do not set ZYDECODB_BOOTSTRAP_KEY here — refused on non-loopback listen.
+      - RUST_LOG=info
     restart: unless-stopped
+    # Data/WAL volumes must be writable by uid 1000 (the image's zydeco user).
+    read_only: false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
 
 volumes:
   zydecodb-data:

@@ -204,9 +204,51 @@ impl Server {
     }
 
     pub fn run(&self, config: Config) -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("ZYDECODB_BOOTSTRAP_KEY").is_some() && !config.listen.ip().is_loopback()
+        {
+            return Err(
+                "ZYDECODB_BOOTSTRAP_KEY is set but listen is not loopback — refuse to start \
+                 (bootstrap auth is loopback/dev-only; use a keys file for networked binds)"
+                    .into(),
+            );
+        }
+
         let security = Arc::new(SecurityRuntime::from_config(&config)?);
         if security.require_auth {
             info!("authentication required for this listen address");
+        }
+
+        // Fail closed: auth required but nothing can ever authenticate. A
+        // server in that state looks healthy while rejecting every client —
+        // or worse, tempts the operator into flipping require_auth off.
+        {
+            let keys = security.keys.load();
+            if security.require_auth && keys.record_count() == 0 && !keys.has_bootstrap() {
+                return Err(format!(
+                    "refusing to start: authentication is required but the keys file {} has no \
+                     keys — create one with `zydecodb admin keys create --keys-file {}`",
+                    config.security.keys_file.display(),
+                    config.security.keys_file.display(),
+                )
+                .into());
+            }
+
+            // legacy_single_tenant collapses the all-zero tenant onto the
+            // un-prefixed key layout. Mixing that with real (non-zero) tenant
+            // keys silently splits the keyspace into two layouts; refuse the
+            // ambiguous configuration instead.
+            if config.security.legacy_single_tenant {
+                let zero = "00000000000000000000000000000000";
+                if let Some(bad) = keys.records().iter().find(|r| r.tenant != zero) {
+                    return Err(format!(
+                        "refusing to start: legacy_single_tenant = true but key '{}' has \
+                         non-zero tenant {} — set legacy_single_tenant = false for \
+                         multi-tenant deployments (or keep all keys on the zero tenant)",
+                        bad.id, bad.tenant,
+                    )
+                    .into());
+                }
+            }
         }
 
         let engine_cfg = EngineConfig {
@@ -217,14 +259,22 @@ impl Server {
             ..Default::default()
         };
 
-        // Read-replica mode: ingest sha256-verified WAL segments shipped by a
-        // primary into our WAL dir before opening, so the initial replay already
+        // Read-replica mode: ingest verified WAL segments shipped by a primary
+        // into our WAL dir before opening, so the initial replay already
         // reflects everything delivered so far. A poll thread (spawned below)
-        // keeps catching up.
+        // keeps catching up. The shipped manifest must be HMAC-authenticated:
+        // a replica ingesting an unauthenticated stream would trust whatever
+        // an attacker with write access to the ship path put there.
         let mut replica = match config.replica.from.clone() {
             Some(from) => {
+                let key_file = config.replica.hmac_key_file.as_ref().ok_or(
+                    "replica.from is set but replica.hmac_key_file is missing — the shipped \
+                     stream must be HMAC-authenticated (share the primary's shipping key)",
+                )?;
+                let key = crate::config::load_hmac_key(key_file)?;
                 info!(dir = %from.display(), "starting as READ REPLICA (read-only)");
-                let mut rep = crate::replica::Replica::new(from, config.wal_dir.clone());
+                let mut rep = crate::replica::Replica::new(from, config.wal_dir.clone())
+                    .with_hmac_key(Some(key));
                 let out = rep.sync()?;
                 info!(
                     installed = out.installed.len(),
@@ -271,10 +321,18 @@ impl Server {
                 crate::replica::write_fence(&ship_dir, node_epoch)?;
                 info!(epoch = node_epoch, dir = %ship_dir.display(), "stamped shipping fence epoch");
             }
+            let key_file = config.shipping.hmac_key_file.as_ref().ok_or(
+                "shipping.ship_dir is set but shipping.hmac_key_file is missing — shipped \
+                 manifests must be HMAC-authenticated (generate a key: \
+                 `head -c 32 /dev/urandom > ship.hmac && chmod 600 ship.hmac`)",
+            )?;
+            let hmac_key = crate::config::load_hmac_key(key_file)?;
             let mode =
                 zydecodb_engine::shipping::ShipMode::from_str_or_default(&config.shipping.mode);
-            engine = engine.with_shipping(Some(ship_dir.clone()), mode);
-            info!(dir = %ship_dir.display(), ?mode, "WAL shipping enabled");
+            engine = engine
+                .with_shipping(Some(ship_dir.clone()), mode)
+                .with_shipping_hmac_key(Some(hmac_key));
+            info!(dir = %ship_dir.display(), ?mode, "WAL shipping enabled (HMAC-authenticated)");
         }
 
         // Always construct and attach the metrics registry so it is populated
@@ -331,13 +389,22 @@ impl Server {
         };
 
         // Operability HTTP endpoint (Prometheus /metrics, /healthz, /readyz) on
-        // its own address, separate from the data-plane socket.
+        // its own address, separate from the data-plane socket. Non-loopback
+        // binds are refused unless explicitly allowed with a token.
         let metrics_http = match config.metrics.listen {
-            Some(addr) => Some(crate::metrics_http::spawn(
-                addr,
-                Arc::clone(&metrics),
-                Arc::clone(&self.shutdown),
-            )?),
+            Some(addr) => {
+                crate::metrics_http::check_bind_policy(
+                    &addr,
+                    config.metrics.allow_remote,
+                    config.metrics.token.as_deref(),
+                )?;
+                Some(crate::metrics_http::spawn(
+                    addr,
+                    Arc::clone(&metrics),
+                    Arc::clone(&self.shutdown),
+                    config.metrics.token.clone(),
+                )?)
+            }
             None => None,
         };
 
@@ -348,14 +415,20 @@ impl Server {
         // Optional Unix-domain socket for local control-plane traffic. Removing a
         // stale socket from a prior run is required because bind() fails if the
         // path already exists. The file's permissions are the trust boundary;
-        // TLS does not apply (API-key auth still does).
+        // TLS does not apply (API-key auth still does). We chmod to 0600
+        // explicitly so the process umask can never leave the socket
+        // world-connectable.
         let uds_listener: Option<(UnixListener, std::path::PathBuf)> =
             match config.listen_unix.clone() {
                 Some(path) => {
                     let _ = std::fs::remove_file(&path);
                     let l = UnixListener::bind(&path)?;
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                    }
                     l.set_nonblocking(true)?;
-                    info!(path = %path.display(), "ZydecoDB listening on unix socket");
+                    info!(path = %path.display(), "ZydecoDB listening on unix socket (mode 0600)");
                     Some((l, path))
                 }
                 None => None,
@@ -798,7 +871,7 @@ fn serve_stream<S: Read + Write>(
             break;
         }
 
-        let req = match read_message(stream, shutdown) {
+        let req = match read_message(stream, shutdown, security.idle_timeout) {
             ReadOutcome::Request(r) => {
                 last_activity = Instant::now();
                 r
@@ -826,6 +899,26 @@ fn serve_stream<S: Read + Write>(
             write_response(stream, &resp)?;
             stream.flush()?;
             continue;
+        }
+
+        // Re-validate session against current KeyStore (handles SIGHUP revocations)
+        if session.authenticated {
+            let store = security.keys.load();
+            if !store.is_session_valid(&session) {
+                tracing::warn!("Session revoked during re-validation!");
+                session = SessionState::anonymous();
+                if security.require_auth && req.command != Command::SessionInit {
+                    let resp = zydecodb_engine::frame::ResponseEnvelope::error(
+                        zydecodb_engine::errors::Status::Unauthorized,
+                        "session revoked",
+                    );
+                    write_response(stream, &resp)?;
+                    stream.flush()?;
+                    continue;
+                }
+            } else {
+                // tracing::info!("Session is still valid");
+            }
         }
 
         // Per-tenant rate ceiling: shared across all of an authenticated tenant's
@@ -943,24 +1036,36 @@ fn fill<S: Read>(
     buf: &mut [u8],
     shutdown: &Arc<Mutex<bool>>,
     allow_idle: bool,
+    idle_timeout: Option<Duration>,
 ) -> Result<Fill, zydecodb_engine::errors::EngineError> {
     let mut filled = 0;
     let started = Instant::now();
+    let mut last_byte = Instant::now();
+    let timeout = idle_timeout.unwrap_or(MESSAGE_READ_TIMEOUT).min(MESSAGE_READ_TIMEOUT);
+
     while filled < buf.len() {
         if *shutdown.lock().unwrap() {
             return Ok(Fill::Closed);
         }
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return Ok(Fill::Closed),
-            Ok(n) => filled += n,
+            Ok(n) => {
+                filled += n;
+                last_byte = Instant::now();
+            }
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(ref e) if is_idle_io(e) => {
                 if filled == 0 && allow_idle {
                     return Ok(Fill::Idle);
                 }
-                if started.elapsed() > MESSAGE_READ_TIMEOUT {
+                if last_byte.elapsed() > timeout {
                     return Err(zydecodb_engine::errors::EngineError::Io(
                         "read timed out mid-message".into(),
+                    ));
+                }
+                if started.elapsed() > MESSAGE_READ_TIMEOUT {
+                    return Err(zydecodb_engine::errors::EngineError::Io(
+                        "message read exceeded absolute time limit".into(),
                     ));
                 }
                 continue;
@@ -974,11 +1079,11 @@ fn fill<S: Read>(
 
 /// Read one request frame, distinguishing "idle between frames" from "client
 /// closed" from "stream error".
-fn read_message<S: Read>(stream: &mut S, shutdown: &Arc<Mutex<bool>>) -> ReadOutcome {
+fn read_message<S: Read>(stream: &mut S, shutdown: &Arc<Mutex<bool>>, idle_timeout: Option<Duration>) -> ReadOutcome {
     use zydecodb_engine::frame::{RequestEnvelope, ENVELOPE_HEADER_LEN};
 
     let mut header = [0u8; ENVELOPE_HEADER_LEN];
-    match fill(stream, &mut header, shutdown, true) {
+    match fill(stream, &mut header, shutdown, true, idle_timeout) {
         Ok(Fill::Done) => {}
         Ok(Fill::Idle) => return ReadOutcome::Idle,
         Ok(Fill::Closed) => return ReadOutcome::Closed,
@@ -997,7 +1102,7 @@ fn read_message<S: Read>(stream: &mut S, shutdown: &Arc<Mutex<bool>>) -> ReadOut
 
     let mut payload = vec![0u8; len];
     if len > 0 {
-        match fill(stream, &mut payload, shutdown, false) {
+        match fill(stream, &mut payload, shutdown, false, idle_timeout) {
             Ok(Fill::Done) => {}
             // EOF/shutdown after the header started a frame is a desync, not a
             // clean close.

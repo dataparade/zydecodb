@@ -71,13 +71,23 @@ Roles:
 | `read_write` | allowed | allowed | Default for app backends |
 | `admin` | allowed | allowed | Can send `SetContext` to switch tenant |
 
-Optional prefix ACL per key:
+Optional prefix ACL per key (enforced on **both** raw KV keys and document collection names):
 
 ```toml
 allowed_prefixes = ["events:", "metrics:"]
 ```
 
-Dev-only bootstrap (logs a warning): set `ZYDECODB_BOOTSTRAP_KEY` env var instead of a keys file.
+- **KV:** the client key must start with one of the prefixes.
+- **Documents:** the collection name must start with a prefix, or equal the prefix with a trailing `:` stripped (so `events:` allows collection `events`).
+
+Dev-only bootstrap: set `ZYDECODB_BOOTSTRAP_KEY` instead of a keys file. The server **refuses to start** if this env var is set and `listen` is not loopback. Use a real `keys.toml` for any networked bind.
+
+Fail-closed startup guards:
+
+- **Auth required + empty keys file + no bootstrap** → the server refuses to start (a server that can never authenticate anyone is a misconfiguration, not a service).
+- **`legacy_single_tenant = true` + any key with a non-zero tenant** → refused; the two key layouts must not be mixed. Set `legacy_single_tenant = false` for multi-tenant deployments.
+
+Key verification is O(1): `admin keys create` stores a `secret_lookup` (sha256 of the secret) used as an index into the keystore, so auth performs exactly one argon2 verify regardless of how many keys exist. Keys minted before this field existed still verify via a linear scan — reissue them to get the fast path (the server logs a warning at startup when such keys are present).
 
 ## Connection handshake
 
@@ -107,9 +117,10 @@ See [`config/zydecodb.keys.example.toml`](../config/zydecodb.keys.example.toml).
 |-------|---------|
 | `id` | Label in audit logs |
 | `secret_hash` | argon2id hash of the full `zdk_...` secret |
+| `secret_lookup` | sha256 of the secret; O(1) keystore index (written by `admin keys create`) |
 | `role` | `read_only`, `read_write`, or `admin` |
 | `tenant` | 32 hex chars → 16-byte namespace |
-| `allowed_prefixes` | Optional; empty = entire tenant |
+| `allowed_prefixes` | Optional; empty = entire tenant. Applies to KV key prefixes and document collection names |
 
 ## Tenant isolation
 
@@ -117,6 +128,8 @@ Stored engine keys use layout `0x01 | tenant(16) | your_key`. Each API key is sc
 
 - `legacy_single_tenant = true` (default): when tenant is all zeros, uses old layout `0x01 | your_key` for backward compatibility.
 - `legacy_single_tenant = false`: always prefix with tenant (multi-tenant hosted).
+
+Upgrade note: keep `legacy_single_tenant = true` until your existing data is migrated — flipping it orphans keys written under the old layout. The server refuses to start when `legacy_single_tenant = true` is combined with any non-zero-tenant key, so a legacy volume can never be half-migrated by accident. Greenfield deployments (including the Docker config) should use `false`.
 
 Admins can switch tenant mid-connection with `SetContext` (`0x41`) and a 16-byte tenant payload.
 
@@ -136,6 +149,14 @@ openssl req -x509 -newkey rsa:2048 -keyout tls.key -out tls.crt \
   -days 365 -nodes -subj "/CN=localhost"
 ```
 
+Official drivers speak TLS when configured:
+
+| Driver | Option |
+|--------|--------|
+| Go | `WithTLS(nil)` or `WithTLS(&tls.Config{...})` |
+| TypeScript | `{ tls: true }` or `{ tls: { rejectUnauthorized: false, /* ... */ } }` |
+| Python | `tls=True` or `tls=ssl_context` |
+
 Alternative: terminate TLS at nginx or stunnel; keep plain TCP to ZydecoDB on `127.0.0.1`.
 
 ### Unix-domain socket (local transport)
@@ -148,8 +169,25 @@ listen_unix = "/run/zydecodb/zydecodb.sock"
 ```
 
 TLS is **TCP-only** — the UDS trust boundary is the socket file's filesystem
-permissions, so restrict the directory to the intended local users. API-key auth
-still applies on the socket exactly as it does over TCP.
+permissions. The server chmods the socket to `0600` at bind, so only the
+server's own user can connect by default; widen deliberately (e.g. a shared
+group directory) if co-located services need it. API-key auth still applies on
+the socket exactly as it does over TCP.
+
+### Metrics endpoint
+
+The `[metrics]` HTTP endpoint binds loopback by default. A non-loopback bind is
+**refused** unless `allow_remote = true`, and remote binds require a bearer
+`token`; `/metrics` then demands `Authorization: Bearer <token>` (constant-time
+compared) while `/healthz` and `/readyz` stay open for probes.
+
+### WAL shipping integrity (HMAC)
+
+When `[shipping] ship_dir` is set, `hmac_key_file` is **required**: each
+`shipped.log` entry carries an HMAC-SHA256 over `<id> <seq> <sha256>` so an
+attacker with write access to the ship path cannot forge a segment plus a
+matching manifest line. A replica (`[replica] from`) requires the same key and
+refuses entries without a valid HMAC. See [SHIPPING.md](SHIPPING.md).
 
 ## Rate limits and quotas
 
@@ -158,10 +196,17 @@ still applies on the socket exactly as it does over TCP.
 max_connections = 256        # drop new TCP connections when full
 rate_limit_rps = 1000        # per-connection token bucket
 auth_burst_limit = 10        # failed SessionInit per IP per minute
+max_sort_buffer = 10000      # max docs buffered per query sort / multi-write select
 
 [security.quotas]
 max_bytes_per_tenant = 0     # 0 = unlimited; else write cap per tenant
 ```
+
+`max_sort_buffer` bounds authenticated memory abuse: one sorted `find` or
+filtered `update_many`/`delete_many` can buffer at most this many documents
+before the request is rejected with `BadFilter` (add an index or a tighter
+filter). The Docker config additionally lowers `rate_limit_rps` to 200 and
+`max_connections` to 128 — raise them deliberately if your workload needs it.
 
 Exceeded rate → `EngineBusy` (`0x07`). Exceeded quota → `PolicyRejected` (`0x09`).
 
@@ -202,6 +247,8 @@ log_client_key = false   # never enable in production without good reason
 
 Emits structured `tracing` events: `tenant`, `key_id`, `cmd`, `client_key_len`, `status`, `duration_us`. Secrets and values are never logged.
 
+With `log_client_key = true`, each line also carries `client_key_prefix` — a hex dump of at most the **first 8 bytes** of the client's KV key. The full key is never logged even when enabled; leave it off unless you are actively debugging access patterns.
+
 ## Wire status codes (security-related)
 
 | Byte | Name | When |
@@ -217,8 +264,43 @@ Emits structured `tracing` events: `tenant`, `key_id`, `cmd`, `client_key_len`, 
 - SQL injection protection (no SQL)
 - Encryption at rest (use disk/filesystem encryption)
 
+## Docker
+
+[`config/zydecodb.docker.toml`](../config/zydecodb.docker.toml) and [`docker-compose.yml`](../docker-compose.yml):
+
+- `require_auth = true` and `listen = "0.0.0.0:9470"`
+- Metrics bind `127.0.0.1:9471` inside the container (not published)
+- Process runs as non-root `zydeco` (uid 1000); Compose drops all capabilities (`cap_drop: [ALL]`), sets `no-new-privileges`, and mounts `/tmp` as tmpfs
+- `legacy_single_tenant = false`, `rate_limit_rps = 200`, `max_connections = 128`
+- Data/WAL volumes must be writable by uid 1000
+
+Create keys before the first start (host binary or a one-shot container):
+
+```bash
+zydecodb admin keys create --id docker --role admin --keys-file config/keys.toml
+docker compose up -d
+```
+
+`config/keys.toml` is gitignored. Do not set `ZYDECODB_BOOTSTRAP_KEY` in Compose — non-loopback listen rejects it.
+
+## Operations checklist (networked deployments)
+
+Before exposing a ZydecoDB port beyond loopback:
+
+- [ ] `require_auth = true` (or `"auto"`, which enforces it off-loopback)
+- [ ] Real keys file created with `admin keys create` (server refuses to start with auth on and zero keys)
+- [ ] `ZYDECODB_BOOTSTRAP_KEY` **not** set (refused off-loopback anyway)
+- [ ] `[tls] enabled = true` with a real cert/key — see [`config/zydecodb.tls.example.toml`](../config/zydecodb.tls.example.toml)
+- [ ] Metrics on loopback, or `allow_remote = true` **with** a bearer `token`
+- [ ] Shipping/replication configured with `hmac_key_file` (required when enabled)
+- [ ] `legacy_single_tenant = false` unless migrating an old volume
+- [ ] Firewall: `:9470` reachable only from app subnets; metrics port never published
+- [ ] Rate caps sized for your workload (`rate_limit_rps`, `max_connections`, `max_sort_buffer`, per-tenant quotas)
+
 ## Never do this
 
 - Bind `0.0.0.0:9470` without `require_auth` on the public internet
-- Commit API keys or plaintext secrets to git
+- Ship Docker with `require_auth = false`
+- Set `ZYDECODB_BOOTSTRAP_KEY` on a non-loopback listen address
+- Commit API keys, `keys.toml`, or TLS PEMs to git
 - Log full keys or values in audit mode

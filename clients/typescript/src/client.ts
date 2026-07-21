@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 
+import type { TlsOption } from "./connection.ts";
 import { Collection } from "./collection.ts";
 import { ConnectionError, fromStatus, ServerBusyError, ZydecoError } from "./errors.ts";
 import { ConnectionPool } from "./pool.ts";
@@ -33,6 +34,11 @@ export interface ClientOptions {
   maxRetries?: number;
   backoffBaseMs?: number;
   backoffCapMs?: number;
+  /**
+   * Enable TLS before the protocol handshake. `true` uses system CA defaults;
+   * pass a `tls.ConnectionOptions` object for custom roots / SNI / etc.
+   */
+  tls?: TlsOption;
 }
 
 interface ExecOptions {
@@ -75,6 +81,7 @@ export class Client {
       apiKey: options.apiKey ?? null,
       timeoutMs: options.timeoutMs ?? 5000,
       maxSize: options.poolSize ?? 8,
+      tls: options.tls ?? null,
     });
     this.maxRetries = Math.max(0, options.maxRetries ?? 2);
     this.backoffBaseMs = options.backoffBaseMs ?? 50;

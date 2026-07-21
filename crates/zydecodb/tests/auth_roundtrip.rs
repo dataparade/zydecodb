@@ -339,6 +339,99 @@ fn prefix_acl_denies_out_of_scope_keys() {
     handle.join().unwrap();
 }
 
+#[test]
+fn prefix_acl_applies_to_document_collections() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let wal_dir = tmp.path().join("wal");
+    let keys_file = tmp.path().join("keys.toml");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&wal_dir).unwrap();
+
+    let secret = KeyStore::create_key(
+        &keys_file,
+        "analytics",
+        KeyRole::ReadWrite,
+        "00000000000000000000000000000000",
+        vec!["events:".to_string()],
+    )
+    .unwrap();
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let config = Config {
+        listen: addr,
+        data_dir,
+        wal_dir,
+        block_cache_mb: 64,
+        max_open_readers: 32,
+        poll_compaction_ms: 50,
+        durability: Default::default(),
+        fsync_interval_ms: 100,
+        shipping: Default::default(),
+        metrics: Default::default(),
+        replica: Default::default(),
+        security: SecurityConfig {
+            require_auth: RequireAuth::True,
+            keys_file,
+            ..Default::default()
+        },
+        tls: Default::default(),
+        listen_unix: None,
+        runtime: Default::default(),
+    };
+
+    let server = zydecodb::server::Server::new();
+    let shutdown = server.shutdown_flag();
+    let handle = thread::spawn(move || server.run(config).unwrap());
+
+    let mut stream = wait_connect(addr);
+    session_init(&mut stream, &secret);
+
+    // KV-style prefix "events:" allows collection "events".
+    let idx = zydecodb_document::wire::IndexDefPayload {
+        collection: "events".into(),
+        index_name: "by_n".into(),
+        fields: vec!["n".into()],
+        unique: false,
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::IndexDef, idx.encode()),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+
+    let allowed = zydecodb_document::wire::DocPutPayload {
+        collection: "events".into(),
+        doc_id: b"1".to_vec(),
+        body: br#"{"n":1}"#.to_vec(),
+        relaxed: false,
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::DocPut, allowed.encode()),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+
+    let denied = zydecodb_document::wire::DocPutPayload {
+        collection: "users".into(),
+        doc_id: b"1".to_vec(),
+        body: br#"{"n":1}"#.to_vec(),
+        relaxed: false,
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::DocPut, denied.encode()),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Forbidden);
+
+    drop(stream);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
 fn wait_connect(addr: std::net::SocketAddr) -> TcpStream {
     for _ in 0..50 {
         if let Ok(s) = TcpStream::connect(addr) {

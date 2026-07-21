@@ -174,6 +174,9 @@ pub struct Engine {
     /// How sealed segments reach `ship_dir`: hardlink (default, atomic, free) or
     /// copy (required across filesystems).
     ship_mode: crate::shipping::ShipMode,
+    /// Optional HMAC key authenticating each `shipped.log` entry so a writable
+    /// ship directory cannot forge segments plus matching manifest lines.
+    ship_hmac_key: Option<Vec<u8>>,
     manifest_file: Arc<Mutex<File>>,
     metrics: Option<Arc<crate::metrics::Metrics>>,
     /// Shared block cache for all SSTable readers. Constructed at engine
@@ -444,6 +447,7 @@ impl Engine {
             group_commit: true,
             ship_dir: None,
             ship_mode: crate::shipping::ShipMode::Hardlink,
+            ship_hmac_key: None,
             manifest_file,
             metrics: None,
             block_cache,
@@ -514,6 +518,13 @@ impl Engine {
     ) -> Self {
         self.ship_dir = ship_dir;
         self.ship_mode = ship_mode;
+        self
+    }
+
+    /// Set the HMAC key that authenticates each `shipped.log` entry. `None`
+    /// keeps the legacy unauthenticated 3-field format (dev only).
+    pub fn with_shipping_hmac_key(mut self, key: Option<Vec<u8>>) -> Self {
+        self.ship_hmac_key = key;
         self
     }
 
@@ -689,6 +700,7 @@ impl Engine {
             segment_id,
             self.wal_sync.synced_seq(),
             self.ship_mode,
+            self.ship_hmac_key.as_deref(),
         ) {
             tracing::error!(error = %e, segment = segment_id, "WAL shipping failed");
         } else {
@@ -2438,7 +2450,6 @@ impl Engine {
     /// size threshold. Mirrors the roll path in `append_wal_buffered` so the
     /// `sealed_segment_max_seq` cache and ship-out semantics get exercised
     /// without needing to actually write `WAL_SEGMENT_SIZE` bytes.
-    #[cfg(test)]
     pub fn force_roll_wal_for_test(&mut self) -> EngineResult<()> {
         if self.active_wal_size == 0 {
             return Ok(()); // mirror should_roll: empty segments don't roll
@@ -2452,7 +2463,6 @@ impl Engine {
         self.open_new_wal_segment()
     }
 
-    #[cfg(test)]
     pub fn sealed_segment_max_seq_snapshot(&self) -> Vec<(u64, u64)> {
         self.sealed_segment_max_seq
             .iter()

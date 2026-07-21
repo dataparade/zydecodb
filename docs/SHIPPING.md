@@ -55,12 +55,21 @@ Pass `None` for `ship_dir` to disable shipping.
 Append-only, one line per shipped segment, written into `wal_ship_dir`:
 
 ```text
-<segment_id> <seal_seq> <sha256_hex>
+<segment_id> <seal_seq> <sha256_hex> <hmac_hex>
 ```
 
 - `segment_id` — the WAL segment number (matches `wal-XXXXXXXX.log`).
 - `seal_seq` — the highest durable sequence number at seal time.
 - `sha256_hex` — SHA-256 of the shipped file, for end-to-end integrity checks.
+- `hmac_hex` — HMAC-SHA256(key, `<segment_id> <seal_seq> <sha256_hex>`), keyed
+  by `[shipping] hmac_key_file`. This authenticates the manifest entry: an
+  attacker who can write the ship directory cannot forge a segment *and* a
+  matching log line without the key.
+
+The server **requires** `hmac_key_file` whenever `ship_dir` is set. Generate a
+key with `head -c 32 /dev/urandom > ship.hmac && chmod 600 ship.hmac` and share
+it with the replica. Legacy 3-field lines (pre-HMAC) are only accepted by a
+consumer with no key configured.
 
 The sidecar should transport files in `segment_id` order and may use the hash to
 verify each upload.

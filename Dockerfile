@@ -24,16 +24,19 @@ WORKDIR /usr/local/bin
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1000 zydeco \
+    && useradd --system --uid 1000 --gid zydeco --home-dir /var/lib/zydecodb --shell /usr/sbin/nologin zydeco \
+    && mkdir -p /var/lib/zydecodb/data /var/lib/zydecodb/wal /etc/zydecodb \
+    && chown -R zydeco:zydeco /var/lib/zydecodb /etc/zydecodb
 
 # Copy the compiled binary from the builder stage
 COPY --from=builder /usr/src/zydecodb/target/release/zydecodb /usr/local/bin/zydecodb
 
-# Create directories for data, wal, and configuration
-RUN mkdir -p /var/lib/zydecodb/data /var/lib/zydecodb/wal /etc/zydecodb
+# Expose database port only (metrics bind loopback inside the container)
+EXPOSE 9470
 
-# Expose database port and metrics port
-EXPOSE 9470 9471
+USER zydeco
 
 # Set the entrypoint to run the server
 ENTRYPOINT ["zydecodb"]

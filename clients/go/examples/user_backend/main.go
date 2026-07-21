@@ -2,25 +2,31 @@
 // the client driving a real request/response cycle: one shared, pooled Client
 // handles concurrent HTTP requests.
 //
+// Passwords are hashed with PBKDF2-HMAC-SHA256 (200k iterations), matching the
+// Python example. Login requires email + password.
+//
 // Run against a local server (default 127.0.0.1:9470):
 //
 //	go run ./examples/user_backend
 //
 // Then:
 //
-//	curl -s localhost:8080/users -d '{"name":"Ada","email":"ada@x.io","age":30}'
-//	curl -s 'localhost:8080/users?min_age=18'
-//	curl -s localhost:8080/users/<id>
-//	curl -s -X PATCH localhost:8080/users/<id> -d '{"age":31}'
-//	curl -s -X DELETE localhost:8080/users/<id>
+//	curl -s localhost:8080/users -d '{"name":"Ada","email":"ada@x.io","password":"secret123","age":30}'
+//	curl -s localhost:8080/login -d '{"email":"ada@x.io","password":"secret123"}'
+//	curl -s localhost:8080/me -H "Authorization: Bearer <token>"
 package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"hash"
 	"log"
 	"net/http"
 	"os"
@@ -31,7 +37,13 @@ import (
 	zydecodb "github.com/dataparade/zydecodb/clients/go"
 )
 
-const collection = "app_users"
+const (
+	collection      = "app_users"
+	pbkdf2Iters     = 200_000
+	pbkdf2KeyLen    = 32
+	minPasswordLen  = 8
+	sessionTTLHours = 24
+)
 
 type server struct {
 	db   *zydecodb.Client
@@ -93,7 +105,7 @@ func (s *server) handleUserByID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		s.getUser(w, r, id)
 	case http.MethodPatch:
-		s.patchUser(w, r, id)
+		s.patchUserByID(w, r, id)
 	case http.MethodDelete:
 		s.deleteUser(w, r, id)
 	default:
@@ -107,10 +119,25 @@ func (s *server) createUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, ok := doc["email"].(string); !ok {
+	email, _ := doc["email"].(string)
+	password, _ := doc["password"].(string)
+	if email == "" {
 		http.Error(w, "email is required", http.StatusBadRequest)
 		return
 	}
+	if len(password) < minPasswordLen {
+		http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
+		return
+	}
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		serverError(w, err)
+		return
+	}
+	doc["password_salt"] = hex.EncodeToString(salt)
+	doc["password_hash"] = hashPassword(password, salt)
+	delete(doc, "password")
+
 	id, err := s.coll.InsertOne(r.Context(), doc, false)
 	if err != nil {
 		if zydecodb.IsConflict(err) {
@@ -144,6 +171,9 @@ func (s *server) listUsers(w http.ResponseWriter, r *http.Request) {
 	if users == nil {
 		users = []zydecodb.Document{}
 	}
+	for i := range users {
+		users[i] = publicUser(users[i])
+	}
 	writeJSON(w, http.StatusOK, users)
 }
 
@@ -157,16 +187,32 @@ func (s *server) getUser(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, doc)
+	writeJSON(w, http.StatusOK, publicUser(doc))
 }
 
-func (s *server) patchUser(w http.ResponseWriter, r *http.Request, id string) {
+func (s *server) patchUserByID(w http.ResponseWriter, r *http.Request, id string) {
 	var fields zydecodb.Document
 	if err := decodeJSON(r, &fields); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	delete(fields, "_id")
+	delete(fields, "password_hash")
+	delete(fields, "password_salt")
+	if pwd, ok := fields["password"].(string); ok {
+		if len(pwd) < minPasswordLen {
+			http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
+			return
+		}
+		salt := make([]byte, 16)
+		if _, err := rand.Read(salt); err != nil {
+			serverError(w, err)
+			return
+		}
+		fields["password_salt"] = hex.EncodeToString(salt)
+		fields["password_hash"] = hashPassword(pwd, salt)
+		delete(fields, "password")
+	}
 	if len(fields) == 0 {
 		http.Error(w, "no fields to update", http.StatusBadRequest)
 		return
@@ -207,7 +253,8 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var creds struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	if err := decodeJSON(r, &creds); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -218,17 +265,17 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	if len(docs) == 0 {
-		http.Error(w, "invalid email", http.StatusUnauthorized)
+	if len(docs) == 0 || !verifyPassword(creds.Password, docs[0]) {
+		http.Error(w, "invalid email or password", http.StatusUnauthorized)
 		return
 	}
 	id, _ := docs[0]["_id"].(string)
 
 	var b [32]byte
-	rand.Read(b[:])
+	_, _ = rand.Read(b[:])
 	token := hex.EncodeToString(b[:])
-	
-	expiresAt := uint64(time.Now().Add(24 * time.Hour).UnixMilli())
+
+	expiresAt := uint64(time.Now().Add(sessionTTLHours * time.Hour).UnixMilli())
 	_, err = s.db.Put(r.Context(), []byte("session:"+token), []byte(id), expiresAt)
 	if err != nil {
 		serverError(w, err)
@@ -248,7 +295,7 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := strings.TrimPrefix(auth, "Bearer ")
-	
+
 	idBytes, err := s.db.Get(r.Context(), []byte("session:"+token))
 	if err != nil {
 		serverError(w, err)
@@ -258,7 +305,7 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
 		return
 	}
-	
+
 	doc, err := s.coll.Get(r.Context(), string(idBytes))
 	if err != nil {
 		serverError(w, err)
@@ -268,7 +315,68 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, doc)
+	writeJSON(w, http.StatusOK, publicUser(doc))
+}
+
+func publicUser(doc zydecodb.Document) zydecodb.Document {
+	out := zydecodb.Document{}
+	for k, v := range doc {
+		if k == "password" || k == "password_hash" || k == "password_salt" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func hashPassword(password string, salt []byte) string {
+	return hex.EncodeToString(pbkdf2Key([]byte(password), salt, pbkdf2Iters, pbkdf2KeyLen, sha256.New))
+}
+
+func verifyPassword(password string, doc zydecodb.Document) bool {
+	hashHex, _ := doc["password_hash"].(string)
+	saltHex, _ := doc["password_salt"].(string)
+	if hashHex == "" || saltHex == "" {
+		return false
+	}
+	salt, err := hex.DecodeString(saltHex)
+	if err != nil {
+		return false
+	}
+	expected, err := hex.DecodeString(hashHex)
+	if err != nil {
+		return false
+	}
+	got := pbkdf2Key([]byte(password), salt, pbkdf2Iters, len(expected), sha256.New)
+	return subtle.ConstantTimeCompare(got, expected) == 1
+}
+
+// pbkdf2Key is a minimal PBKDF2 (RFC 8018) using the given hash constructor.
+func pbkdf2Key(password, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
+	prf := hmac.New(h, password)
+	hashLen := prf.Size()
+	numBlocks := (keyLen + hashLen - 1) / hashLen
+	var out []byte
+	var block [4]byte
+	for i := 1; i <= numBlocks; i++ {
+		binary.BigEndian.PutUint32(block[:], uint32(i))
+		prf.Reset()
+		prf.Write(salt)
+		prf.Write(block[:])
+		u := prf.Sum(nil)
+		t := make([]byte, len(u))
+		copy(t, u)
+		for j := 1; j < iter; j++ {
+			prf.Reset()
+			prf.Write(u)
+			u = prf.Sum(nil)
+			for k := range t {
+				t[k] ^= u[k]
+			}
+		}
+		out = append(out, t...)
+	}
+	return out[:keyLen]
 }
 
 func decodeJSON(r *http.Request, v any) error {

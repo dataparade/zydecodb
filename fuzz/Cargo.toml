@@ -9,32 +9,19 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-zydecodb-engine = { path = "../crates/zydecodb-engine" }
 tempfile = "3"
+zydecodb = { path = "../crates/zydecodb" }
+zydecodb-engine = { path = "../crates/zydecodb-engine" }
+zydecodb-document = { path = "../crates/zydecodb-document" }
 
 [[bin]]
-name = "wal_parser"
-path = "fuzz_targets/wal_parser.rs"
+name = "decode_envelope"
+path = "fuzz_targets/decode_envelope.rs"
 test = false
 doc = false
 
 [[bin]]
-name = "ipc_envelope"
-path = "fuzz_targets/ipc_envelope.rs"
+name = "fuzz_dispatch"
+path = "fuzz_targets/fuzz_dispatch.rs"
 test = false
 doc = false
-
-[[bin]]
-name = "sstable_reader"
-path = "fuzz_targets/sstable_reader.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "manifest_parser"
-path = "fuzz_targets/manifest_parser.rs"
-test = false
-doc = false
-
-[workspace]
-members = ["."]

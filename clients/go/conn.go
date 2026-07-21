@@ -2,6 +2,7 @@ package zydecodb
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -18,7 +19,7 @@ type conn struct {
 	lastUsed time.Time
 }
 
-func dial(ctx context.Context, addr string, timeout time.Duration, apiKey string) (*conn, error) {
+func dial(ctx context.Context, addr string, timeout time.Duration, apiKey string, tlsConf *tls.Config) (*conn, error) {
 	d := net.Dialer{Timeout: timeout}
 	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -27,6 +28,30 @@ func dial(ctx context.Context, addr string, timeout time.Duration, apiKey string
 	// Disable Nagle: requests are small and latency-sensitive.
 	if tcp, ok := nc.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
+	}
+	if tlsConf != nil {
+		cfg := tlsConf.Clone()
+		if cfg.ServerName == "" {
+			// SNI defaults to the dial host so wildcard certs verify without
+			// the caller repeating the hostname.
+			if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
+				cfg.ServerName = host
+			} else {
+				cfg.ServerName = addr
+			}
+		}
+		tc := tls.Client(nc, cfg)
+		hsCtx := ctx
+		if _, ok := ctx.Deadline(); !ok && timeout > 0 {
+			var cancel context.CancelFunc
+			hsCtx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		if err := tc.HandshakeContext(hsCtx); err != nil {
+			_ = nc.Close()
+			return nil, &ConnError{Err: fmt.Errorf("tls handshake with %s failed: %w", addr, err)}
+		}
+		nc = tc
 	}
 	c := &conn{nc: nc, timeout: timeout, lastUsed: time.Now()}
 	if apiKey != "" {

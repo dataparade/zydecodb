@@ -22,10 +22,11 @@ use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use zydecodb_engine::SnapshotHandle;
 
-/// Upper bound on documents buffered for an in-memory sort (collection scan or
-/// descending/non-index-ordered sort). Beyond this the query is rejected so a
-/// single request cannot exhaust server memory; add an index or a tighter
-/// filter to stay under it.
+/// Default upper bound on documents buffered for an in-memory sort (collection
+/// scan or descending/non-index-ordered sort). Beyond this the query is
+/// rejected so a single request cannot exhaust server memory; add an index or
+/// a tighter filter to stay under it. The server passes its configured
+/// `[security] max_sort_buffer` instead of this constant.
 pub const MAX_SORT_BUFFER: usize = 100_000;
 
 /// A resolved index-range scan, built under lock (catalog + key math), then
@@ -324,6 +325,7 @@ pub fn execute_find(
     prefix: &[u8],
     collection: &str,
     spec: &FindSpec,
+    max_sort_buffer: usize,
 ) -> DocResult<QueryPage> {
     let coll = catalog
         .collection(prefix, collection)
@@ -360,7 +362,7 @@ pub fn execute_find(
         {
             key_mode_page(snap, spec, &doc_prefix, lo, hi, limit)
         }
-        _ => offset_mode_page(snap, spec, &path, &doc_prefix, limit),
+        _ => offset_mode_page(snap, spec, &path, &doc_prefix, limit, max_sort_buffer),
     }
 }
 
@@ -421,6 +423,7 @@ fn offset_mode_page(
     path: &AccessPath,
     doc_prefix: &[u8],
     limit: usize,
+    max_sort_buffer: usize,
 ) -> DocResult<QueryPage> {
     let offset = match spec.cursor.as_deref() {
         Some(c) => match decode_cursor(c)? {
@@ -433,7 +436,7 @@ fn offset_mode_page(
     if spec.sort.is_empty() {
         stream_offset_page(snap, spec, path, doc_prefix, offset, limit)
     } else {
-        buffered_sort_page(snap, spec, path, doc_prefix, offset, limit)
+        buffered_sort_page(snap, spec, path, doc_prefix, offset, limit, max_sort_buffer)
     }
 }
 
@@ -686,6 +689,7 @@ fn buffered_sort_page(
     doc_prefix: &[u8],
     offset: usize,
     limit: usize,
+    max_sort_buffer: usize,
 ) -> DocResult<QueryPage> {
     let prefix_len = doc_prefix.len().saturating_sub(1 + 4);
     let mut all: Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
@@ -698,7 +702,7 @@ fn buffered_sort_page(
         doc_prefix,
         prefix_len,
         |doc_id, stored| {
-            if all.len() >= MAX_SORT_BUFFER {
+            if all.len() >= max_sort_buffer {
                 overflow = true;
                 return Ok(false);
             }
@@ -710,7 +714,7 @@ fn buffered_sort_page(
 
     if overflow {
         return Err(DocError::BadFilter(format!(
-            "sorted result exceeds {MAX_SORT_BUFFER} documents; add an index or a tighter filter"
+            "sorted result exceeds {max_sort_buffer} documents; add an index or a tighter filter"
         )));
     }
 

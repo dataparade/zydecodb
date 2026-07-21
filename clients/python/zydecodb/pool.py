@@ -12,7 +12,7 @@ import threading
 import time
 from typing import List, Optional
 
-from ._connection import Connection
+from ._connection import Connection, TlsOption
 from .errors import ConfigError
 from .errors import ConnectionError as ZConnectionError
 
@@ -28,6 +28,7 @@ class ConnectionPool:
         max_size: int = 8,
         acquire_timeout: float = 10.0,
         keepalive_idle: float = 30.0,
+        tls: Optional[TlsOption] = None,
     ):
         if max_size < 1:
             raise ConfigError("max_size must be >= 1")
@@ -38,6 +39,7 @@ class ConnectionPool:
         self._max_size = max_size
         self._acquire_timeout = acquire_timeout
         self._keepalive_idle = keepalive_idle
+        self._tls = tls
 
         self._lock = threading.Condition()
         self._idle: List[Connection] = []
@@ -46,7 +48,11 @@ class ConnectionPool:
 
     def _new_connection(self) -> Connection:
         conn = Connection(
-            self._host, self._port, timeout=self._timeout, api_key=self._api_key
+            self._host,
+            self._port,
+            timeout=self._timeout,
+            api_key=self._api_key,
+            tls=self._tls,
         )
         conn.connect()
         return conn

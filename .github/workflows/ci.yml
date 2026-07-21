@@ -179,7 +179,7 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Fuzz smoke (1000 runs each)
         run: |
-          for t in wal_parser sstable_reader manifest_parser ipc_envelope; do
+          for t in decode_envelope fuzz_dispatch; do
             cargo fuzz run "$t" -- -runs=1000 -max_total_time=60
           done
         working-directory: fuzz

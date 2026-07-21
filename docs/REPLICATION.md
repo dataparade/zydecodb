@@ -17,16 +17,20 @@ the data path simple and auditable.
    `shipped.log`:
 
    ```text
-   <segment_id> <seal_seq> <sha256_hex>
+   <segment_id> <seal_seq> <sha256_hex> <hmac_hex>
    ```
+
+   The HMAC field is keyed by `[shipping].hmac_key_file` (required) and
+   authenticates the manifest entry end to end.
 
 2. **Sidecar** (yours) transports `ship_dir` to the replica host's
    `[replica].from` directory. Order does not matter; the replica enforces it.
 
 3. **Replica** (`--replica-from <dir>`) polls `from`, and for each segment in
    `shipped.log` not yet applied:
-   - verifies the file's SHA-256 matches the recorded digest (a partial or
-     corrupt transfer is refused and retried on the next poll),
+   - verifies the file's SHA-256 matches the recorded digest **and** the
+     entry's HMAC under the shared key (a partial, corrupt, or forged transfer
+     is refused),
    - installs it into its own WAL directory atomically,
    - reopens the engine to replay the new segment (flushing already-applied data
      to SSTables first, so each catch-up replays only the new bytes).
@@ -42,6 +46,8 @@ the data path simple and auditable.
 [shipping]
 ship_dir = "/var/lib/zydecodb/ship"
 mode = "hardlink"   # same filesystem; use "copy" across filesystems
+# Required: authenticates every shipped.log entry (share with the replica).
+hmac_key_file = "/etc/zydecodb/ship.hmac"
 ```
 
 Point your sidecar at `ship_dir`. Ship the whole directory, including
@@ -65,6 +71,8 @@ or in the config file:
 [replica]
 from = "/var/lib/zydecodb/replica_from"
 poll_ms = 1000
+# Required: must match the primary's [shipping] hmac_key_file.
+hmac_key_file = "/etc/zydecodb/ship.hmac"
 ```
 
 ## Liveness: the heartbeat

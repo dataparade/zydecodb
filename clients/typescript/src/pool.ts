@@ -1,4 +1,4 @@
-import { Connection } from "./connection.ts";
+import { Connection, type TlsOption } from "./connection.ts";
 import { ConnectionError } from "./errors.ts";
 
 export interface PoolOptions {
@@ -9,6 +9,8 @@ export interface PoolOptions {
   maxSize: number;
   acquireTimeoutMs?: number;
   keepaliveIdleMs?: number;
+  /** When set, wrap every connection in TLS before the protocol handshake. */
+  tls?: TlsOption | null;
 }
 
 /**
@@ -34,7 +36,13 @@ export class ConnectionPool {
   }
 
   private newConnection(): Connection {
-    return new Connection(this.opts.host, this.opts.port, this.opts.timeoutMs, this.opts.apiKey);
+    return new Connection(
+      this.opts.host,
+      this.opts.port,
+      this.opts.timeoutMs,
+      this.opts.apiKey,
+      this.opts.tls ?? null,
+    );
   }
 
   async acquire(): Promise<Connection> {

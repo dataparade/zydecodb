@@ -23,6 +23,9 @@ pub struct SecurityRuntime {
     /// Per-tenant byte caps + rate ceilings, shared with the byte-cap write
     /// policy and reloadable on SIGHUP.
     pub tenant_limits: Arc<TenantLimits>,
+    /// Max documents buffered per query for in-memory sorts / multi-write
+    /// candidate sets (see `[security] max_sort_buffer`).
+    pub max_sort_buffer: usize,
     active_connections: Arc<AtomicUsize>,
 }
 
@@ -42,6 +45,7 @@ impl SecurityRuntime {
             read_only: config.replica.from.is_some(),
             auth_burst: Arc::new(AuthBurstLimiter::new(config.security.auth_burst_limit)),
             tenant_limits,
+            max_sort_buffer: config.security.max_sort_buffer,
             active_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -75,6 +79,7 @@ impl Default for SecurityRuntime {
             read_only: false,
             auth_burst: Arc::new(AuthBurstLimiter::new(10)),
             tenant_limits: Arc::new(TenantLimits::default()),
+            max_sort_buffer: 10_000,
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }

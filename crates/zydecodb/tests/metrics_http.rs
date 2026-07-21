@@ -53,6 +53,8 @@ fn metrics_health_and_readiness_endpoints() {
         metrics: zydecodb::config::MetricsConfig {
             listen: Some(metrics_addr),
             per_tenant: false,
+            allow_remote: false,
+            token: None,
         },
         replica: Default::default(),
         security: zydecodb::config::SecurityConfig {

@@ -3,6 +3,7 @@ package zydecodb
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -34,6 +35,7 @@ type config struct {
 	maxRetries  int
 	backoffBase time.Duration
 	backoffCap  time.Duration
+	tlsConf     *tls.Config
 }
 
 // WithAPIKey authenticates each connection with a SessionInit handshake.
@@ -48,6 +50,20 @@ func WithPoolSize(n int) Option { return func(c *config) { c.poolSize = n } }
 // WithMaxRetries sets how many times idempotent operations are retried on
 // transient failures (default 2).
 func WithMaxRetries(n int) Option { return func(c *config) { c.maxRetries = n } }
+
+// WithTLS wraps every connection in TLS before the protocol handshake. A nil
+// cfg uses sane defaults (system roots). If cfg.ServerName is empty, the SNI
+// name is inferred from the dial address, so
+// WithTLS(nil) is all a caller needs for a public
+// {tenant}.{node}.zydeco.dev endpoint.
+func WithTLS(cfg *tls.Config) Option {
+	return func(c *config) {
+		if cfg == nil {
+			cfg = &tls.Config{}
+		}
+		c.tlsConf = cfg
+	}
+}
 
 // NewClient connects to a ZydecoDB server at addr (e.g. "127.0.0.1:9470").
 func NewClient(addr string, opts ...Option) *Client {
@@ -65,7 +81,7 @@ func NewClient(addr string, opts ...Option) *Client {
 		cfg.maxRetries = 0
 	}
 	return &Client{
-		pool:        newPool(addr, cfg.apiKey, cfg.timeout, cfg.poolSize),
+		pool:        newPool(addr, cfg.apiKey, cfg.timeout, cfg.poolSize, cfg.tlsConf),
 		maxRetries:  cfg.maxRetries,
 		backoffBase: cfg.backoffBase,
 		backoffCap:  cfg.backoffCap,
@@ -82,8 +98,8 @@ func (c *Client) backoff(attempt int) time.Duration {
 
 // execOptions tunes a single request execution.
 type execOptions struct {
-	retryable    bool
-	notFoundNil  bool // map StatusNotFound to (nil, nil)
+	retryable   bool
+	notFoundNil bool // map StatusNotFound to (nil, nil)
 }
 
 // execute runs one request with pooling and the retry policy. On StatusOK it

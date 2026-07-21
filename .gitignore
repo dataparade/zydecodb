@@ -5,6 +5,7 @@ experiments/**/*.js
 
 # Compiled binaries
 experiments/write_heavy/write_heavy
+clients/go/user_backend
 
 # Rust
 /target

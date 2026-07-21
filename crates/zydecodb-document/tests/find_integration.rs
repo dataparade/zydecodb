@@ -81,7 +81,7 @@ fn names(page: &query::QueryPage) -> Vec<String> {
 
 fn run(e: &Engine, cat: &Catalog, s: &FindSpec) -> query::QueryPage {
     let snap = e.snapshot_owned();
-    query::execute_find(&snap, cat, PREFIX, "people", s).unwrap()
+    query::execute_find(&snap, cat, PREFIX, "people", s, query::MAX_SORT_BUFFER).unwrap()
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn run_rr(e: &Engine, cat: &Catalog, s: &FindSpec) -> query::QueryPage {
         Some(seq) => e.snapshot_at(seq),
         None => e.snapshot_owned(),
     };
-    query::execute_find(&snap, cat, PREFIX, "people", s).unwrap()
+    query::execute_find(&snap, cat, PREFIX, "people", s, query::MAX_SORT_BUFFER).unwrap()
 }
 
 #[test]

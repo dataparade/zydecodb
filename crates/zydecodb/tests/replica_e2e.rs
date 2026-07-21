@@ -109,6 +109,10 @@ fn replica_ingests_shipped_wal_and_is_read_only() {
     let tmp = TempDir::new().unwrap();
     let ship_dir = tmp.path().join("ship");
 
+    // Shared shipping HMAC key (required whenever shipping/replication is on).
+    let hmac_key = tmp.path().join("ship.hmac");
+    std::fs::write(&hmac_key, b"e2e-shipping-hmac-key").unwrap();
+
     // --- Primary: ship WAL into ship_dir. ---
     let primary_addr = free_addr();
     let mut primary_cfg = base_config(&tmp, "primary", primary_addr);
@@ -116,6 +120,7 @@ fn replica_ingests_shipped_wal_and_is_read_only() {
         ship_dir: Some(ship_dir.clone()),
         mode: "copy".into(),
         heartbeat_ms: 200,
+        hmac_key_file: Some(hmac_key.clone()),
     };
     let primary = zydecodb::server::Server::new();
     let primary_shutdown = primary.shutdown_flag();
@@ -141,6 +146,7 @@ fn replica_ingests_shipped_wal_and_is_read_only() {
     replica_cfg.replica = ReplicaConfig {
         from: Some(ship_dir.clone()),
         poll_ms: 100,
+        hmac_key_file: Some(hmac_key.clone()),
     };
     let replica = zydecodb::server::Server::new();
     let replica_shutdown = replica.shutdown_flag();
@@ -188,11 +194,14 @@ fn promotion_bumps_epoch_and_fences_old_primary() {
     // The OLD primary (epoch 1, no EPOCH file) tries to restart against the same
     // stream. serve must refuse before binding a socket to avoid split-brain.
     let old_addr = free_addr();
+    let hmac_key = tmp.path().join("ship.hmac");
+    std::fs::write(&hmac_key, b"e2e-shipping-hmac-key").unwrap();
     let mut old_cfg = base_config(&tmp, "old_primary", old_addr);
     old_cfg.shipping = ShippingConfig {
         ship_dir: Some(ship.clone()),
         mode: "copy".into(),
         heartbeat_ms: 0,
+        hmac_key_file: Some(hmac_key),
     };
     let server = zydecodb::server::Server::new();
     let err = server

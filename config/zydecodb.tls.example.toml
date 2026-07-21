@@ -1,0 +1,48 @@
+# Networked deployment with TLS. Copy, adjust paths, then:
+#   zydecodb serve --config zydecodb.tls.example.toml
+#
+# Prerequisites:
+#   1. A keys file:  zydecodb admin keys create --id backend --role read_write \
+#                      --keys-file /etc/zydecodb/keys.toml
+#   2. A cert/key pair for the server's hostname (from your CA / cert-manager /
+#      an internal PKI). Self-signed works for testing; clients must trust it.
+#
+# Never set ZYDECODB_BOOTSTRAP_KEY on a networked server — the server refuses
+# to start when it is set and listen is not loopback.
+
+listen = "0.0.0.0:9470"
+data_dir = "/var/lib/zydecodb/data"
+wal_dir = "/var/lib/zydecodb/wal"
+block_cache_mb = 256
+max_open_readers = 128
+poll_compaction_ms = 50
+durability = "sync"
+
+# Operability endpoint stays on loopback; scrape from a local agent. To expose
+# it remotely you must opt in AND set a bearer token:
+#   allow_remote = true
+#   token = "long-random-string"
+[metrics]
+listen = "127.0.0.1:9471"
+
+[security]
+require_auth = true
+keys_file = "/etc/zydecodb/keys.toml"
+allow_unauthenticated_ping = true
+# New deployments should use the tenant-prefixed layout.
+legacy_single_tenant = false
+max_connections = 256
+rate_limit_rps = 1000
+auth_burst_limit = 10
+idle_timeout_secs = 300
+# Bound on per-query in-memory sort / multi-write candidate buffering.
+max_sort_buffer = 10000
+
+[security.audit]
+enabled = true
+log_client_key = false
+
+[tls]
+enabled = true
+cert = "/etc/zydecodb/tls.crt"
+key = "/etc/zydecodb/tls.key"

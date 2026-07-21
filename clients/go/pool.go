@@ -2,6 +2,7 @@ package zydecodb
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ type pool struct {
 	apiKey        string
 	timeout       time.Duration
 	keepaliveIdle time.Duration
+	tlsConf       *tls.Config
 
 	sem  chan struct{} // capacity = maxSize; one token per live connection
 	free chan *conn    // capacity = maxSize; idle connections
@@ -27,7 +29,7 @@ type pool struct {
 	closed bool
 }
 
-func newPool(addr, apiKey string, timeout time.Duration, maxSize int) *pool {
+func newPool(addr, apiKey string, timeout time.Duration, maxSize int, tlsConf *tls.Config) *pool {
 	if maxSize < 1 {
 		maxSize = 1
 	}
@@ -36,6 +38,7 @@ func newPool(addr, apiKey string, timeout time.Duration, maxSize int) *pool {
 		apiKey:        apiKey,
 		timeout:       timeout,
 		keepaliveIdle: 30 * time.Second,
+		tlsConf:       tlsConf,
 		sem:           make(chan struct{}, maxSize),
 		free:          make(chan *conn, maxSize),
 	}
@@ -68,7 +71,7 @@ func (p *pool) acquire(ctx context.Context) (*conn, error) {
 		// Either take a slot to create a new connection or wait for a freed one.
 		select {
 		case p.sem <- struct{}{}:
-			c, err := dial(ctx, p.addr, p.timeout, p.apiKey)
+			c, err := dial(ctx, p.addr, p.timeout, p.apiKey, p.tlsConf)
 			if err != nil {
 				<-p.sem
 				return nil, err

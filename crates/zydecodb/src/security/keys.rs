@@ -4,6 +4,8 @@ use argon2::{
 };
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -35,6 +37,13 @@ pub enum KeyRole {
 pub struct KeyRecord {
     pub id: String,
     pub secret_hash: String,
+    /// SHA-256 (hex) of the full secret, used as an O(1) index into the
+    /// keystore so auth performs exactly one argon2 verify. The argon2
+    /// `secret_hash` remains the actual credential check; this field only
+    /// selects which record to verify against. Absent on keys minted before
+    /// this field existed (those fall back to a linear scan — reissue them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_lookup: Option<String>,
     #[serde(default)]
     pub role: KeyRole,
     #[serde(default = "default_tenant_hex")]
@@ -73,14 +82,20 @@ pub struct KeyStore {
     records: Vec<KeyRecord>,
     tenants: Vec<TenantRecord>,
     bootstrap_secret: Option<String>,
+    /// sha256(secret) hex -> index into `records`, for O(1) auth lookup.
+    lookup: HashMap<String, usize>,
 }
 
 impl KeyStore {
     pub fn load(path: &Path) -> Result<Self, KeyError> {
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("keystore_load_io_error", |_| Err(KeyError::Io("simulated I/O error".into())));
+
         let bootstrap_secret = std::env::var("ZYDECODB_BOOTSTRAP_KEY").ok();
         if bootstrap_secret.is_some() {
             tracing::warn!(
-                "ZYDECODB_BOOTSTRAP_KEY is set — dev-only bootstrap auth enabled; do not use in production"
+                "ZYDECODB_BOOTSTRAP_KEY is set — loopback/dev-only bootstrap auth; \
+                 server refuses to start when listen is not loopback"
             );
         }
 
@@ -93,12 +108,46 @@ impl KeyStore {
             (Vec::new(), Vec::new())
         };
 
+        let mut lookup = HashMap::with_capacity(records.len());
+        let mut legacy_count = 0usize;
+        for (i, record) in records.iter().enumerate() {
+            match &record.secret_lookup {
+                Some(l) => {
+                    lookup.insert(l.to_ascii_lowercase(), i);
+                }
+                None => legacy_count += 1,
+            }
+        }
+        if legacy_count > 0 {
+            tracing::warn!(
+                count = legacy_count,
+                "keys without secret_lookup use a slow linear auth scan — \
+                 reissue them with `admin keys create` to get O(1) lookup"
+            );
+        }
+
         Ok(KeyStore {
             path: path.to_path_buf(),
             records,
             tenants,
             bootstrap_secret,
+            lookup,
         })
+    }
+
+    /// Number of key records loaded (excludes the env bootstrap key).
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether a dev-only bootstrap secret is configured via env.
+    pub fn has_bootstrap(&self) -> bool {
+        self.bootstrap_secret.is_some()
+    }
+
+    /// All key records (read-only view, for startup policy checks).
+    pub fn records(&self) -> &[KeyRecord] {
+        &self.records
     }
 
     /// The configured per-tenant limit records (for building [`TenantLimits`]).
@@ -148,6 +197,7 @@ impl KeyStore {
                 return Some(KeyRecord {
                     id: "bootstrap".to_string(),
                     secret_hash: String::new(),
+                    secret_lookup: None,
                     role: KeyRole::Admin,
                     tenant: default_tenant_hex(),
                     allowed_prefixes: vec![],
@@ -156,16 +206,50 @@ impl KeyStore {
         }
 
         let secret_str = std::str::from_utf8(secret).ok()?;
-        for record in &self.records {
-            let parsed = PasswordHash::new(&record.secret_hash).ok()?;
-            if Argon2::default()
-                .verify_password(secret_str.as_bytes(), &parsed)
-                .is_ok()
-            {
+
+        // Fast path: O(1) index by sha256(secret), then exactly one argon2
+        // verify. The argon2 hash remains the credential; the index only
+        // selects the candidate record.
+        if let Some(&idx) = self.lookup.get(&secret_lookup_hex(secret_str)) {
+            let record = &self.records[idx];
+            if argon2_matches(secret_str, &record.secret_hash) {
+                return Some(record.clone());
+            }
+            return None;
+        }
+
+        // Fallback for keys minted before secret_lookup existed: linear scan
+        // over only those legacy records.
+        for record in self.records.iter().filter(|r| r.secret_lookup.is_none()) {
+            if argon2_matches(secret_str, &record.secret_hash) {
                 return Some(record.clone());
             }
         }
         None
+    }
+
+    /// Checks if a previously authenticated session is still valid against the
+    /// current keystore (e.g. after a SIGHUP reload).
+    pub fn is_session_valid(&self, session: &crate::security::SessionState) -> bool {
+        if !session.authenticated {
+            return false;
+        }
+        
+        let Some(key_id) = &session.key_id else {
+            return false;
+        };
+        
+        if key_id == "bootstrap" {
+            return self.bootstrap_secret.is_some();
+        }
+        
+        let Some(secret_hash) = &session.secret_hash else {
+            return false;
+        };
+        
+        // Find the key by ID and ensure the secret hash matches exactly.
+        // If the hash changed, the key was revoked and recreated with the same ID.
+        self.records.iter().any(|r| r.id == *key_id && r.secret_hash == *secret_hash)
     }
 
     pub fn list_ids(&self) -> Vec<String> {
@@ -191,6 +275,7 @@ impl KeyStore {
         store.records.push(KeyRecord {
             id: id.to_string(),
             secret_hash: hash,
+            secret_lookup: Some(secret_lookup_hex(&secret)),
             role,
             tenant: tenant_hex.to_string(),
             allowed_prefixes,
@@ -251,6 +336,28 @@ pub fn hash_secret(secret: &str) -> Result<String, KeyError> {
     Ok(hash.to_string())
 }
 
+/// SHA-256 of the secret, lower-case hex — the O(1) keystore index value.
+pub fn secret_lookup_hex(secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    let digest = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    use std::fmt::Write;
+    for b in digest {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn argon2_matches(secret: &str, stored_hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(stored_hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(secret.as_bytes(), &parsed)
+        .is_ok()
+}
+
 fn generate_api_key() -> String {
     let bytes: [u8; 24] = rand::random();
     format!("zdk_{}", hex::encode(bytes))
@@ -293,6 +400,48 @@ mod tests {
         .unwrap();
         let store = KeyStore::load(&path).unwrap();
         assert!(store.verify(secret.as_bytes()).is_some());
+        assert!(store.verify(b"wrong").is_none());
+    }
+
+    #[test]
+    fn lookup_index_selects_correct_record_among_many() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keys.toml");
+        let s1 =
+            KeyStore::create_key(&path, "a", KeyRole::ReadOnly, &default_tenant_hex(), vec![])
+                .unwrap();
+        let s2 =
+            KeyStore::create_key(&path, "b", KeyRole::ReadWrite, &default_tenant_hex(), vec![])
+                .unwrap();
+        let store = KeyStore::load(&path).unwrap();
+        assert_eq!(store.verify(s1.as_bytes()).unwrap().id, "a");
+        assert_eq!(store.verify(s2.as_bytes()).unwrap().id, "b");
+        assert!(store.verify(b"zdk_not_a_real_key").is_none());
+    }
+
+    #[test]
+    fn legacy_record_without_lookup_still_verifies() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keys.toml");
+        let secret = KeyStore::create_key(
+            &path,
+            "old",
+            KeyRole::ReadWrite,
+            &default_tenant_hex(),
+            vec![],
+        )
+        .unwrap();
+        // Strip secret_lookup from the file to simulate a pre-upgrade key.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let stripped: String = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("secret_lookup"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, stripped).unwrap();
+
+        let store = KeyStore::load(&path).unwrap();
+        assert_eq!(store.verify(secret.as_bytes()).unwrap().id, "old");
         assert!(store.verify(b"wrong").is_none());
     }
 }

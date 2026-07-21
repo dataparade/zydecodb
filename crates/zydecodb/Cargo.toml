@@ -13,7 +13,7 @@ path = "src/lib.rs"
 [features]
 # Forwards the engine's failpoint instrumentation so server-level tests can
 # inject delays/faults (e.g. a slow WAL fsync) to exercise lock decoupling.
-failpoints = ["zydecodb-engine/failpoints"]
+failpoints = ["zydecodb-engine/failpoints", "fail"]
 
 [[bin]]
 name = "zydecodb"
@@ -33,15 +33,18 @@ tracing-subscriber = { workspace = true }
 thiserror = "1"
 argon2 = "0.5"
 rand = "0.8"
+sha2 = { workspace = true }
 rustls = "0.23"
 rustls-pemfile = "2"
 tiny_http = "0.12"
 signal-hook = "0.3"
 polling = "3"
 arc-swap = "1.9.2"
+fail = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 rcgen = "0.13"
 fail = { workspace = true }
+proptest = { workspace = true }

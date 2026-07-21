@@ -1,4 +1,6 @@
-# Docker production-ready configuration
+# Docker defaults. Auth is required; do not expose :9470 without a real keys file.
+# Generate keys before first start:
+#   zydecodb admin keys create --id docker --role admin --keys-file config/keys.toml
 listen = "0.0.0.0:9470"
 data_dir = "/var/lib/zydecodb/data"
 wal_dir = "/var/lib/zydecodb/wal"
@@ -7,15 +9,20 @@ max_open_readers = 32
 poll_compaction_ms = 50
 durability = "sync"
 
-# Prometheus/health endpoint
+# Operability HTTP: loopback inside the container. Scrape via `docker exec` or a
+# sidecar on the same network namespace — do not publish this port to the host.
 [metrics]
-listen = "0.0.0.0:9471"
+listen = "127.0.0.1:9471"
 
 [security]
-require_auth = "false"
+require_auth = true
 keys_file = "/etc/zydecodb/keys.toml"
 allow_unauthenticated_ping = true
-legacy_single_tenant = true
+# Greenfield Docker installs use the tenant-prefixed layout. Only set this to
+# true when migrating a volume written by a pre-multi-tenant server.
+legacy_single_tenant = false
+max_connections = 128
+rate_limit_rps = 200
 
 [security.audit]
 enabled = true

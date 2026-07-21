@@ -11,14 +11,18 @@ from __future__ import annotations
 import json
 import os
 import random
+import ssl
 import time
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 from . import _protocol as proto
 from .collection import Collection
 from .errors import ConnectionError as ZConnectionError
 from .errors import ServerBusyError, ZydecoError, from_status
 from .pool import ConnectionPool
+
+# True enables system-default TLS; pass an SSLContext for custom roots/SNI.
+TlsOption = Union[bool, ssl.SSLContext]
 
 
 def generate_id() -> str:
@@ -40,6 +44,7 @@ class Client:
         max_retries: int = 2,
         backoff_base: float = 0.05,
         backoff_cap: float = 2.0,
+        tls: Optional[TlsOption] = None,
     ):
         self._pool = ConnectionPool(
             host,
@@ -47,6 +52,7 @@ class Client:
             api_key=api_key,
             timeout=timeout,
             max_size=pool_size,
+            tls=tls,
         )
         self._max_retries = max(0, max_retries)
         self._backoff_base = backoff_base

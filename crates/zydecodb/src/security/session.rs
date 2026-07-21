@@ -5,6 +5,7 @@ use super::keys::{KeyRecord, KeyRole};
 pub struct SessionState {
     pub authenticated: bool,
     pub key_id: Option<String>,
+    pub secret_hash: Option<String>,
     pub role: Option<KeyRole>,
     pub tenant: [u8; 16],
     pub allowed_prefixes: Vec<String>,
@@ -15,6 +16,7 @@ impl SessionState {
         SessionState {
             authenticated: false,
             key_id: None,
+            secret_hash: None,
             role: None,
             tenant: [0u8; 16],
             allowed_prefixes: vec![],
@@ -26,6 +28,7 @@ impl SessionState {
         SessionState {
             authenticated: true,
             key_id: Some(record.id.clone()),
+            secret_hash: Some(record.secret_hash.clone()),
             role: Some(record.role),
             tenant,
             allowed_prefixes: record.allowed_prefixes.clone(),

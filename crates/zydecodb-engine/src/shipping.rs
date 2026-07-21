@@ -10,8 +10,15 @@
 //!
 //! `shipped.log` line format (append-only, one per shipped segment):
 //! ```text
-//! <segment_id> <seal_seq> <sha256_hex>\n
+//! <segment_id> <seal_seq> <sha256_hex> [<hmac_hex>]\n
 //! ```
+//!
+//! When an HMAC key is configured, each line carries a fourth field:
+//! `HMAC-SHA256(key, "<segment_id> <seal_seq> <sha256_hex>")` in lower hex.
+//! The HMAC authenticates the manifest entry, so an attacker who can write the
+//! ship directory cannot forge both the segment bytes and a matching log line.
+//! Verification with a key requires the HMAC field; legacy 3-field lines are
+//! accepted only when no key is configured (dev/back-compat).
 
 use crate::errors::{EngineError, EngineResult};
 use sha2::{Digest, Sha256};
@@ -145,12 +152,14 @@ pub fn read_heartbeat(dir: &Path) -> EngineResult<Option<Heartbeat>> {
 
 /// Ship one sealed segment into `ship_dir` and append a `shipped.log` entry.
 /// Idempotent on the destination file name (overwrites a same-named stale ship).
+/// With `hmac_key`, the log line carries an HMAC authenticating the entry.
 pub fn ship_segment(
     src: &Path,
     ship_dir: &Path,
     segment_id: u64,
     seal_seq: u64,
     mode: ShipMode,
+    hmac_key: Option<&[u8]>,
 ) -> EngineResult<()> {
     std::fs::create_dir_all(ship_dir)?;
     let file_name = src
@@ -184,7 +193,8 @@ pub fn ship_segment(
         }
     }
 
-    append_shipped_log(ship_dir, segment_id, seal_seq, &hex)?;
+    let hmac_hex = hmac_key.map(|k| entry_hmac_hex(k, segment_id, seal_seq, &hex));
+    append_shipped_log(ship_dir, segment_id, seal_seq, &hex, hmac_hex.as_deref())?;
     Ok(())
 }
 
@@ -193,14 +203,18 @@ fn append_shipped_log(
     segment_id: u64,
     seal_seq: u64,
     sha256_hex: &str,
+    hmac_hex: Option<&str>,
 ) -> EngineResult<()> {
     let log_path = ship_dir.join(SHIPPED_LOG);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)?;
-    writeln!(f, "{} {} {}", segment_id, seal_seq, sha256_hex)
-        .map_err(|e| EngineError::Io(format!("shipped.log write: {}", e)))?;
+    match hmac_hex {
+        Some(mac) => writeln!(f, "{} {} {} {}", segment_id, seal_seq, sha256_hex, mac),
+        None => writeln!(f, "{} {} {}", segment_id, seal_seq, sha256_hex),
+    }
+    .map_err(|e| EngineError::Io(format!("shipped.log write: {}", e)))?;
     f.sync_all()?;
     Ok(())
 }
@@ -211,6 +225,8 @@ pub struct ShippedEntry {
     pub segment_id: u64,
     pub seal_seq: u64,
     pub sha256_hex: String,
+    /// Present on lines written with an HMAC key (4-field format).
+    pub hmac_hex: Option<String>,
 }
 
 /// Read and parse `shipped.log` from a ship directory, in append order.
@@ -223,16 +239,16 @@ pub fn read_shipped_log(ship_dir: &Path) -> EngineResult<Vec<ShippedEntry>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(EngineError::Io(format!("read shipped.log: {}", e))),
     };
-    let mut out = Vec::new();
+    let mut out: Vec<ShippedEntry> = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() != 3 {
+        if parts.len() != 3 && parts.len() != 4 {
             return Err(EngineError::Io(format!(
-                "shipped.log line {}: expected '<id> <seq> <sha256>'",
+                "shipped.log line {}: expected '<id> <seq> <sha256> [<hmac>]'",
                 lineno + 1
             )));
         }
@@ -249,10 +265,33 @@ pub fn read_shipped_log(ship_dir: &Path) -> EngineResult<Vec<ShippedEntry>> {
                 lineno + 1
             )));
         }
+        let hmac_hex = if parts.len() == 4 {
+            let mac = parts[3].to_ascii_lowercase();
+            if mac.len() != 64 || !mac.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(EngineError::Io(format!(
+                    "shipped.log line {}: bad hmac",
+                    lineno + 1
+                )));
+            }
+            Some(mac)
+        } else {
+            None
+        };
+        
+        if let Some(last) = out.last() {
+            if segment_id <= last.segment_id {
+                return Err(EngineError::Io(format!(
+                    "shipped.log line {}: out of order segment_id {} (<= {})",
+                    lineno + 1, segment_id, last.segment_id
+                )));
+            }
+        }
+        
         out.push(ShippedEntry {
             segment_id,
             seal_seq,
             sha256_hex,
+            hmac_hex,
         });
     }
     Ok(out)
@@ -269,6 +308,72 @@ pub fn sha256_file(path: &Path) -> EngineResult<String> {
 /// Verify a shipped segment's bytes match the sha256 recorded in `shipped.log`.
 pub fn verify_segment(path: &Path, expected_sha256_hex: &str) -> EngineResult<bool> {
     Ok(sha256_file(path)?.eq_ignore_ascii_case(expected_sha256_hex))
+}
+
+/// Verify a shipped-log entry against the segment bytes and, when a key is
+/// configured, its HMAC. With a key, a missing or wrong HMAC fails — a legacy
+/// 3-field line is not acceptable on an authenticated stream.
+pub fn verify_entry(path: &Path, entry: &ShippedEntry, hmac_key: Option<&[u8]>) -> EngineResult<bool> {
+    if !verify_segment(path, &entry.sha256_hex)? {
+        return Err(EngineError::Io(format!("segment {} hash mismatch or corrupt", entry.segment_id)));
+    }
+    let Some(key) = hmac_key else {
+        return Ok(true);
+    };
+    let Some(ref presented) = entry.hmac_hex else {
+        return Err(EngineError::Io(format!("segment {} missing hmac", entry.segment_id)));
+    };
+    let expected = entry_hmac_hex(key, entry.segment_id, entry.seal_seq, &entry.sha256_hex);
+    if !constant_time_eq_str(presented, &expected) {
+        return Err(EngineError::Io(format!("segment {} hmac mismatch", entry.segment_id)));
+    }
+    Ok(true)
+}
+
+/// HMAC-SHA256 over the canonical entry string `"<id> <seq> <sha256_hex>"`.
+pub fn entry_hmac_hex(key: &[u8], segment_id: u64, seal_seq: u64, sha256_hex: &str) -> String {
+    let msg = format!("{} {} {}", segment_id, seal_seq, sha256_hex);
+    hex_encode(&hmac_sha256(key, msg.as_bytes()))
+}
+
+/// RFC 2104 HMAC-SHA256. Implemented on top of the `sha2` crate we already
+/// depend on (no extra crypto dependency for one construction).
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let mut h = Sha256::new();
+        h.update(key);
+        k[..32].copy_from_slice(&h.finalize());
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// EXDEV ("cross-device link") errno. Avoids a libc dependency for one constant.
@@ -298,7 +403,7 @@ mod tests {
         let src = wal.join("wal-00000001.log");
         std::fs::write(&src, b"hello-wal-bytes").unwrap();
 
-        ship_segment(&src, &ship, 1, 42, ShipMode::Hardlink).unwrap();
+        ship_segment(&src, &ship, 1, 42, ShipMode::Hardlink, None).unwrap();
 
         let shipped = ship.join("wal-00000001.log");
         assert!(shipped.exists());
@@ -320,7 +425,7 @@ mod tests {
         let src = wal.join("wal-00000007.log");
         std::fs::write(&src, b"copy-me").unwrap();
 
-        ship_segment(&src, &ship, 7, 100, ShipMode::Copy).unwrap();
+        ship_segment(&src, &ship, 7, 100, ShipMode::Copy, None).unwrap();
         assert_eq!(
             std::fs::read(ship.join("wal-00000007.log")).unwrap(),
             b"copy-me"

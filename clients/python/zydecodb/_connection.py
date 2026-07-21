@@ -8,13 +8,17 @@ here; pooling, retries, and the typed API live above.
 from __future__ import annotations
 
 import socket
+import ssl
 import struct
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from . import _protocol as proto
 from .errors import ConnectionError as ZConnectionError
 from .errors import from_status
+
+# True enables system-default TLS; an SSLContext customizes verification/SNI.
+TlsOption = Union[bool, ssl.SSLContext]
 
 
 class Connection:
@@ -25,10 +29,12 @@ class Connection:
         *,
         timeout: float,
         api_key: Optional[str],
+        tls: Optional[TlsOption] = None,
     ):
         self._addr = (host, port)
         self._timeout = timeout
         self._api_key = api_key
+        self._tls = tls
         self._sock: Optional[socket.socket] = None
         self.last_used = 0.0
 
@@ -39,6 +45,13 @@ class Connection:
             sock.settimeout(self._timeout)
             # Disable Nagle: requests are small and latency-sensitive.
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if self._tls:
+                ctx = (
+                    ssl.create_default_context()
+                    if self._tls is True
+                    else self._tls
+                )
+                sock = ctx.wrap_socket(sock, server_hostname=self._addr[0])
         except OSError as exc:
             raise ZConnectionError(f"connect to {self._addr[0]}:{self._addr[1]} failed: {exc}")
         self._sock = sock
@@ -99,9 +112,9 @@ class Connection:
         chunks = []
         got = 0
         while got < n:
-            piece = self._sock.recv(n - got)
-            if not piece:
-                raise ZConnectionError("connection closed while reading response")
-            chunks.append(piece)
-            got += len(piece)
+            chunk = self._sock.recv(n - got)
+            if not chunk:
+                raise ZConnectionError("connection closed while reading")
+            chunks.append(chunk)
+            got += len(chunk)
         return b"".join(chunks)

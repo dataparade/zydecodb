@@ -142,9 +142,9 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 		return EncodeQueryIndexRange(in.Collection, in.IndexName, optBytes(in.LoJSON), optBytes(in.HiJSON), mustHex(t, in.CursorHex), in.Limit)
 	case "Find":
 		var in struct {
-			Collection string     `json:"collection"`
-			FilterJSON string     `json:"filter_json"`
-			Sort       [][]any    `json:"sort"`
+			Collection string  `json:"collection"`
+			FilterJSON string  `json:"filter_json"`
+			Sort       [][]any `json:"sort"`
 			Projection struct {
 				Mode   string   `json:"mode"`
 				Fields []string `json:"fields"`

@@ -8,6 +8,11 @@
 id = "backend"
 # Placeholder — replace by running admin keys create
 secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$PLACEHOLDER$PLACEHOLDER"
+# Written automatically by `admin keys create`: sha256(secret) used as an O(1)
+# index into the keystore (the argon2 hash above remains the credential).
+# Keys minted before this field existed still verify via a slow linear scan;
+# reissue them to get the fast path.
+# secret_lookup = "..."
 role = "read_write"
 tenant = "00000000000000000000000000000000"
 allowed_prefixes = []

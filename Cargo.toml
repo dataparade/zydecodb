@@ -4,6 +4,7 @@ members = [
     "crates/zydecodb-document",
     "crates/zydecodb",
     "crates/zydecodb-migrate",
+    "fuzz",
 ]
 resolver = "2"
 

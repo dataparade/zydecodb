@@ -38,6 +38,9 @@ pub struct Replica {
     applied: BTreeSet<u64>,
     last_seq: u64,
     applied_max_seq: u64,
+    /// When set, every `shipped.log` entry must carry a valid HMAC (see
+    /// `shipping::verify_entry`); entries without one are refused.
+    hmac_key: Option<Vec<u8>>,
 }
 
 /// Result of one [`Replica::sync`] pass.
@@ -64,7 +67,14 @@ impl Replica {
             applied: BTreeSet::new(),
             last_seq: applied_max_seq,
             applied_max_seq,
+            hmac_key: None,
         }
+    }
+
+    /// Require every shipped entry to carry a valid HMAC under `key`.
+    pub fn with_hmac_key(mut self, key: Option<Vec<u8>>) -> Self {
+        self.hmac_key = key;
+        self
     }
 
     pub fn last_seq(&self) -> u64 {
@@ -99,8 +109,9 @@ impl Replica {
                 // yet; stop and retry on the next pass so order is preserved.
                 break;
             }
-            if !shipping::verify_segment(&src, &entry.sha256_hex)? {
-                // A partial/corrupt transfer: stop and retry once it settles.
+            if !shipping::verify_entry(&src, &entry, self.hmac_key.as_deref())? {
+                // A partial/corrupt/forged transfer: stop and retry once it
+                // settles (or fail permanently if the manifest was tampered).
                 break;
             }
 
@@ -361,6 +372,7 @@ mod tests {
             1,
             10,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
         ship_segment(
@@ -369,6 +381,7 @@ mod tests {
             2,
             20,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
 
@@ -401,6 +414,7 @@ mod tests {
             1,
             5,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
         // Corrupt the shipped copy after its sha256 was recorded.
@@ -430,6 +444,7 @@ mod tests {
             1,
             1,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
         ship_segment(
@@ -438,6 +453,7 @@ mod tests {
             2,
             2,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
         // Simulate segment 2's bytes not yet delivered (log line present, file gone).
@@ -466,6 +482,7 @@ mod tests {
             1,
             7,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
 
@@ -502,6 +519,7 @@ mod tests {
             1,
             10,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
         // Replica has applied up to seq 10 (caught up to shipped).
@@ -553,6 +571,7 @@ mod tests {
             1,
             10,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
         ship_segment(
@@ -561,6 +580,7 @@ mod tests {
             2,
             20,
             ShipMode::Copy,
+            None,
         )
         .unwrap();
         // The stream already carries a fence epoch of 3.

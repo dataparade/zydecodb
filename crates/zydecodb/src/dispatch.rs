@@ -30,12 +30,12 @@ pub fn handle_request(
 ) -> DispatchOutcome {
     let start = Instant::now();
     let outcome = handle_request_inner(engine, req, session, security);
-    let client_key_len = outcome.client_key_len;
+    let client_key = outcome.client_key;
     crate::security::audit::log_request(
         &security.audit,
         &outcome.session,
         outcome.command,
-        client_key_len,
+        client_key,
         outcome.response.status,
         start.elapsed(),
     );
@@ -50,7 +50,7 @@ struct InnerOutcome {
     response: ResponseEnvelope,
     session: SessionState,
     command: Command,
-    client_key_len: Option<usize>,
+    client_key: Option<crate::security::audit::AuditKey>,
     /// Sequence number of a durable write to await before acking (PUT/DEL).
     commit_seq: Option<u64>,
 }
@@ -66,7 +66,7 @@ fn handle_request_inner(
             response: ResponseEnvelope::error(Status::ProtocolError, "unimplemented"),
             session,
             command: req.command,
-            client_key_len: None,
+            client_key: None,
             commit_seq: None,
         };
     }
@@ -85,7 +85,7 @@ fn handle_request_inner(
                 response: ResponseEnvelope::ok(vec![]),
                 session,
                 command: Command::Ping,
-                client_key_len: None,
+                client_key: None,
                 commit_seq: None,
             }
         }
@@ -104,7 +104,7 @@ fn handle_request_inner(
                         response: ResponseEnvelope::ok(json),
                         session,
                         command: Command::Stats,
-                        client_key_len: None,
+                        client_key: None,
                         commit_seq: None,
                     }
                 }
@@ -115,7 +115,7 @@ fn handle_request_inner(
             response: ResponseEnvelope::error(Status::ProtocolError, "unimplemented"),
             session,
             command: req.command,
-            client_key_len: None,
+            client_key: None,
             commit_seq: None,
         },
     }
@@ -131,7 +131,7 @@ fn handle_session_init(
             response: ResponseEnvelope::error(Status::ProtocolError, "already authenticated"),
             session,
             command: Command::SessionInit,
-            client_key_len: None,
+            client_key: None,
             commit_seq: None,
         };
     }
@@ -145,7 +145,7 @@ fn handle_session_init(
                 response: ResponseEnvelope::ok(vec![]),
                 session: new_session,
                 command: Command::SessionInit,
-                client_key_len: None,
+                client_key: None,
                 commit_seq: None,
             }
         }
@@ -162,7 +162,7 @@ fn handle_set_context(req: RequestEnvelope, session: SessionState) -> InnerOutco
             response: ResponseEnvelope::error(Status::ProtocolError, "tenant must be 16 bytes"),
             session,
             command: Command::SetContext,
-            client_key_len: None,
+            client_key: None,
             commit_seq: None,
         };
     }
@@ -174,7 +174,7 @@ fn handle_set_context(req: RequestEnvelope, session: SessionState) -> InnerOutco
         response: ResponseEnvelope::ok(vec![]),
         session: new_session,
         command: Command::SetContext,
-        client_key_len: None,
+        client_key: None,
         commit_seq: None,
     }
 }
@@ -191,12 +191,12 @@ fn handle_put(
     match PutPayload::decode(&req.payload) {
         Ok(p) => {
             // ACL check needs only the session; do it before touching the lock.
-            if let Some(resp) = check_prefix_acl(&session, &p.key) {
+            if let Some(resp) = crate::security::check_key_prefix_acl(&session, &p.key) {
                 return InnerOutcome {
                     response: resp,
                     session,
                     command: Command::Put,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: None,
                 };
             }
@@ -207,14 +207,14 @@ fn handle_put(
                     response: ResponseEnvelope::ok(seq.to_be_bytes().to_vec()),
                     session,
                     command: Command::Put,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: Some(seq),
                 },
                 Err(e) => InnerOutcome {
                     response: ResponseEnvelope::error(e.status(), &e.to_string()),
                     session,
                     command: Command::Put,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: None,
                 },
             }
@@ -223,7 +223,7 @@ fn handle_put(
             response: ResponseEnvelope::error(e.status(), &e.to_string()),
             session,
             command: Command::Put,
-            client_key_len: None,
+            client_key: None,
             commit_seq: None,
         },
     }
@@ -237,12 +237,12 @@ fn handle_get(
 ) -> InnerOutcome {
     match KeyPayload::decode(&req.payload) {
         Ok(p) => {
-            if let Some(resp) = check_prefix_acl(&session, &p.key) {
+            if let Some(resp) = crate::security::check_key_prefix_acl(&session, &p.key) {
                 return InnerOutcome {
                     response: resp,
                     session,
                     command: Command::Get,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: None,
                 };
             }
@@ -256,21 +256,21 @@ fn handle_get(
                     response: ResponseEnvelope::ok(value),
                     session,
                     command: Command::Get,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: None,
                 },
                 Ok(None) => InnerOutcome {
                     response: ResponseEnvelope::not_found(),
                     session,
                     command: Command::Get,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: None,
                 },
                 Err(e) => InnerOutcome {
                     response: ResponseEnvelope::error(e.status(), &e.to_string()),
                     session,
                     command: Command::Get,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: None,
                 },
             }
@@ -279,7 +279,7 @@ fn handle_get(
             response: ResponseEnvelope::error(e.status(), &e.to_string()),
             session,
             command: Command::Get,
-            client_key_len: None,
+            client_key: None,
             commit_seq: None,
         },
     }
@@ -296,12 +296,12 @@ fn handle_del(
     }
     match KeyPayload::decode(&req.payload) {
         Ok(p) => {
-            if let Some(resp) = check_prefix_acl(&session, &p.key) {
+            if let Some(resp) = crate::security::check_key_prefix_acl(&session, &p.key) {
                 return InnerOutcome {
                     response: resp,
                     session,
                     command: Command::Del,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: None,
                 };
             }
@@ -315,7 +315,7 @@ fn handle_del(
                         response: ResponseEnvelope::ok(payload),
                         session,
                         command: Command::Del,
-                        client_key_len: Some(p.key.len()),
+                        client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                         commit_seq: Some(seq),
                     }
                 }
@@ -323,7 +323,7 @@ fn handle_del(
                     response: ResponseEnvelope::error(e.status(), &e.to_string()),
                     session,
                     command: Command::Del,
-                    client_key_len: Some(p.key.len()),
+                    client_key: Some(crate::security::audit::AuditKey::capture(&p.key)),
                     commit_seq: None,
                 },
             }
@@ -332,7 +332,7 @@ fn handle_del(
             response: ResponseEnvelope::error(e.status(), &e.to_string()),
             session,
             command: Command::Del,
-            client_key_len: None,
+            client_key: None,
             commit_seq: None,
         },
     }
@@ -354,30 +354,12 @@ fn storage_key(session: &SessionState, client_key: &[u8], legacy_single_tenant: 
     }
 }
 
-fn check_prefix_acl(session: &SessionState, client_key: &[u8]) -> Option<ResponseEnvelope> {
-    if session.allowed_prefixes.is_empty() {
-        return None;
-    }
-    let allowed = session
-        .allowed_prefixes
-        .iter()
-        .any(|p| client_key.starts_with(p.as_bytes()));
-    if allowed {
-        None
-    } else {
-        Some(ResponseEnvelope::error(
-            Status::Forbidden,
-            "key prefix not allowed",
-        ))
-    }
-}
-
 fn unauthorized(session: SessionState, command: Command, msg: &str) -> InnerOutcome {
     InnerOutcome {
         response: ResponseEnvelope::error(Status::Unauthorized, msg),
         session,
         command,
-        client_key_len: None,
+        client_key: None,
         commit_seq: None,
     }
 }
@@ -387,7 +369,7 @@ fn forbidden(session: SessionState, command: Command, msg: &str) -> InnerOutcome
         response: ResponseEnvelope::error(Status::Forbidden, msg),
         session,
         command,
-        client_key_len: None,
+        client_key: None,
         commit_seq: None,
     }
 }
