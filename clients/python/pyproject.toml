@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zydecodb"
-version = "0.9.0b1"
+version = "0.9.0b2"
 description = "Official Python driver for ZydecoDB — a MongoDB-style document store without the fluff."
 readme = "README.md"
 requires-python = ">=3.9"

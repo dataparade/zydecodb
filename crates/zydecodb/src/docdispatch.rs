@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use zydecodb_document::catalog::Catalog;
 use zydecodb_document::error::{DocError, DocResult};
 use zydecodb_document::filter::Filter;
-use zydecodb_document::query::{FindSpec, Projection};
+use zydecodb_document::query::{FindSpec, Projection, MAX_SORT_BUFFER};
 use zydecodb_document::update::UpdateDoc;
 use zydecodb_document::{query, store, update, wire};
 use zydecodb_engine::engine::Engine;
@@ -69,8 +69,8 @@ fn read_snapshot(engine: &SharedEngine, cursor: Option<&[u8]>) -> zydecodb_engin
     }
 }
 
-/// Route one document command, applying the same auth/role/prefix-ACL checks as
-/// the raw-KV path. The session is never mutated by document commands.
+/// Route one document command, applying the same auth/role checks as the raw-KV
+/// path. The session is never mutated by document commands.
 pub fn handle_document(
     engine: &SharedEngine,
     catalog: &SharedCatalog,
@@ -90,63 +90,18 @@ pub fn handle_document(
         return ResponseEnvelope::error(Status::Forbidden, "read-only key");
     }
 
-    // Prefix ACL applies to collection names (see security::acl).
-    let collection = match collection_for_acl(req.command, &req.payload) {
-        Ok(c) => c,
-        Err(e) => return err_response(&e),
-    };
-    if let Some(resp) = crate::security::check_collection_prefix_acl(session, &collection) {
-        return resp;
-    }
-
     let prefix = tenant_prefix(session, security.legacy_single_tenant);
 
-    let sort_cap = security.max_sort_buffer;
     match req.command {
         Command::DocPut => doc_put(engine, catalog, commit, &prefix, &req.payload),
         Command::DocDel => doc_del(engine, catalog, commit, &prefix, &req.payload),
         Command::IndexDef => index_def(engine, catalog, commit, &prefix, &req.payload),
         Command::Query => query_cmd(engine, catalog, &prefix, &req.payload),
-        Command::Find => result(find_cmd(engine, catalog, &prefix, &req.payload, sort_cap)),
-        Command::Update => result(update_cmd(
-            engine,
-            catalog,
-            commit,
-            &prefix,
-            &req.payload,
-            sort_cap,
-        )),
-        Command::Delete => result(delete_cmd(
-            engine,
-            catalog,
-            commit,
-            &prefix,
-            &req.payload,
-            sort_cap,
-        )),
+        Command::Find => result(find_cmd(engine, catalog, &prefix, &req.payload)),
+        Command::Update => result(update_cmd(engine, catalog, commit, &prefix, &req.payload)),
+        Command::Delete => result(delete_cmd(engine, catalog, commit, &prefix, &req.payload)),
         Command::Count => result(count_cmd(engine, catalog, &prefix, &req.payload)),
         _ => ResponseEnvelope::error(Status::ProtocolError, "unimplemented"),
-    }
-}
-
-/// Extract the target collection for prefix-ACL before the command runs.
-fn collection_for_acl(cmd: Command, payload: &[u8]) -> DocResult<String> {
-    match cmd {
-        Command::DocPut => Ok(wire::DocPutPayload::decode(payload)?.collection),
-        Command::DocDel => Ok(wire::DocDelPayload::decode(payload)?.collection),
-        Command::IndexDef => Ok(wire::IndexDefPayload::decode(payload)?.collection),
-        Command::Find => Ok(wire::FindPayload::decode(payload)?.collection),
-        Command::Update => Ok(wire::UpdatePayload::decode(payload)?.collection),
-        Command::Delete => Ok(wire::DeletePayload::decode(payload)?.collection),
-        Command::Query => match wire::QueryPayload::decode(payload)? {
-            wire::QueryPayload::ById { collection, .. }
-            | wire::QueryPayload::IndexRange { collection, .. } => Ok(collection),
-        },
-        Command::Count => match wire::CountPayload::decode(payload)? {
-            wire::CountPayload::Count { collection, .. }
-            | wire::CountPayload::Distinct { collection, .. } => Ok(collection),
-        },
-        _ => Err(DocError::Protocol("unimplemented document command".into())),
     }
 }
 
@@ -358,7 +313,6 @@ fn find_cmd(
     catalog: &SharedCatalog,
     prefix: &[u8],
     payload: &[u8],
-    max_sort_buffer: usize,
 ) -> DocResult<ResponseEnvelope> {
     let p = wire::FindPayload::decode(payload)?;
     let projection = match p.projection {
@@ -376,7 +330,7 @@ fn find_cmd(
     };
     let snap = read_snapshot(engine, spec.cursor.as_deref());
     let cat = catalog.read().unwrap();
-    let page = query::execute_find(&snap, &cat, prefix, &p.collection, &spec, max_sort_buffer)?;
+    let page = query::execute_find(&snap, &cat, prefix, &p.collection, &spec)?;
     Ok(ResponseEnvelope::ok(wire::encode_query_page(&page)))
 }
 
@@ -392,21 +346,12 @@ fn update_cmd(
     commit: &CommitCoordinator,
     prefix: &[u8],
     payload: &[u8],
-    max_sort_buffer: usize,
 ) -> DocResult<ResponseEnvelope> {
     let p = wire::UpdatePayload::decode(payload)?;
     let filter = Filter::parse_bytes(&p.filter)?;
     let upd = UpdateDoc::parse_bytes(&p.update)?;
 
-    let ids = select_candidates(
-        engine,
-        catalog,
-        prefix,
-        &p.collection,
-        &filter,
-        p.multi,
-        max_sort_buffer,
-    )?;
+    let ids = select_candidates(engine, catalog, prefix, &p.collection, &filter, p.multi)?;
     let (modified, seq) = {
         let cat = catalog.read().unwrap();
         let mut guard = engine.lock().unwrap();
@@ -439,20 +384,11 @@ fn delete_cmd(
     commit: &CommitCoordinator,
     prefix: &[u8],
     payload: &[u8],
-    max_sort_buffer: usize,
 ) -> DocResult<ResponseEnvelope> {
     let p = wire::DeletePayload::decode(payload)?;
     let filter = Filter::parse_bytes(&p.filter)?;
 
-    let ids = select_candidates(
-        engine,
-        catalog,
-        prefix,
-        &p.collection,
-        &filter,
-        p.multi,
-        max_sort_buffer,
-    )?;
+    let ids = select_candidates(engine, catalog, prefix, &p.collection, &filter, p.multi)?;
     let (deleted, seq) = {
         let cat = catalog.read().unwrap();
         let mut guard = engine.lock().unwrap();
@@ -476,7 +412,6 @@ fn select_candidates(
     collection: &str,
     filter: &Filter,
     multi: bool,
-    max_sort_buffer: usize,
 ) -> DocResult<Vec<Vec<u8>>> {
     let snap = {
         let guard = engine.lock().unwrap();
@@ -484,7 +419,7 @@ fn select_candidates(
     };
     let cat = catalog.read().unwrap();
     if multi {
-        query::find_ids(&snap, &cat, prefix, collection, filter, max_sort_buffer)
+        query::find_ids(&snap, &cat, prefix, collection, filter, MAX_SORT_BUFFER)
     } else {
         Ok(
             query::find_first_id(&snap, &cat, prefix, collection, filter)?
