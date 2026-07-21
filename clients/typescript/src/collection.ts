@@ -20,7 +20,7 @@ export interface QueryOptions {
 const EMPTY = Buffer.alloc(0);
 
 /**
- * The product surface: a MongoDB-inspired collection of JSON documents over the
+ * The product surface: a collection of JSON documents over the
  * binary client. Filters and updates use the familiar $-operators; the server
  * plans the access path and re-checks the full filter.
  */

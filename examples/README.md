@@ -49,7 +49,7 @@ pip install zydecodb
 
 (Source lives in [`clients/python`](../clients/python).)
 
-If you know MongoDB, the `Collection` API will feel familiar:
+The `Collection` API:
 
 ```python
 users = db.collection("users")

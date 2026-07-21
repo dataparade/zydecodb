@@ -1,8 +1,7 @@
 # ZydecoDB TypeScript / Node driver
 
-Official TypeScript/Node client for [ZydecoDB](../../README.md) — a MongoDB-style
-document store without the fluff. Built on Node's standard library (`node:net`),
-no runtime dependencies.
+Official TypeScript/Node client for [ZydecoDB](../../README.md). Built on Node's
+standard library (`node:net`), no runtime dependencies.
 
 ## Install
 
@@ -50,7 +49,7 @@ try {
   `ConflictError` (unique-index violation), `AuthError`, `ServerBusyError`,
   `InvalidRequestError`, or the base `ServerError` — each carrying the wire
   `status` byte. Transport problems throw `ConnectionError`.
-- **MongoDB-style `Collection` API.** `insertOne/Many`, `find`/`findOne`,
+- **`Collection` API.** `insertOne/Many`, `find`/`findOne`,
   `updateOne/Many`, `deleteOne/Many`, `countDocuments`, `distinct`, and
   `createIndex`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.

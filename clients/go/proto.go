@@ -1,5 +1,5 @@
-// Package zydecodb is the official Go driver for ZydecoDB, a MongoDB-style
-// document store that speaks a compact binary wire protocol.
+// Package zydecodb is the official Go driver for ZydecoDB, a document store
+// that speaks a compact binary wire protocol.
 //
 // This file is the pure codec: command/status constants and the encode/decode
 // of payload bodies, with no I/O. It mirrors the Rust definitions in
@@ -39,9 +39,9 @@ const (
 
 // Query / count sub-command discriminators (first payload byte).
 const (
-	queryByID       byte = 0x00
-	queryIndexRange byte = 0x01
-	countModeCount  byte = 0x00
+	queryByID         byte = 0x00
+	queryIndexRange   byte = 0x01
+	countModeCount    byte = 0x00
 	countModeDistinct byte = 0x01
 )
 

@@ -1,7 +1,7 @@
 # ZydecoDB Document Store — Architecture
 
 How the document layer works today: collections of JSON documents with a
-MongoDB-style query/index layer, riding on the durable LSM key-value engine.
+query/index layer, riding on the durable LSM key-value engine.
 
 **Audience:** Engineers working on collections, indexes, query execution, or the
 wire protocol.
@@ -96,8 +96,7 @@ is queryable whether it is indexed or not.
 - `update_one` / `update_many`, `delete_one` / `delete_many`: candidate ids come
   from a lock-free snapshot, then **each matched document is rewritten in one
   atomic `write_batch`** (body + all of its index keys). Per-document writes are
-  atomic; a multi-document update is **not** globally atomic — same model as
-  MongoDB.
+  atomic; a multi-document update is **not** globally atomic.
 
 ---
 

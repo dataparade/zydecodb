@@ -4,7 +4,7 @@ Source-available database written in Rust (BSL 1.1). Runs as a standalone server
 
 Two layers, one engine:
 
-- **Document store** — collections of JSON documents with a MongoDB-style query layer: filter with `$`-operators, sort/projection/pagination, partial updates (`$set`/`$inc`/`$unset`/`$push`), `count`/`distinct`, and secondary indexes the server keeps in sync automatically. Any field is queryable, indexed or not.
+- **Document store** — collections of JSON documents with a filter/query layer: `$`-operators, sort/projection/pagination, partial updates (`$set`/`$inc`/`$unset`/`$push`), `count`/`distinct`, and secondary indexes the server keeps in sync automatically. Any field is queryable, indexed or not.
 - **Key-value core** — the LSM storage engine underneath: ordered keys, atomic multi-key batches, snapshots, and WAL crash recovery.
 
 **License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07)
@@ -44,7 +44,7 @@ with Client("127.0.0.1", 9470) as db:
     users.delete_many({"age": {"$lt": 18}})
 ```
 
-If you know MongoDB, you already know the driver. Wire protocol: length-prefixed binary frames (see `zydecodb-engine::frame`) on `127.0.0.1:9470`.
+Wire protocol: length-prefixed binary frames (see `zydecodb-engine::frame`) on `127.0.0.1:9470`.
 
 ### Build from source
 
@@ -93,7 +93,7 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 **Document store**
 - JSON document collections with auto-generated time-ordered `_id`
-- MongoDB-style filters: `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists`, implicit-AND, `$and/$or/$not`, dotted paths
+- Filters: `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists`, implicit-AND, `$and/$or/$not`, dotted paths
 - `find` with sort, projection, skip/limit, and cursor pagination; `find_one`, `count_documents`, `distinct`
 - Partial updates (`$set/$inc/$unset/$push`), `update_one/many`, `delete_one/many`
 - A query planner that uses an index (or `_id` lookup) when one fits and falls back to a collection scan otherwise — so any field is queryable
@@ -126,7 +126,7 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 ## Beta scope
 
-**Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). MongoDB-style filters, sort, projection, pagination, partial updates, `count`/`distinct`, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits.
+**Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). Filters, sort, projection, pagination, partial updates, `count`/`distinct`, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits.
 
 **Not yet:** aggregation pipeline (`$group`/`$lookup`/`$unwind`), `$regex`/`$type`/array operators, upsert, document TTL, MVCC/multi-document transactions, and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). See [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) for the gap list and roadmap.
 

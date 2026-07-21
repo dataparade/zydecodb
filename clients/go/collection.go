@@ -11,7 +11,7 @@ import (
 // the document's string primary key.
 type Document = map[string]any
 
-// Collection is the product surface: a MongoDB-inspired collection of JSON
+// Collection is the product surface: a collection of JSON
 // documents over the binary client. Filters and updates use the familiar
 // $-operators; the server plans the access path and re-checks the full filter.
 type Collection struct {

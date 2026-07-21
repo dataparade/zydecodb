@@ -1,7 +1,7 @@
 # ZydecoDB Go driver
 
-Official Go client for [ZydecoDB](../../README.md) — a MongoDB-style document
-store without the fluff. Standard library only, no third-party dependencies.
+Official Go client for [ZydecoDB](../../README.md). Standard library only, no
+third-party dependencies.
 
 ## Install
 
@@ -67,7 +67,7 @@ func main() {
 - **Typed errors.** Non-OK responses return a `*ServerError` carrying the wire
   `Status` byte; use `IsConflict`, `IsAuth`, `IsBusy`, and `IsInvalidRequest`
   to branch. Transport problems return a `*ConnError`.
-- **MongoDB-style `Collection` API.** `InsertOne/Many`, `Find`/`FindOne`,
+- **`Collection` API.** `InsertOne/Many`, `Find`/`FindOne`,
   `UpdateOne/Many`, `DeleteOne/Many`, `CountDocuments`, `Distinct`, and
   `CreateIndex`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.

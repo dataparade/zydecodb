@@ -1,12 +1,11 @@
-//! Query filter language: a Mongo-inspired JSON filter document parsed into a
-//! predicate tree and evaluated against a document.
+//! Query filter language: a JSON filter document parsed into a predicate tree
+//! and evaluated against a document.
 //!
-//! Cleaned-up surface (vs MongoDB):
+//! Surface:
 //! - Field conditions: `{field: value}` (equality) or `{field: {$op: operand}}`.
 //! - Comparison operators: `$eq $ne $gt $gte $lt $lte $in $nin $exists`.
 //! - Logical: top-level multiple fields are implicitly ANDed; `$and`/`$or` take
-//!   arrays of sub-filters; `$not` wraps a single sub-filter (simpler than
-//!   Mongo's per-field `$not`).
+//!   arrays of sub-filters; `$not` wraps a single sub-filter.
 //! - Dotted paths (`"a.b.c"`) walk nested objects.
 //!
 //! Scalar comparisons reuse [`crate::encoding::encode_value`], so a filter sees

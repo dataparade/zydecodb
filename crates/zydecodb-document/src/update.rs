@@ -1,13 +1,13 @@
 //! Partial-update operators and the update/delete write paths.
 //!
-//! Cleaned-up surface (vs MongoDB): an update document must use operators
-//! (`$set $inc $unset $push`); a bare (non-`$`) document is rejected rather than
-//! silently replacing the whole document.
+//! An update document must use operators (`$set $inc $unset $push`); a bare
+//! (non-`$`) document is rejected rather than silently replacing the whole
+//! document.
 //!
 //! Each write reuses the atomic [`crate::store::upsert`]/[`crate::store::delete`]
 //! path, so the body and every secondary index move together in one WAL record.
 //! `update_many`/`delete_many` select candidate ids from a snapshot first, then
-//! apply one atomic batch per document (not globally atomic, matching Mongo).
+//! apply one atomic batch per document (not globally atomic across the set).
 
 use crate::error::{DocError, DocResult};
 use crate::store::{self, strip_value_kind};
@@ -30,8 +30,8 @@ enum UpdateOp {
 }
 
 impl UpdateDoc {
-    /// Parse a Mongo-style update document. Every top-level key must be a
-    /// supported `$`-operator whose value is an object of `path: operand`.
+    /// Parse an update document. Every top-level key must be a supported
+    /// `$`-operator whose value is an object of `path: operand`.
     pub fn parse(doc: &Value) -> DocResult<UpdateDoc> {
         let obj = doc
             .as_object()

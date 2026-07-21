@@ -129,7 +129,7 @@ fn doc_put(
     };
     let zdoc_bytes = zydecodb_document::binary::ZDocBuilder::from_value(&json_val);
 
-    // Implicit collection creation on first insert (Mongo-style): the catalog
+    // Implicit collection creation on first insert: the catalog
     // write lock is taken only when the collection is missing, so the steady
     // state stays on the cheap read lock. Same catalog-before-engine lock
     // order and durable-before-ack DDL policy as index_def.
@@ -336,8 +336,8 @@ fn find_cmd(
 
 /// Filter-based update. Phase 1 selects candidate ids from a lock-free
 /// snapshot; phase 2 re-verifies the filter per document UNDER the engine
-/// lock and applies one atomic batch per document (not globally atomic,
-/// matching Mongo). The re-check makes a filtered update a per-document
+/// lock and applies one atomic batch per document (not globally atomic
+/// across the set). The re-check makes a filtered update a per-document
 /// compare-and-swap: `matched` reports only documents whose current body
 /// still satisfied the filter at write time.
 fn update_cmd(

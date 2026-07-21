@@ -1,5 +1,5 @@
 """
-User storage on top of ZydecoDB's Mongo-inspired document driver.
+User storage on top of ZydecoDB's document driver.
 
 Users are JSON documents in a collection, accessed through the `Collection`
 API (find / insert_one / update_one / delete_one with `$`-operators). ZydecoDB

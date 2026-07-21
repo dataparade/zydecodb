@@ -1,4 +1,4 @@
-"""The product surface: a MongoDB-inspired `Collection` of JSON documents.
+"""The product surface: a `Collection` of JSON documents.
 
 Documents are plain dicts, each with a string ``_id`` (auto-generated and
 time-ordered if you don't supply one) that doubles as its storage key. Filters

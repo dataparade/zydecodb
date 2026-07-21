@@ -1,7 +1,7 @@
 # ZydecoDB Python driver
 
-Official Python client for [ZydecoDB](../../README.md) — a MongoDB-style
-document store without the fluff. Pure standard library, no runtime dependencies.
+Official Python client for [ZydecoDB](../../README.md). Pure standard library,
+no runtime dependencies.
 
 ## Install
 
@@ -45,7 +45,7 @@ with Client("127.0.0.1", 9470, api_key="YOUR_KEY") as db:
   `ConflictError` (unique-index violation), `AuthError`, `ServerBusyError`,
   `InvalidRequestError`, or the base `ServerError` — each carrying the wire
   `status` byte. Transport problems raise `ConnectionError`.
-- **MongoDB-style `Collection` API.** `insert_one/many`, `find`/`find_one`,
+- **`Collection` API.** `insert_one/many`, `find`/`find_one`,
   `update_one/many`, `delete_one/many`, `count_documents`, `distinct`,
   `create_index`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.
