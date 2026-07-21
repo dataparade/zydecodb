@@ -1,0 +1,31 @@
+name: npm dist-tag
+
+# One-shot / ops helper: move an npm dist-tag (e.g. point `latest` at a beta
+# while every published version is still a prerelease).
+on:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: "Package version already on npm (e.g. 0.9.0-beta.3)"
+        required: true
+      dist_tag:
+        description: "Dist-tag to assign"
+        required: true
+        default: latest
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Assign dist-tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          ver="${{ inputs.package_version }}"
+          tag="${{ inputs.dist_tag }}"
+          npm dist-tag add "zydecodb@${ver}" "$tag"
+          npm dist-tag ls zydecodb

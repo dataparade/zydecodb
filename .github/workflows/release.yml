@@ -138,7 +138,17 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          tag="${GITHUB_REF_NAME}"
+          # Hyphenated tags (beta/rc) publish under the `beta` dist-tag.
+          # Until there is a stable (non-prerelease) release, also point
+          # `latest` at this version so the npm package page matches what
+          # people actually install during the beta period.
+          ver="$(node -p "require('./package.json').version")"
           dist_tag="latest"
-          case "$tag" in *-*) dist_tag="beta" ;; esac
+          case "${GITHUB_REF_NAME}" in *-*) dist_tag="beta" ;; esac
           npm publish --access public --tag "$dist_tag"
+          if [ "$dist_tag" = "beta" ]; then
+            current_latest="$(npm view zydecodb dist-tags.latest 2>/dev/null || true)"
+            case "$current_latest" in
+              ""|*-*) npm dist-tag add "zydecodb@${ver}" latest ;;
+            esac
+          fi
