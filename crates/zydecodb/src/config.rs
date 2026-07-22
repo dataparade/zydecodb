@@ -241,7 +241,8 @@ pub struct MetricsConfig {
     pub token: Option<String>,
 }
 
-/// Durability model selector (mirrors [`crate::commit::DurabilityMode`]).
+/// TOML durability selector. Maps to [`crate::commit::DurabilityMode`] via
+/// [`Config::commit_durability`] (periodic uses `fsync_interval_ms`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
@@ -480,6 +481,16 @@ impl Config {
                 .to_fair_config(block_cache_bytes, memtable_flush_threshold),
             l0_write_stall_threshold: self.fair.l0_write_stall_threshold,
             ..Default::default()
+        }
+    }
+
+    /// Runtime commit-coordinator mode (interval comes from `fsync_interval_ms`).
+    pub fn commit_durability(&self) -> crate::commit::DurabilityMode {
+        match self.durability {
+            DurabilityMode::Sync => crate::commit::DurabilityMode::Sync,
+            DurabilityMode::Periodic => crate::commit::DurabilityMode::Periodic {
+                interval: Duration::from_millis(self.fsync_interval_ms.max(1)),
+            },
         }
     }
 }

@@ -3,21 +3,25 @@
 //!
 //! Run with: `cargo test -p zydecodb --test security_suite`
 
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::net::{SocketAddr, TcpStream};
+use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
 use zydecodb::config::{
-    Config, MetricsConfig, ReplicaConfig, RequireAuth, SecurityConfig, ShippingConfig,
+    MetricsConfig, ReplicaConfig, ShippingConfig,
 };
 use zydecodb::security::keys::{KeyRole, KeyStore};
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{
-    Command, KeyPayload, PutPayload, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN,
+    Command, KeyPayload, PutPayload, RequestEnvelope,
 };
 
 /// Serializes tests that read or mutate `ZYDECODB_BOOTSTRAP_KEY`: the keystore
@@ -28,78 +32,6 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 const ZERO_TENANT: &str = "00000000000000000000000000000000";
 
 // ---------- harness ----------
-
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
-}
-
-fn base_config(tmp: &TempDir, listen: SocketAddr, keys_file: PathBuf) -> Config {
-    let data_dir = tmp.path().join("data");
-    let wal_dir = tmp.path().join("wal");
-    std::fs::create_dir_all(&data_dir).unwrap();
-    std::fs::create_dir_all(&wal_dir).unwrap();
-    Config {
-        listen,
-        data_dir,
-        wal_dir,
-        block_cache_mb: 64,
-        max_open_readers: 32,
-        poll_compaction_ms: 50,
-        durability: Default::default(),
-        fsync_interval_ms: 100,
-        shipping: Default::default(),
-        metrics: Default::default(),
-        replica: Default::default(),
-        security: SecurityConfig {
-            require_auth: RequireAuth::True,
-            keys_file,
-            ..Default::default()
-        },
-        tls: Default::default(),
-        listen_unix: None,
-        runtime: Default::default(),
-        fair: Default::default(),
-    }
-}
-
-fn write_request(stream: &mut TcpStream, req: &RequestEnvelope) {
-    stream.write_all(&req.encode()).unwrap();
-    stream.flush().unwrap();
-}
-
-fn read_response(stream: &mut TcpStream) -> ResponseEnvelope {
-    let mut header = [0u8; ENVELOPE_HEADER_LEN];
-    stream.read_exact(&mut header).unwrap();
-    let (status, len) = ResponseEnvelope::parse_header(&header).unwrap();
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream.read_exact(&mut payload).unwrap();
-    }
-    ResponseEnvelope::new(status, payload)
-}
-
-fn wait_connect(addr: SocketAddr) -> TcpStream {
-    for _ in 0..100 {
-        if let Ok(s) = TcpStream::connect(addr) {
-            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-            return s;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("failed to connect to {addr}");
-}
-
-fn session_init(stream: &mut TcpStream, secret: &str) -> Status {
-    write_request(
-        stream,
-        &RequestEnvelope::new(Command::SessionInit, secret.as_bytes().to_vec()),
-    );
-    read_response(stream).status
-}
 
 fn http_get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap();
@@ -121,16 +53,6 @@ fn http_get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> (u16, String)
     (code, buf)
 }
 
-fn wait_tcp_up(addr: SocketAddr) {
-    for _ in 0..100 {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("listener at {addr} never came up");
-}
-
 // ---------- auth ----------
 
 /// Multiple keys resolve via the sha256 lookup index: each secret maps to its
@@ -146,7 +68,7 @@ fn auth_lookup_single_argon_path() {
     let s2 = KeyStore::create_key(&keys_file, "b", KeyRole::ReadOnly, ZERO_TENANT, vec![]).unwrap();
 
     let addr = free_addr();
-    let config = base_config(&tmp, addr, keys_file);
+    let config = auth_config(&tmp, addr, keys_file);
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
     let handle = thread::spawn(move || server.run(config).unwrap());
@@ -190,7 +112,7 @@ fn require_auth_empty_keys_refuses_start() {
         "test env must not carry a bootstrap key"
     );
     let tmp = TempDir::new().unwrap();
-    let config = base_config(&tmp, free_addr(), tmp.path().join("empty-keys.toml"));
+    let config = auth_config(&tmp, free_addr(), tmp.path().join("empty-keys.toml"));
     let server = zydecodb::server::Server::new();
     let err = server.run(config).expect_err("must refuse to start");
     assert!(
@@ -205,7 +127,7 @@ fn bootstrap_non_loopback_refuses_start() {
     let _env = ENV_LOCK.lock().unwrap();
     std::env::set_var("ZYDECODB_BOOTSTRAP_KEY", "zdk_dev_bootstrap");
     let tmp = TempDir::new().unwrap();
-    let mut config = base_config(&tmp, free_addr(), tmp.path().join("keys.toml"));
+    let mut config = auth_config(&tmp, free_addr(), tmp.path().join("keys.toml"));
     config.listen = "0.0.0.0:9470".parse().unwrap();
     let server = zydecodb::server::Server::new();
     let result = server.run(config);
@@ -233,7 +155,7 @@ fn legacy_mixed_tenants_refuses_start() {
     )
     .unwrap();
 
-    let mut config = base_config(&tmp, free_addr(), keys_file);
+    let mut config = auth_config(&tmp, free_addr(), keys_file);
     config.security.legacy_single_tenant = true;
     let server = zydecodb::server::Server::new();
     let err = server.run(config).expect_err("mixed layout must refuse");
@@ -253,7 +175,7 @@ fn metrics_non_loopback_without_allow_refuses() {
     let keys_file = tmp.path().join("keys.toml");
     KeyStore::create_key(&keys_file, "k", KeyRole::ReadWrite, ZERO_TENANT, vec![]).unwrap();
 
-    let mut config = base_config(&tmp, free_addr(), keys_file);
+    let mut config = auth_config(&tmp, free_addr(), keys_file);
     config.metrics = MetricsConfig {
         listen: Some("0.0.0.0:9471".parse().unwrap()),
         per_tenant: false,
@@ -276,7 +198,7 @@ fn metrics_remote_without_token_refuses() {
     let keys_file = tmp.path().join("keys.toml");
     KeyStore::create_key(&keys_file, "k", KeyRole::ReadWrite, ZERO_TENANT, vec![]).unwrap();
 
-    let mut config = base_config(&tmp, free_addr(), keys_file);
+    let mut config = auth_config(&tmp, free_addr(), keys_file);
     config.metrics = MetricsConfig {
         listen: Some("0.0.0.0:9471".parse().unwrap()),
         per_tenant: false,
@@ -302,7 +224,7 @@ fn metrics_token_required_for_scrape() {
     KeyStore::create_key(&keys_file, "k", KeyRole::ReadWrite, ZERO_TENANT, vec![]).unwrap();
 
     let metrics_addr = free_addr();
-    let mut config = base_config(&tmp, free_addr(), keys_file);
+    let mut config = auth_config(&tmp, free_addr(), keys_file);
     config.metrics = MetricsConfig {
         listen: Some(metrics_addr),
         per_tenant: false,
@@ -341,7 +263,7 @@ fn shipping_without_hmac_refuses_when_enabled() {
     let keys_file = tmp.path().join("keys.toml");
     KeyStore::create_key(&keys_file, "k", KeyRole::ReadWrite, ZERO_TENANT, vec![]).unwrap();
 
-    let mut config = base_config(&tmp, free_addr(), keys_file);
+    let mut config = auth_config(&tmp, free_addr(), keys_file);
     config.shipping = ShippingConfig {
         ship_dir: Some(tmp.path().join("ship")),
         mode: "copy".into(),
@@ -366,7 +288,7 @@ fn replica_without_hmac_refuses() {
     let keys_file = tmp.path().join("keys.toml");
     KeyStore::create_key(&keys_file, "k", KeyRole::ReadWrite, ZERO_TENANT, vec![]).unwrap();
 
-    let mut config = base_config(&tmp, free_addr(), keys_file);
+    let mut config = auth_config(&tmp, free_addr(), keys_file);
     config.replica = ReplicaConfig {
         from: Some(tmp.path().join("ship")),
         poll_ms: 100,
@@ -469,7 +391,7 @@ fn uds_socket_mode_0600() {
 
     let addr = free_addr();
     let sock = tmp.path().join("zydecodb.sock");
-    let mut config = base_config(&tmp, addr, keys_file);
+    let mut config = auth_config(&tmp, addr, keys_file);
     config.listen_unix = Some(sock.clone());
 
     let server = zydecodb::server::Server::new();
@@ -508,7 +430,7 @@ fn doc_and_kv_prefix_acl() {
     .unwrap();
 
     let addr = free_addr();
-    let config = base_config(&tmp, addr, keys_file);
+    let config = auth_config(&tmp, addr, keys_file);
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
     let handle = thread::spawn(move || server.run(config).unwrap());
@@ -585,7 +507,7 @@ fn sort_buffer_cap_configurable() {
         KeyStore::create_key(&keys_file, "k", KeyRole::ReadWrite, ZERO_TENANT, vec![]).unwrap();
 
     let addr = free_addr();
-    let mut config = base_config(&tmp, addr, keys_file);
+    let mut config = auth_config(&tmp, addr, keys_file);
     config.security.max_sort_buffer = 2;
 
     let server = zydecodb::server::Server::new();

@@ -8,3 +8,6 @@ pub mod metrics_http;
 pub mod replica;
 pub mod security;
 pub mod server;
+pub mod shared;
+
+pub use shared::{SharedCatalog, SharedEngine};

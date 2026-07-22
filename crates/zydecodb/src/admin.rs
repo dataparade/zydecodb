@@ -5,11 +5,6 @@ use zydecodb_document::catalog::Catalog;
 use zydecodb_engine::engine::{Engine, EngineConfig};
 use zydecodb_engine::keys::KS_USER;
 
-/// Build an [`EngineConfig`] from a server [`Config`] for offline admin commands.
-fn engine_cfg_from(cfg: &Config) -> EngineConfig {
-    cfg.to_engine_config()
-}
-
 pub fn keys_create(
     keys_file: PathBuf,
     id: String,
@@ -131,7 +126,7 @@ pub fn restore(
 /// MANIFEST, and a SNAPMETA recording the snapshot sequence.
 pub fn snapshot(config: &Path, out: &Path) -> Result<(), String> {
     let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
-    let mut engine = Engine::open(engine_cfg_from(&cfg)).map_err(|e| e.to_string())?;
+    let mut engine = Engine::open(cfg.to_engine_config()).map_err(|e| e.to_string())?;
     let seq = engine.snapshot_to(out).map_err(|e| e.to_string())?;
     engine.shutdown().map_err(|e| e.to_string())?;
     println!("snapshot written to {} at seq {seq}", out.display());
@@ -179,7 +174,7 @@ fn count_sstable_versions(data_dir: &Path) -> Result<(usize, usize), String> {
 pub fn upgrade(config: &Path) -> Result<(), String> {
     let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
     let data_dir = cfg.data_dir.clone();
-    let mut engine = Engine::open(engine_cfg_from(&cfg)).map_err(|e| e.to_string())?;
+    let mut engine = Engine::open(cfg.to_engine_config()).map_err(|e| e.to_string())?;
     engine.compact_all().map_err(|e| e.to_string())?;
     engine.shutdown().map_err(|e| e.to_string())?;
 
@@ -261,7 +256,7 @@ pub fn drop_tenant_on_engine(
 pub fn drop_tenant(config: &Path, tenant_hex: &str, compact: bool) -> Result<(), String> {
     let tenant = parse_tenant_hex(tenant_hex).map_err(|e| e.to_string())?;
     let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
-    let mut engine = Engine::open(engine_cfg_from(&cfg)).map_err(|e| e.to_string())?;
+    let mut engine = Engine::open(cfg.to_engine_config()).map_err(|e| e.to_string())?;
     let mut catalog = Catalog::load(&engine).map_err(|e| e.to_string())?;
 
     let result = drop_tenant_on_engine(&mut engine, &mut catalog, &tenant, compact)?;

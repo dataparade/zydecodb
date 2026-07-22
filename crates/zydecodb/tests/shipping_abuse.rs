@@ -1,7 +1,3 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 use tempfile::TempDir;
 
 use zydecodb::config::{Config, ReplicaConfig, RequireAuth, SecurityConfig, ShippingConfig};

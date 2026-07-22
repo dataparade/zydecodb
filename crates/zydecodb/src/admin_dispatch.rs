@@ -1,14 +1,11 @@
 //! Live admin commands that need both engine and catalog.
 
 use crate::admin::drop_tenant_on_engine;
-use crate::docdispatch::SharedCatalog;
 use crate::security::{SecurityRuntime, SessionState};
-use std::sync::Arc;
+use crate::shared::{SharedCatalog, SharedEngine};
 use zydecodb_engine::engine::Engine;
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope};
-
-type SharedEngine = Arc<zydecodb_engine::engine_handle::EngineHandle>;
 
 /// `AdminDropTenant` payload: 16-byte tenant id + 1-byte compact flag (0/1).
 pub fn handle_admin_drop_tenant(

@@ -1,11 +1,12 @@
 use crate::admin_dispatch::{handle_admin_drop_tenant, is_admin_command};
-use crate::commit::{CommitCoordinator, DurabilityMode};
-use crate::config::{Config, DurabilityMode as ConfigDurability};
+use crate::commit::CommitCoordinator;
+use crate::config::Config;
 use crate::dispatch::{handle_request, write_response};
-use crate::docdispatch::{handle_document, is_document_command, SharedCatalog};
+use crate::docdispatch::handle_document;
 use crate::security::ratelimit::RateLimiter;
 use crate::security::tls::{accept as tls_accept, load_server_config};
 use crate::security::{SecurityRuntime, SessionState};
+use crate::shared::{SharedCatalog, SharedEngine};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -17,10 +18,6 @@ use zydecodb_document::catalog::Catalog;
 use zydecodb_engine::engine::{Engine, EngineConfig};
 use zydecodb_engine::engine_handle::EngineHandle;
 use zydecodb_engine::frame::Command;
-
-/// Shared engine with factorized locks (Phase 4): write mutex for memtable/
-/// WAL/catalog; block cache, fair-share, and WAL sync are separate domains.
-type SharedEngine = Arc<EngineHandle>;
 
 /// Optional per-tenant request metrics, registered on the shared Prometheus
 /// registry when `[metrics].per_tenant` is set. A single counter vector keeps
@@ -362,12 +359,7 @@ impl Server {
         // Durability: the engine buffers WAL appends; the commit coordinator owns
         // the fsync so acknowledged writes are durable by default (or on a bounded
         // interval in periodic mode). See crate::commit.
-        let durability = match config.durability {
-            ConfigDurability::Sync => DurabilityMode::Sync,
-            ConfigDurability::Periodic => DurabilityMode::Periodic {
-                interval: Duration::from_millis(config.fsync_interval_ms.max(1)),
-            },
-        };
+        let durability = config.commit_durability();
         let commit = CommitCoordinator::new(&engine, durability);
         let commit_thread = commit.spawn()?;
         info!(?durability, "commit coordinator started");
@@ -1035,7 +1027,7 @@ fn serve_stream<S: Read + Write>(
         // socket I/O.
         let response = if is_admin_command(req.command) {
             handle_admin_drop_tenant(engine, catalog, &req, &session, security)
-        } else if is_document_command(req.command) {
+        } else if req.command.is_document_command() {
             handle_document(engine, catalog, commit, &req, &session, security)
         } else {
             let outcome = handle_request(engine, req, session, security);

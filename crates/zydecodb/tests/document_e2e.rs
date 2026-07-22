@@ -2,11 +2,14 @@
 //! Query (ById + IndexRange with pagination), and concurrent progress while a
 //! query holds a snapshot.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::Duration;
-use tempfile::TempDir;
 use zydecodb_document::wire;
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN};
@@ -138,55 +141,9 @@ fn distinct(s: &mut TcpStream, collection: &str, field: &str) -> Vec<serde_json:
         .clone()
 }
 
-fn spawn_server() -> (
-    SocketAddr,
-    std::sync::Arc<std::sync::Mutex<bool>>,
-    thread::JoinHandle<()>,
-) {
-    let tmp = TempDir::new().unwrap();
-    let data_dir = tmp.path().join("data");
-    let wal_dir = tmp.path().join("wal");
-    std::fs::create_dir_all(&data_dir).unwrap();
-    std::fs::create_dir_all(&wal_dir).unwrap();
-    // Keep tmp alive for the server's lifetime by leaking it into the thread.
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    let config = zydecodb::config::Config {
-        listen: addr,
-        data_dir,
-        wal_dir,
-        block_cache_mb: 64,
-        max_open_readers: 32,
-        poll_compaction_ms: 50,
-        durability: Default::default(),
-        fsync_interval_ms: 100,
-        shipping: Default::default(),
-        metrics: Default::default(),
-        replica: Default::default(),
-        security: zydecodb::config::SecurityConfig {
-            require_auth: zydecodb::config::RequireAuth::False,
-            ..Default::default()
-        },
-        tls: Default::default(),
-        listen_unix: None,
-        runtime: Default::default(),
-        fair: Default::default(),
-    };
-
-    let server = zydecodb::server::Server::new();
-    let shutdown = server.shutdown_flag();
-    let handle = thread::spawn(move || {
-        let _tmp = tmp; // hold the temp dir until the server stops
-        server.run(config).unwrap()
-    });
-    (addr, shutdown, handle)
-}
-
 #[test]
 fn docput_query_by_id_and_index_range_with_pagination() {
-    let (addr, shutdown, handle) = spawn_server();
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
     let mut s = connect(addr);
 
     define_index(&mut s, "users", "by_age", &["age"]);
@@ -278,7 +235,7 @@ fn docput_query_by_id_and_index_range_with_pagination() {
 /// server restart because the catalog write is durable before the ack.
 #[test]
 fn docput_implicitly_creates_collection() {
-    let (addr, shutdown, handle) = spawn_server();
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
     let mut s = connect(addr);
 
     // No define_index — the very first operation on "fresh" is a write.
@@ -323,7 +280,7 @@ fn docput_implicitly_creates_collection() {
 
 #[test]
 fn find_update_delete_count_over_wire() {
-    let (addr, shutdown, handle) = spawn_server();
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
     let mut s = connect(addr);
 
     // Index only on age; city stays unindexed to prove scans work over the wire.
@@ -405,7 +362,7 @@ fn find_update_delete_count_over_wire() {
 /// across its scan.
 #[test]
 fn concurrent_connection_progresses_during_queries() {
-    let (addr, shutdown, handle) = spawn_server();
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
 
     // Seed a collection + index + some docs.
     let mut setup = connect(addr);

@@ -2,34 +2,18 @@
 //! under `~/.zydecodb/`, keep auth optional on loopback, and boot a server
 //! that answers unauthenticated requests.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::thread;
-use std::time::Duration;
 use tempfile::TempDir;
 
 use zydecodb::config::Config;
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN};
-
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
-}
-
-fn wait_connect(addr: SocketAddr) -> TcpStream {
-    for _ in 0..100 {
-        if let Ok(s) = TcpStream::connect(addr) {
-            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-            return s;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("failed to connect to {addr}");
-}
 
 fn roundtrip(stream: &mut TcpStream, req: &RequestEnvelope) -> ResponseEnvelope {
     stream.write_all(&req.encode()).unwrap();

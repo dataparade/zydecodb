@@ -119,12 +119,6 @@ impl Command {
                 | Command::IndexDef
         )
     }
-
-    /// Deprecated alias for [`Self::is_kv_command`].
-    #[deprecated(note = "use is_kv_command or is_document_command")]
-    pub fn is_v1(self) -> bool {
-        self.is_kv_command()
-    }
 }
 
 /// A parsed request envelope.

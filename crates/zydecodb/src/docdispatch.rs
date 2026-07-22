@@ -9,7 +9,7 @@
 use crate::commit::CommitCoordinator;
 use crate::security::keys::KeyRole;
 use crate::security::{SecurityRuntime, SessionState};
-use std::sync::{Arc, RwLock};
+use crate::shared::{SharedCatalog, SharedEngine};
 use zydecodb_document::catalog::Catalog;
 use zydecodb_document::error::{DocError, DocResult};
 use zydecodb_document::filter::Filter;
@@ -20,24 +20,6 @@ use zydecodb_engine::engine::Engine;
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope};
 use zydecodb_engine::keys::KS_USER;
-
-pub type SharedEngine = Arc<zydecodb_engine::engine_handle::EngineHandle>;
-pub type SharedCatalog = Arc<RwLock<Catalog>>;
-
-/// Whether a command is handled by the document layer.
-pub fn is_document_command(cmd: Command) -> bool {
-    matches!(
-        cmd,
-        Command::DocPut
-            | Command::DocDel
-            | Command::IndexDef
-            | Command::Query
-            | Command::Find
-            | Command::Update
-            | Command::Delete
-            | Command::Count
-    )
-}
 
 /// Storage prefix (`KS_USER` + optional tenant) mirroring `dispatch::storage_key`,
 /// but without a trailing client key — the document layer appends its own
@@ -61,6 +43,23 @@ fn err_response(e: &DocError) -> ResponseEnvelope {
 /// Apply write slowdown after the engine mutex is released.
 fn apply_pending_slowdown(slowdown: std::time::Duration) {
     Engine::apply_write_slowdown(slowdown);
+}
+
+/// Catalog read lock, then engine write lock (lock order: catalog → engine).
+fn with_catalog_engine_write<R>(
+    engine: &SharedEngine,
+    catalog: &SharedCatalog,
+    f: impl FnOnce(&Catalog, &mut Engine) -> R,
+) -> R {
+    let (r, slowdown) = {
+        let cat = catalog.read().unwrap();
+        let mut guard = engine.write();
+        let r = f(&cat, &mut guard);
+        let s = guard.take_write_slowdown();
+        (r, s)
+    };
+    apply_pending_slowdown(slowdown);
+    r
 }
 
 /// Capture a read snapshot for a paginated read. When the request carries a
@@ -214,24 +213,18 @@ fn doc_put(
         }
     }
 
-    // Lock order: catalog (read) then engine, consistent across all writers.
-    let (outcome, slowdown) = {
-        let cat = catalog.read().unwrap();
-        let mut guard = engine.write();
-        let r = store::upsert_with_expiry(
-            &mut guard,
-            &cat,
+    let outcome = with_catalog_engine_write(engine, catalog, |cat, guard| {
+        store::upsert_with_expiry(
+            guard,
+            cat,
             prefix,
             &p.collection,
             &p.doc_id,
             &zdoc_bytes,
             true,
             p.expires_at,
-        );
-        let s = guard.take_write_slowdown();
-        (r, s)
-    };
-    apply_pending_slowdown(slowdown);
+        )
+    });
     match outcome {
         Ok(seq) => {
             commit.commit(seq, p.relaxed);
@@ -252,15 +245,11 @@ fn doc_del(
         Ok(p) => p,
         Err(e) => return err_response(&e),
     };
-    let (outcome, slowdown) = {
-        let cat = catalog.read().unwrap();
-        let mut guard = engine.write();
-        let r = store::delete(&mut guard, &cat, prefix, &p.collection, &p.doc_id);
+    let outcome = with_catalog_engine_write(engine, catalog, |cat, guard| {
+        let r = store::delete(guard, cat, prefix, &p.collection, &p.doc_id);
         let seq = guard.last_buffered_seq();
-        let s = guard.take_write_slowdown();
-        ((r, seq), s)
-    };
-    apply_pending_slowdown(slowdown);
+        (r, seq)
+    });
     match outcome.0 {
         Ok(deleted) => {
             // A delete-by-id is always durable-by-default (no relaxed flag on
@@ -432,12 +421,10 @@ fn update_cmd(
         p.multi,
         max_sort_buffer,
     )?;
-    let ((modified, seq), slowdown) = {
-        let cat = catalog.read().unwrap();
-        let mut guard = engine.write();
+    let (modified, seq) = with_catalog_engine_write(engine, catalog, |cat, guard| {
         let modified = update::apply_to_ids(
-            &mut guard,
-            &cat,
+            guard,
+            cat,
             prefix,
             &p.collection,
             &ids,
@@ -445,10 +432,8 @@ fn update_cmd(
             Some(&filter),
         )?;
         let seq = guard.last_buffered_seq();
-        let s = guard.take_write_slowdown();
-        ((modified, seq), s)
-    };
-    apply_pending_slowdown(slowdown);
+        Ok::<_, DocError>((modified, seq))
+    })?;
     // Stale candidates were skipped by the under-lock re-check; every counted
     // document both matched and was rewritten.
     let matched = modified;
@@ -480,16 +465,11 @@ fn delete_cmd(
         p.multi,
         max_sort_buffer,
     )?;
-    let ((deleted, seq), slowdown) = {
-        let cat = catalog.read().unwrap();
-        let mut guard = engine.write();
-        let deleted =
-            store::delete_ids(&mut guard, &cat, prefix, &p.collection, &ids, Some(&filter))?;
+    let (deleted, seq) = with_catalog_engine_write(engine, catalog, |cat, guard| {
+        let deleted = store::delete_ids(guard, cat, prefix, &p.collection, &ids, Some(&filter))?;
         let seq = guard.last_buffered_seq();
-        let s = guard.take_write_slowdown();
-        ((deleted, seq), s)
-    };
-    apply_pending_slowdown(slowdown);
+        Ok::<_, DocError>((deleted, seq))
+    })?;
     commit.commit(seq, p.relaxed);
     Ok(ResponseEnvelope::ok(
         format!("{{\"deleted\":{deleted}}}").into_bytes(),
@@ -570,6 +550,7 @@ mod tests {
     use super::*;
     use crate::commit::DurabilityMode;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, RwLock};
     use std::thread;
     use std::time::{Duration, Instant};
     use zydecodb_engine::engine::{Engine, EngineConfig};

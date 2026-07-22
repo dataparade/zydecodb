@@ -1,41 +1,14 @@
-use std::io::{Read, Write};
-use std::net::TcpStream;
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::thread;
-use std::time::Duration;
 use tempfile::TempDir;
 use zydecodb::config::{Config, QuotasConfig, RequireAuth, SecurityConfig};
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{
-    Command, PutPayload, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN,
+    Command, PutPayload, RequestEnvelope,
 };
-
-fn write_request(stream: &mut TcpStream, req: &RequestEnvelope) {
-    stream.write_all(&req.encode()).unwrap();
-    stream.flush().unwrap();
-}
-
-fn read_response(stream: &mut TcpStream) -> ResponseEnvelope {
-    let mut header = [0u8; ENVELOPE_HEADER_LEN];
-    stream.read_exact(&mut header).unwrap();
-    let (status, len) = ResponseEnvelope::parse_header(&header).unwrap();
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream.read_exact(&mut payload).unwrap();
-    }
-    ResponseEnvelope::new(status, payload)
-}
-
-fn wait_connect(addr: std::net::SocketAddr) -> TcpStream {
-    for _ in 0..50 {
-        if let Ok(s) = TcpStream::connect(addr) {
-            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-            return s;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("failed to connect");
-}
 
 #[test]
 fn rate_limit_returns_engine_busy() {

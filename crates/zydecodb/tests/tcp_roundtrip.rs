@@ -1,4 +1,8 @@
-use std::io::{Read, Write};
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
+use std::io::Write;
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
@@ -6,24 +10,8 @@ use tempfile::TempDir;
 use zydecodb_engine::engine::{Engine, EngineConfig};
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{
-    Command, KeyPayload, PutPayload, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN,
+    Command, KeyPayload, PutPayload, RequestEnvelope,
 };
-
-fn write_request(stream: &mut TcpStream, req: &RequestEnvelope) {
-    stream.write_all(&req.encode()).unwrap();
-    stream.flush().unwrap();
-}
-
-fn read_response(stream: &mut TcpStream) -> ResponseEnvelope {
-    let mut header = [0u8; ENVELOPE_HEADER_LEN];
-    stream.read_exact(&mut header).unwrap();
-    let (status, len) = ResponseEnvelope::parse_header(&header).unwrap();
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream.read_exact(&mut payload).unwrap();
-    }
-    ResponseEnvelope::new(status, payload)
-}
 
 #[test]
 fn tcp_put_get_del_roundtrip() {

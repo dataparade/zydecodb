@@ -34,6 +34,10 @@ use zydecodb_engine::engine_handle::EngineHandle;
 use zydecodb_engine::keys::KS_USER;
 use zydecodb_engine::tenant_fair::FairConfig;
 
+#[path = "../soak_util.rs"]
+mod soak_common;
+use soak_common::percentile_us;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Steady,
@@ -176,15 +180,6 @@ fn tenant_key(tenant: u8, i: u64) -> Vec<u8> {
     k.extend_from_slice(&[tenant; 16]);
     k.extend_from_slice(&i.to_be_bytes());
     k
-}
-
-fn percentile_us(samples: &mut [u64], p: f64) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    samples.sort_unstable();
-    let idx = ((samples.len() as f64 - 1.0) * p).round() as usize;
-    samples[idx.min(samples.len() - 1)] as f64
 }
 
 fn busy_class(err: &str) -> &'static str {

@@ -2,21 +2,18 @@
 //! `Ping` keepalive must succeed after an idle gap longer than the socket's
 //! internal read-poll interval.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
 const CMD_PING: u8 = 0xF0;
 const PROTO: u8 = 0x01;
-
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
-}
 
 fn ping(stream: &mut TcpStream) -> u8 {
     let frame = [PROTO, CMD_PING, 0, 0, 0, 0];

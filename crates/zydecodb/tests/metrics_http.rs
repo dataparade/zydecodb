@@ -1,17 +1,14 @@
 //! The operability HTTP endpoint serves Prometheus metrics and health probes.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
-
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
-}
 
 fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap();

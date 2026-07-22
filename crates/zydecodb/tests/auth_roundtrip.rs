@@ -1,30 +1,16 @@
-use std::io::{Read, Write};
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::net::TcpStream;
 use std::thread;
-use std::time::Duration;
 use tempfile::TempDir;
 use zydecodb::config::{Config, RequireAuth, SecurityConfig};
 use zydecodb::security::keys::{KeyRole, KeyStore};
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{
-    Command, KeyPayload, PutPayload, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN,
+    Command, KeyPayload, PutPayload, RequestEnvelope,
 };
-
-fn write_request(stream: &mut TcpStream, req: &RequestEnvelope) {
-    stream.write_all(&req.encode()).unwrap();
-    stream.flush().unwrap();
-}
-
-fn read_response(stream: &mut TcpStream) -> ResponseEnvelope {
-    let mut header = [0u8; ENVELOPE_HEADER_LEN];
-    stream.read_exact(&mut header).unwrap();
-    let (status, len) = ResponseEnvelope::parse_header(&header).unwrap();
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream.read_exact(&mut payload).unwrap();
-    }
-    ResponseEnvelope::new(status, payload)
-}
 
 #[test]
 fn auth_required_rejects_anonymous_put() {
@@ -241,12 +227,12 @@ fn tenant_isolation() {
     let handle = thread::spawn(move || server.run(config).unwrap());
 
     let mut stream_a = wait_connect(addr);
-    session_init(&mut stream_a, &secret_a);
+    session_init_ok(&mut stream_a, &secret_a);
     put_key(&mut stream_a, b"shared-name", b"from-a");
     drop(stream_a);
 
     let mut stream_b = wait_connect(addr);
-    session_init(&mut stream_b, &secret_b);
+    session_init_ok(&mut stream_b, &secret_b);
     let get = KeyPayload {
         routing_key: [0u8; 16],
         snapshot_seq: 0,
@@ -313,7 +299,7 @@ fn prefix_acl_denies_out_of_scope_keys() {
     let handle = thread::spawn(move || server.run(config).unwrap());
 
     let mut stream = wait_connect(addr);
-    session_init(&mut stream, &secret);
+    session_init_ok(&mut stream, &secret);
     put_key(&mut stream, b"events:click", b"1");
 
     let get = KeyPayload {
@@ -393,7 +379,7 @@ fn prefix_acl_applies_to_document_collections() {
     let handle = thread::spawn(move || server.run(config).unwrap());
 
     let mut stream = wait_connect(addr);
-    session_init(&mut stream, &secret);
+    session_init_ok(&mut stream, &secret);
 
     // KV-style prefix "events:" allows collection "events".
     let idx = zydecodb_document::wire::IndexDefPayload {
@@ -437,26 +423,6 @@ fn prefix_acl_applies_to_document_collections() {
     drop(stream);
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();
-}
-
-fn wait_connect(addr: std::net::SocketAddr) -> TcpStream {
-    for _ in 0..50 {
-        if let Ok(s) = TcpStream::connect(addr) {
-            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-            return s;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("failed to connect");
-}
-
-fn session_init(stream: &mut TcpStream, secret: &str) {
-    write_request(
-        stream,
-        &RequestEnvelope::new(Command::SessionInit, secret.as_bytes().to_vec()),
-    );
-    assert_eq!(read_response(stream).status, Status::Ok);
 }
 
 fn put_key(stream: &mut TcpStream, key: &[u8], value: &[u8]) {

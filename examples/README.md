@@ -2,6 +2,10 @@
 
 Runnable references for building on top of ZydecoDB. Start here before writing your own client.
 
+**Client codecs:** treat the Python client as the reference implementation; Go and
+TypeScript track the same wire via [`clients/conformance/`](../clients/conformance/).
+Prefer one full `user_backend` language when learning — ports exist for the others.
+
 ## What to run first
 
 | Example | What it shows |

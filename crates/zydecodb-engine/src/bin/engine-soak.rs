@@ -31,6 +31,11 @@ use zydecodb_engine::engine::{Engine, EngineConfig};
 use zydecodb_engine::keys::KS_USER;
 use zydecodb_engine::metrics::Metrics;
 
+#[path = "../soak_util.rs"]
+mod soak_common;
+use soak_common::Lcg;
+
+
 // ---------------------------------------------------------------------------
 // CLI
 
@@ -223,29 +228,7 @@ OPTIONS:
     );
 }
 
-// ---------------------------------------------------------------------------
-// RNG (seeded LCG — same one used in the determinism test for consistency)
-
-struct Lcg(u64);
-impl Lcg {
-    fn new(seed: u64) -> Self {
-        Lcg(seed.max(1))
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-        self.0
-    }
-    fn range_u32(&mut self, n: u32) -> u32 {
-        (self.next_u64() >> 32) as u32 % n
-    }
-    fn range_usize(&mut self, lo: usize, hi_inclusive: usize) -> usize {
-        if hi_inclusive <= lo {
-            return lo;
-        }
-        let span = (hi_inclusive - lo + 1) as u32;
-        lo + self.range_u32(span) as usize
-    }
-}
+// RNG: soak_common::Lcg
 
 // ---------------------------------------------------------------------------
 // Workload
@@ -371,13 +354,7 @@ impl LatencySampler {
     }
 
     fn percentile(&self, p: f64) -> u64 {
-        if self.samples_us.is_empty() {
-            return 0;
-        }
-        let mut sorted = self.samples_us.clone();
-        sorted.sort_unstable();
-        let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
-        sorted[idx.min(sorted.len() - 1)]
+        soak_common::percentile_us_pct(&self.samples_us, p)
     }
 
     fn reset_window(&mut self) {

@@ -1,55 +1,33 @@
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-use zydecodb::config::{Config, RequireAuth, SecurityConfig};
+use zydecodb::config::{RequireAuth, SecurityConfig};
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN};
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
-}
-
-fn base_config(tmp: &TempDir, listen: SocketAddr) -> Config {
-    let data_dir = tmp.path().join("data");
-    let wal_dir = tmp.path().join("wal");
-    std::fs::create_dir_all(&data_dir).unwrap();
-    std::fs::create_dir_all(&wal_dir).unwrap();
-    Config {
-        listen,
-        data_dir,
-        wal_dir,
-        block_cache_mb: 64,
-        max_open_readers: 32,
-        poll_compaction_ms: 50,
-        durability: Default::default(),
-        fsync_interval_ms: 100,
-        shipping: Default::default(),
-        metrics: Default::default(),
-        replica: Default::default(),
-        security: SecurityConfig {
-            require_auth: RequireAuth::False,
-            max_connections: 128,
-            idle_timeout_secs: 2,
-            ..Default::default()
-        },
-        tls: Default::default(),
-        listen_unix: None,
-        runtime: Default::default(),
-        fair: Default::default(),
-    }
+fn tight_limits_config(tmp: &TempDir, listen: std::net::SocketAddr) -> zydecodb::config::Config {
+    let mut cfg = base_config(tmp, listen);
+    cfg.security = SecurityConfig {
+        require_auth: RequireAuth::False,
+        max_connections: 128,
+        idle_timeout_secs: 2,
+        ..Default::default()
+    };
+    cfg
 }
 
 #[test]
 fn test_slowloris_connection_starvation() {
     let tmp = TempDir::new().unwrap();
     let addr = free_addr();
-    let config = base_config(&tmp, addr);
+    let config = tight_limits_config(&tmp, addr);
 
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
@@ -125,7 +103,7 @@ fn test_slowloris_connection_starvation() {
 fn test_json_bomb_oom() {
     let tmp = TempDir::new().unwrap();
     let addr = free_addr();
-    let config = base_config(&tmp, addr);
+    let config = tight_limits_config(&tmp, addr);
 
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
@@ -150,8 +128,7 @@ fn test_json_bomb_oom() {
     }
 
     let payload = zydecodb_engine::frame::PutPayload {
-        routing_key: [0u8; 16],
-        txid: 0,
+        routing_key: [0u8; 16], txid: 0,
         expires_at: 0,
         key: b"bomb".to_vec(),
         value: json.into_bytes(),
