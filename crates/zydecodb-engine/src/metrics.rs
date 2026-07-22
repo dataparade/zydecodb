@@ -16,6 +16,7 @@
 use prometheus::{
     Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -71,11 +72,12 @@ pub struct Metrics {
     pub block_cache_resident_bytes: IntGauge,
     pub block_cache_resident_entries: IntGauge,
 
-    // ---- Result (point lookup) cache ----
+    // ---- Result (point lookup) cache (registered only when enabled) ----
     pub result_cache_hits_total: IntCounter,
     pub result_cache_misses_total: IntCounter,
     pub result_cache_evictions_total: IntCounter,
     pub result_cache_resident_bytes: IntGauge,
+    result_cache_registered: Arc<AtomicBool>,
 
     // ---- Disk accounting ----
     pub disk_bytes_total: IntGauge,
@@ -94,17 +96,47 @@ pub struct Metrics {
 impl Metrics {
     pub fn new() -> Arc<Metrics> {
         let registry = Registry::new();
-        let m = Self::build(registry);
+        let m = Self::build(registry, false);
         Arc::new(m)
+    }
+
+    /// Like [`Self::new`], but registers result-cache series immediately.
+    pub fn new_with_result_cache() -> Arc<Metrics> {
+        let registry = Registry::new();
+        Arc::new(Self::build(registry, true))
     }
 
     /// Build a `Metrics` that registers into a pre-existing registry. Useful
     /// when an embedder wants to share one registry with its own counters.
     pub fn new_in(registry: Registry) -> Arc<Metrics> {
-        Arc::new(Self::build(registry))
+        Arc::new(Self::build(registry, false))
     }
 
-    fn build(registry: Registry) -> Metrics {
+    /// Expose result-cache series on the scrape endpoint. Idempotent; called
+    /// when an engine opens with `result_cache_bytes > 0`.
+    pub fn ensure_result_cache_registered(&self) {
+        if self
+            .result_cache_registered
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.registry
+            .register(Box::new(self.result_cache_hits_total.clone()))
+            .unwrap();
+        self.registry
+            .register(Box::new(self.result_cache_misses_total.clone()))
+            .unwrap();
+        self.registry
+            .register(Box::new(self.result_cache_evictions_total.clone()))
+            .unwrap();
+        self.registry
+            .register(Box::new(self.result_cache_resident_bytes.clone()))
+            .unwrap();
+    }
+
+    fn build(registry: Registry, register_result_cache: bool) -> Metrics {
         let wal_bytes_written_total = IntCounter::with_opts(Opts::new(
             "zydecodb_wal_bytes_written_total",
             "Total bytes written to the WAL",
@@ -440,18 +472,22 @@ impl Metrics {
         registry
             .register(Box::new(block_cache_resident_entries.clone()))
             .unwrap();
-        registry
-            .register(Box::new(result_cache_hits_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(result_cache_misses_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(result_cache_evictions_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(result_cache_resident_bytes.clone()))
-            .unwrap();
+        let result_cache_registered = Arc::new(AtomicBool::new(false));
+        if register_result_cache {
+            registry
+                .register(Box::new(result_cache_hits_total.clone()))
+                .unwrap();
+            registry
+                .register(Box::new(result_cache_misses_total.clone()))
+                .unwrap();
+            registry
+                .register(Box::new(result_cache_evictions_total.clone()))
+                .unwrap();
+            registry
+                .register(Box::new(result_cache_resident_bytes.clone()))
+                .unwrap();
+            result_cache_registered.store(true, Ordering::Relaxed);
+        }
         registry
             .register(Box::new(disk_bytes_total.clone()))
             .unwrap();
@@ -509,6 +545,7 @@ impl Metrics {
             result_cache_misses_total,
             result_cache_evictions_total,
             result_cache_resident_bytes,
+            result_cache_registered,
             disk_bytes_total,
             logical_live_bytes,
             space_amplification,
@@ -542,6 +579,20 @@ mod tests {
         assert!(out.contains("zydecodb_wal_bytes_written_total"));
         assert!(out.contains("zydecodb_sstable_flushes_total"));
         assert!(out.contains("zydecodb_memtable_size_bytes"));
+        assert!(
+            !out.contains("zydecodb_result_cache_hits_total"),
+            "result-cache series stay off the scrape until enabled"
+        );
+    }
+
+    #[test]
+    fn result_cache_metrics_register_on_demand() {
+        let m = Metrics::new();
+        assert!(!m.render().contains("zydecodb_result_cache_hits_total"));
+        m.ensure_result_cache_registered();
+        m.ensure_result_cache_registered(); // idempotent
+        assert!(m.render().contains("zydecodb_result_cache_hits_total"));
+        assert!(m.render().contains("zydecodb_result_cache_resident_bytes"));
     }
 
     #[test]

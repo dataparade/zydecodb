@@ -259,6 +259,9 @@ impl Engine {
     }
 
     pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        if self.result_cache.is_some() {
+            metrics.ensure_result_cache_registered();
+        }
         metrics.last_shutdown_clean.set(self.clean_boot as i64);
         self.apply_scheduler.set_metrics(metrics.clone());
         self.wal_sync.set_metrics(Some(metrics.clone()));
