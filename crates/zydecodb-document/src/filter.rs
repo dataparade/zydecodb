@@ -5,6 +5,7 @@
 //! - Field conditions: `{field: value}` (equality) or `{field: {$op: operand}}`.
 //! - Comparison operators: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type`.
 //! - Array operators: `$all` `$elemMatch` (residual filter only).
+//! - String: `$regex` (gated: max pattern length, `i` flag only, string fields).
 //! - Logical: top-level multiple fields are implicitly ANDed; `$and`/`$or` take
 //!   arrays of sub-filters; `$not` wraps a single sub-filter.
 //! - Dotted paths (`"a.b.c"`) walk nested objects.
@@ -16,8 +17,12 @@
 
 use crate::binary::ValueView;
 use crate::error::{DocError, DocResult};
+use regex::Regex;
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
+
+/// Max `$regex` pattern length (bytes). Longer patterns are rejected at parse.
+pub const MAX_REGEX_PATTERN_LEN: usize = 256;
 
 /// A parsed filter predicate tree.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +60,12 @@ pub enum Atom {
     All(Vec<Value>),
     /// Nested filter evaluated against each array element.
     ElemMatch(Filter),
+    /// Compiled regex; matches string fields only.
+    Regex {
+        pattern: String,
+        case_insensitive: bool,
+        re: Regex,
+    },
 }
 
 impl PartialEq for Atom {
@@ -72,6 +83,18 @@ impl PartialEq for Atom {
             (Atom::Exists(a), Atom::Exists(b)) => a == b,
             (Atom::Type(a), Atom::Type(b)) => a == b,
             (Atom::ElemMatch(a), Atom::ElemMatch(b)) => a == b,
+            (
+                Atom::Regex {
+                    pattern: pa,
+                    case_insensitive: ia,
+                    ..
+                },
+                Atom::Regex {
+                    pattern: pb,
+                    case_insensitive: ib,
+                    ..
+                },
+            ) => pa == pb && ia == ib,
             _ => false,
         }
     }
@@ -164,8 +187,21 @@ fn parse_field(path: &str, val: &Value) -> DocResult<FieldPred> {
     if let Value::Object(map) = val {
         if !map.is_empty() && map.keys().all(|k| k.starts_with('$')) {
             let mut atoms = Vec::with_capacity(map.len());
+            let mut regex_pat: Option<&Value> = None;
+            let mut regex_opts: Option<&Value> = None;
             for (op, operand) in map {
-                atoms.push(parse_atom(op, operand)?);
+                match op.as_str() {
+                    "$regex" => regex_pat = Some(operand),
+                    "$options" => regex_opts = Some(operand),
+                    other => atoms.push(parse_atom(other, operand)?),
+                }
+            }
+            if let Some(pat) = regex_pat {
+                atoms.push(parse_regex(pat, regex_opts)?);
+            } else if regex_opts.is_some() {
+                return Err(DocError::BadFilter(
+                    "$options requires a sibling $regex".into(),
+                ));
             }
             return Ok(FieldPred {
                 path: path.to_string(),
@@ -237,6 +273,72 @@ fn parse_type_name(operand: &Value) -> DocResult<&'static str> {
     })
 }
 
+fn parse_regex(pattern_val: &Value, options_val: Option<&Value>) -> DocResult<Atom> {
+    let pattern = pattern_val
+        .as_str()
+        .ok_or_else(|| DocError::BadFilter("$regex requires a string pattern".into()))?;
+    if pattern.is_empty() {
+        return Err(DocError::BadFilter(
+            "$regex pattern must not be empty".into(),
+        ));
+    }
+    if pattern.len() > MAX_REGEX_PATTERN_LEN {
+        return Err(DocError::BadFilter(format!(
+            "$regex pattern exceeds max length ({MAX_REGEX_PATTERN_LEN})"
+        )));
+    }
+    if looks_like_nested_quantifier_bomb(pattern) {
+        return Err(DocError::BadFilter(
+            "$regex pattern rejected: nested quantifier complexity".into(),
+        ));
+    }
+    let mut case_insensitive = false;
+    if let Some(opts) = options_val {
+        let s = opts
+            .as_str()
+            .ok_or_else(|| DocError::BadFilter("$options requires a string".into()))?;
+        for ch in s.chars() {
+            match ch {
+                'i' => case_insensitive = true,
+                other => {
+                    return Err(DocError::BadFilter(format!(
+                        "unsupported $regex option '{other}' (only 'i' is allowed)"
+                    )))
+                }
+            }
+        }
+    }
+    let re = Regex::new(&format!(
+        "{}{}",
+        if case_insensitive { "(?i)" } else { "" },
+        pattern
+    ))
+    .map_err(|e| DocError::BadFilter(format!("invalid $regex: {e}")))?;
+    Ok(Atom::Regex {
+        pattern: pattern.to_string(),
+        case_insensitive,
+        re,
+    })
+}
+
+/// Cheap rejection of classic nested-quantifier ReDoS shapes like `(a+)+`.
+fn looks_like_nested_quantifier_bomb(pattern: &str) -> bool {
+    let b = pattern.as_bytes();
+    if b.len() < 3 {
+        return false;
+    }
+    for i in 0..b.len() - 2 {
+        // `)+)` / `*)*` — quantified group immediately closed again.
+        if b[i] == b')' && matches!(b[i + 1], b'+' | b'*') && b[i + 2] == b')' {
+            return true;
+        }
+        // `+)+` / `*)+` — quantifier inside a group that is itself quantified.
+        if matches!(b[i], b'+' | b'*') && b[i + 1] == b')' && matches!(b[i + 2], b'+' | b'*') {
+            return true;
+        }
+    }
+    false
+}
 
 impl FieldPred {
     fn matches(&self, doc: ValueView<'_>, doc_id: Option<&[u8]>) -> bool {
@@ -287,6 +389,10 @@ impl Atom {
             },
             Atom::ElemMatch(sub) => match field.and_then(|v| v.as_array()) {
                 Some(arr) => (0..arr.len()).any(|i| sub.matches(arr.get(i).unwrap(), None)),
+                None => false,
+            },
+            Atom::Regex { re, .. } => match field.and_then(|v| v.as_str()) {
+                Some(s) => re.is_match(s),
                 None => false,
             },
         }
@@ -561,8 +667,19 @@ mod tests {
     }
 
     #[test]
-    fn regex_still_rejected() {
-        assert!(Filter::parse(&json!({"a": {"$regex": "x"}})).is_err());
+    fn regex_gated() {
+        let f = parse(json!({"name": {"$regex": "^ad", "$options": "i"}}));
+        assert!(check_matches(&f, &json!({"name": "Ada"})));
+        assert!(!check_matches(&f, &json!({"name": "Bo"})));
+        // Non-string fields never match.
+        assert!(!check_matches(&f, &json!({"name": 1})));
+        assert!(Filter::parse(&json!({"a": {"$regex": ""}})).is_err());
+        assert!(
+            Filter::parse(&json!({"a": {"$regex": "x".repeat(MAX_REGEX_PATTERN_LEN + 1)}}))
+                .is_err()
+        );
+        assert!(Filter::parse(&json!({"a": {"$regex": "(a+)+"}})).is_err());
+        assert!(Filter::parse(&json!({"a": {"$regex": "x", "$options": "m"}})).is_err());
     }
 
     #[test]

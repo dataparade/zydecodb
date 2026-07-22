@@ -14,6 +14,7 @@ path = "src/lib.rs"
 zydecodb-engine = { path = "../zydecodb-engine" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

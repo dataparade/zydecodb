@@ -369,9 +369,8 @@ fn find_update_delete_count_over_wire() {
     handle.join().unwrap();
 }
 
-
 #[test]
-fn filter_type_array_over_wire() {
+fn filter_type_array_regex_over_wire() {
     let (addr, shutdown, handle) = spawn_ephemeral_server();
     let mut s = connect(addr);
 
@@ -401,6 +400,14 @@ fn filter_type_array_over_wire() {
         r#"{"items":{"$elemMatch":{"x":1,"y":{"$gt":1}}}}"#,
     );
     assert_eq!(hits.len(), 1);
+
+    let hits = find(
+        &mut s,
+        "misc",
+        r#"{"name":{"$regex":"^ad","$options":"i"}}"#,
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["name"], serde_json::json!("Ada"));
 
     drop(s);
     *shutdown.lock().unwrap() = true;

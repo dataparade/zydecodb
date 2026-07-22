@@ -65,6 +65,7 @@ Filters are JSON documents (`filter.rs`):
 |----------|-----------|
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$in` `$nin` `$exists` `$type` |
 | Array | `$all` `$elemMatch` |
+| String | `$regex` (gated: max pattern length 256, `i` flag only, string fields, residual scan) |
 | Logical | implicit-AND (`{a: 1, b: 2}`), `$and`, `$or`, `$not` (wraps one sub-filter) |
 | Paths | dotted (`"address.city"`); `_id` is a virtual always-present field |
 
@@ -265,7 +266,6 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 ## Not yet
 
 - Aggregation pipeline (`$group` / `$lookup` / `$unwind`)
-- `$regex` (gated)
 - Projection pushdown / covered queries (the body is always fetched)
 - `$setOnInsert` and other upsert edge-case Mongo parity
 - TTL indexes / `expireAfterSeconds` on a date field (per-document `expires_at` on
