@@ -1,6 +1,9 @@
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
+use zydecodb_engine::engine::EngineConfig;
+use zydecodb_engine::tenant_fair::FairConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -42,6 +45,98 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// δ-fair multi-tenant isolation (pods). Off by default — enable when
+    /// hosting multiple tenants on one process. See `docs/SECURITY.md`.
+    #[serde(default)]
+    pub fair: FairTomlConfig,
+}
+
+/// TOML surface for [`FairConfig`]. Durations are milliseconds.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FairTomlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_fair_delta_steady_ms")]
+    pub delta_steady_ms: u64,
+    #[serde(default = "default_fair_delta_buffer_ms")]
+    pub delta_buffer_ms: u64,
+    #[serde(default = "default_fair_delta_cache_ms")]
+    pub delta_cache_ms: u64,
+    #[serde(default = "default_fair_ramp_up_k")]
+    pub ramp_up_k: u32,
+    #[serde(default = "default_fair_tenant_count")]
+    pub tenant_count: u32,
+    /// 0 = derive from memtable flush threshold at engine open.
+    #[serde(default)]
+    pub memtable_total_mb: u64,
+    #[serde(default)]
+    pub fork_b_l0_domains: bool,
+    #[serde(default = "default_fair_fork_b_l0_files")]
+    pub fork_b_l0_file_threshold: u64,
+    /// Optional override for L0 write-stall file count (engine).
+    #[serde(default)]
+    pub l0_write_stall_threshold: Option<usize>,
+}
+
+impl Default for FairTomlConfig {
+    fn default() -> Self {
+        FairTomlConfig {
+            enabled: false,
+            delta_steady_ms: default_fair_delta_steady_ms(),
+            delta_buffer_ms: default_fair_delta_buffer_ms(),
+            delta_cache_ms: default_fair_delta_cache_ms(),
+            ramp_up_k: default_fair_ramp_up_k(),
+            tenant_count: default_fair_tenant_count(),
+            memtable_total_mb: 0,
+            fork_b_l0_domains: false,
+            fork_b_l0_file_threshold: default_fair_fork_b_l0_files(),
+            l0_write_stall_threshold: None,
+        }
+    }
+}
+
+impl FairTomlConfig {
+    pub fn to_fair_config(
+        &self,
+        block_cache_bytes: usize,
+        memtable_flush_threshold: usize,
+    ) -> FairConfig {
+        let mut fair = FairConfig::default();
+        fair.enabled = self.enabled;
+        fair.delta_steady = Duration::from_millis(self.delta_steady_ms);
+        fair.delta_buffer = Duration::from_millis(self.delta_buffer_ms);
+        fair.delta_cache = Duration::from_millis(self.delta_cache_ms);
+        fair.ramp_up_k = self.ramp_up_k.max(1);
+        fair.tenant_count = self.tenant_count.max(1);
+        fair.cache_total_bytes = block_cache_bytes as u64;
+        fair.memtable_total_bytes = if self.memtable_total_mb > 0 {
+            self.memtable_total_mb.saturating_mul(1024 * 1024)
+        } else {
+            memtable_flush_threshold as u64
+        };
+        fair.fork_b_l0_domains = self.fork_b_l0_domains;
+        fair.fork_b_l0_file_threshold = self.fork_b_l0_file_threshold.max(1);
+        fair
+    }
+}
+
+fn default_fair_delta_steady_ms() -> u64 {
+    50
+}
+fn default_fair_delta_buffer_ms() -> u64 {
+    350
+}
+fn default_fair_delta_cache_ms() -> u64 {
+    250
+}
+fn default_fair_ramp_up_k() -> u32 {
+    6
+}
+fn default_fair_tenant_count() -> u32 {
+    8
+}
+fn default_fair_fork_b_l0_files() -> u64 {
+    8
 }
 
 /// Per-process runtime tuning. The `low_footprint` profile shrinks resource
@@ -116,8 +211,8 @@ pub struct ShippingConfig {
 
 /// Load a shipping/replica HMAC key file: raw bytes, must be non-empty.
 pub fn load_hmac_key(path: &PathBuf) -> Result<Vec<u8>, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("hmac_key_file {}: {}", path.display(), e))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("hmac_key_file {}: {}", path.display(), e))?;
     if bytes.iter().all(|b| b.is_ascii_whitespace()) {
         return Err(format!("hmac_key_file {} is empty", path.display()));
     }
@@ -369,6 +464,54 @@ impl Config {
             RequireAuth::False => false,
             RequireAuth::Auto => !self.listen.ip().is_loopback(),
         }
+    }
+
+    /// Build the engine open config (serve + offline admin share this path).
+    pub fn to_engine_config(&self) -> EngineConfig {
+        let block_cache_bytes = self.block_cache_mb.saturating_mul(1024 * 1024);
+        let memtable_flush_threshold = zydecodb_engine::keys::MEMTABLE_FLUSH_THRESHOLD;
+        EngineConfig {
+            data_dir: self.data_dir.clone(),
+            wal_dir: self.wal_dir.clone(),
+            block_cache_bytes,
+            max_open_readers: self.max_open_readers,
+            fair: self
+                .fair
+                .to_fair_config(block_cache_bytes, memtable_flush_threshold),
+            l0_write_stall_threshold: self.fair.l0_write_stall_threshold,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fair_toml_deserializes_and_maps_to_engine() {
+        let toml = r#"
+listen = "127.0.0.1:9470"
+data_dir = "/tmp/d"
+wal_dir = "/tmp/w"
+block_cache_mb = 64
+[fair]
+enabled = true
+tenant_count = 4
+delta_steady_ms = 50
+delta_buffer_ms = 350
+memtable_total_mb = 32
+fork_b_l0_domains = false
+l0_write_stall_threshold = 8
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.fair.enabled);
+        assert_eq!(cfg.fair.tenant_count, 4);
+        let eng = cfg.to_engine_config();
+        assert!(eng.fair.enabled);
+        assert_eq!(eng.fair.tenant_count, 4);
+        assert_eq!(eng.fair.memtable_total_bytes, 32 * 1024 * 1024);
+        assert_eq!(eng.l0_write_stall_threshold, Some(8));
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::admin_dispatch::{handle_admin_drop_tenant, is_admin_command};
 use crate::commit::{CommitCoordinator, DurabilityMode};
 use crate::config::{Config, DurabilityMode as ConfigDurability};
 use crate::dispatch::{handle_request, write_response};
@@ -14,14 +15,12 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use zydecodb_document::catalog::Catalog;
 use zydecodb_engine::engine::{Engine, EngineConfig};
+use zydecodb_engine::engine_handle::EngineHandle;
 use zydecodb_engine::frame::Command;
 
-/// The engine is shared across connection threads behind a mutex. The engine
-/// uses `&mut self` for all writes (single-owner design), so the mutex
-/// serializes engine operations: this buys fairness (no single connection can
-/// monopolize the engine) rather than parallelism. Long reads acquire the lock
-/// only briefly to build an owned snapshot, then release it.
-type SharedEngine = Arc<Mutex<Engine>>;
+/// Shared engine with factorized locks (Phase 4): write mutex for memtable/
+/// WAL/catalog; block cache, fair-share, and WAL sync are separate domains.
+type SharedEngine = Arc<EngineHandle>;
 
 /// Optional per-tenant request metrics, registered on the shared Prometheus
 /// registry when `[metrics].per_tenant` is set. A single counter vector keeps
@@ -251,13 +250,14 @@ impl Server {
             }
         }
 
-        let engine_cfg = EngineConfig {
-            data_dir: config.data_dir.clone(),
-            wal_dir: config.wal_dir.clone(),
-            block_cache_bytes: config.block_cache_mb.saturating_mul(1024 * 1024),
-            max_open_readers: config.max_open_readers,
-            ..Default::default()
-        };
+        let engine_cfg = config.to_engine_config();
+        if engine_cfg.fair.enabled {
+            info!(
+                tenants = engine_cfg.fair.tenant_count,
+                delta_steady_ms = engine_cfg.fair.delta_steady.as_millis() as u64,
+                "δ-fair multi-tenant isolation enabled"
+            );
+        }
 
         // Read-replica mode: ingest verified WAL segments shipped by a primary
         // into our WAL dir before opening, so the initial replay already
@@ -357,7 +357,7 @@ impl Server {
             Catalog::load(&engine).map_err(|e| e.to_string())?,
         ));
 
-        let engine: SharedEngine = Arc::new(Mutex::new(engine));
+        let engine: SharedEngine = EngineHandle::new(engine);
 
         // Durability: the engine buffers WAL appends; the commit coordinator owns
         // the fsync so acknowledged writes are durable by default (or on a bounded
@@ -368,7 +368,7 @@ impl Server {
                 interval: Duration::from_millis(config.fsync_interval_ms.max(1)),
             },
         };
-        let commit = CommitCoordinator::new(Arc::clone(&engine), durability);
+        let commit = CommitCoordinator::new(&engine, durability);
         let commit_thread = commit.spawn()?;
         info!(?durability, "commit coordinator started");
 
@@ -448,7 +448,7 @@ impl Server {
                     if *shutdown.lock().unwrap() {
                         break;
                     }
-                    if let Ok(mut e) = engine.lock() {
+                    if let Ok(mut e) = engine.try_write() {
                         let _ = e.poll_compaction();
                     }
                     if wait_or_shutdown(&shutdown, &wake, poll_interval) {
@@ -474,7 +474,7 @@ impl Server {
                             if *shutdown.lock().unwrap() {
                                 break;
                             }
-                            let seq = engine.lock().map(|e| e.current_seq()).unwrap_or(0);
+                            let seq = engine.try_write().map(|e| e.current_seq()).unwrap_or(0);
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
@@ -496,10 +496,32 @@ impl Server {
             _ => None,
         };
 
+        // Lazy TTL sweep: expire engine-level `expires_at` entries on a cadence
+        // so document TTL (and raw-KV TTL) become unreachable without waiting
+        // for a natural read.
+        let sweep_thread = {
+            let engine = Arc::clone(&engine);
+            let shutdown = Arc::clone(&self.shutdown);
+            let wake = Arc::clone(&self.wake);
+            let interval = Duration::from_secs(30);
+            thread::Builder::new()
+                .name("zydecodb-ttl-sweep".into())
+                .spawn(move || loop {
+                    if wait_or_shutdown(&shutdown, &wake, interval) {
+                        break;
+                    }
+                    if let Ok(mut e) = engine.try_write() {
+                        match e.sweep_expired() {
+                            Ok(n) if n > 0 => info!(expired = n, "TTL sweep removed entries"),
+                            Ok(_) => {}
+                            Err(err) => warn!(error = %err, "TTL sweep failed"),
+                        }
+                    }
+                })?
+        };
+
         // Replica catch-up: periodically ingest newly shipped segments, then
-        // reopen the engine (flush current state to SSTables + replay the new
-        // WAL) and reload the catalog from the fresh engine. Reopen happens under
-        // the engine lock so no reader observes a half-applied state.
+        // apply them into the live engine (incremental) or reopen on failure.
         let replica_thread: Option<JoinHandle<()>> = match replica.take() {
             Some(mut rep) => {
                 let engine = Arc::clone(&engine);
@@ -534,10 +556,14 @@ impl Server {
                             }
                             match rep.sync() {
                                 Ok(out) if out.made_progress() => {
-                                    if let Err(e) =
-                                        reopen_replica(&engine, &catalog, &metrics, &engine_cfg)
-                                    {
-                                        error!(error = %e, "replica reopen failed");
+                                    if let Err(e) = catch_up_replica(
+                                        &engine,
+                                        &catalog,
+                                        &metrics,
+                                        &engine_cfg,
+                                        &out.installed,
+                                    ) {
+                                        error!(error = %e, "replica catch-up failed");
                                     } else {
                                         info!(
                                             installed = ?out.installed,
@@ -732,36 +758,75 @@ impl Server {
         if let Some(h) = heartbeat_thread {
             let _ = h.join();
         }
+        let _ = sweep_thread.join();
         if let Some(h) = metrics_http {
             let _ = h.join();
         }
 
-        engine.lock().unwrap().shutdown()?;
+        engine.write().shutdown()?;
         Ok(())
     }
 }
 
-/// Replay newly ingested WAL segments into the served engine by reopening it.
+/// Apply newly installed WAL segments into the live engine (happy path).
+/// Falls back to full reopen if incremental apply fails.
 ///
-/// Held under the engine lock for the whole swap so no reader sees a partial
-/// state. `shutdown()` first flushes the current (already-applied) data to
-/// SSTables and truncates the WAL it covers, so the subsequent `open` replays
-/// only the freshly installed segments — making catch-up bounded — and the old
-/// engine is quiescent before it is dropped. The catalog is then reloaded from
-/// the fresh engine since shipped writes may include catalog updates.
+/// Incremental apply holds the engine lock only for flush+replay of new
+/// segments (no second `Engine::open` on the happy path). Full reopen remains
+/// for corruption / apply failures: shutdown under the lock, open replacement,
+/// swap, reload catalog.
+fn catch_up_replica(
+    engine: &SharedEngine,
+    catalog: &SharedCatalog,
+    metrics: &Arc<zydecodb_engine::metrics::Metrics>,
+    engine_cfg: &EngineConfig,
+    installed: &[u64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    {
+        let mut guard = engine.write();
+        for &segment_id in installed {
+            if let Err(e) = guard.apply_installed_wal_segment(segment_id) {
+                warn!(
+                    error = %e,
+                    segment_id,
+                    "incremental replica apply failed; falling back to reopen"
+                );
+                drop(guard);
+                return reopen_replica(engine, catalog, metrics, engine_cfg);
+            }
+        }
+        let cat = Catalog::load(&*guard).map_err(|e| e.to_string())?;
+        drop(guard);
+        *catalog.write().unwrap() = cat;
+    }
+    info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        segments = installed.len(),
+        "replica catch-up (incremental apply)"
+    );
+    Ok(())
+}
+
+/// Full engine reopen fallback for replica catch-up.
 fn reopen_replica(
     engine: &SharedEngine,
     catalog: &SharedCatalog,
     metrics: &Arc<zydecodb_engine::metrics::Metrics>,
     engine_cfg: &EngineConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut guard = engine.lock().unwrap();
+    let started = std::time::Instant::now();
+    let mut guard = engine.write();
     guard.shutdown()?;
     let fresh = Engine::open(engine_cfg.clone())?.with_metrics(Arc::clone(metrics));
     let cat = Catalog::load(&fresh).map_err(|e| e.to_string())?;
     *guard = fresh;
     drop(guard);
     *catalog.write().unwrap() = cat;
+    warn!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "replica catch-up (full reopen fallback)"
+    );
     Ok(())
 }
 
@@ -848,6 +913,7 @@ fn is_write_command(cmd: Command) -> bool {
             | Command::Update
             | Command::Delete
             | Command::IndexDef
+            | Command::AdminDropTenant
     )
 }
 
@@ -967,7 +1033,9 @@ fn serve_stream<S: Read + Write>(
         // command (no lock for control commands, a brief snapshot capture for
         // Get/Stats, the write under the lock for Put/Del) -- never across
         // socket I/O.
-        let response = if is_document_command(req.command) {
+        let response = if is_admin_command(req.command) {
+            handle_admin_drop_tenant(engine, catalog, &req, &session, security)
+        } else if is_document_command(req.command) {
             handle_document(engine, catalog, commit, &req, &session, security)
         } else {
             let outcome = handle_request(engine, req, session, security);
@@ -1041,7 +1109,9 @@ fn fill<S: Read>(
     let mut filled = 0;
     let started = Instant::now();
     let mut last_byte = Instant::now();
-    let timeout = idle_timeout.unwrap_or(MESSAGE_READ_TIMEOUT).min(MESSAGE_READ_TIMEOUT);
+    let timeout = idle_timeout
+        .unwrap_or(MESSAGE_READ_TIMEOUT)
+        .min(MESSAGE_READ_TIMEOUT);
 
     while filled < buf.len() {
         if *shutdown.lock().unwrap() {
@@ -1079,7 +1149,11 @@ fn fill<S: Read>(
 
 /// Read one request frame, distinguishing "idle between frames" from "client
 /// closed" from "stream error".
-fn read_message<S: Read>(stream: &mut S, shutdown: &Arc<Mutex<bool>>, idle_timeout: Option<Duration>) -> ReadOutcome {
+fn read_message<S: Read>(
+    stream: &mut S,
+    shutdown: &Arc<Mutex<bool>>,
+    idle_timeout: Option<Duration>,
+) -> ReadOutcome {
     use zydecodb_engine::frame::{RequestEnvelope, ENVELOPE_HEADER_LEN};
 
     let mut header = [0u8; ENVELOPE_HEADER_LEN];

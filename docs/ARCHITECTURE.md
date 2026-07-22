@@ -105,3 +105,15 @@ match crate::security::keys::KeyStore::load(&keys_file) {
     Err(e) => warn!(error = %e, "SIGHUP reload failed"),
 }
 ```
+
+---
+
+## Not shipping (superseded)
+
+| Direction | Replaced by |
+|-----------|-------------|
+| FlatBuffers typed values | **ZDoc** binary (`VK_ZDOC = 0x01`) in `zydecodb-document` |
+| Glommio / io_uring / thread-per-core | **std threads** + `EngineHandle` (write mutex + separate cache/fair/WAL sync domains) |
+| RESP2 Redis wire / HTTP REST document API | **Length-prefixed binary** frames on TCP/UDS (`zydecodb-engine::frame`) |
+
+Sources of truth: [`DOCUMENT_STORE.md`](DOCUMENT_STORE.md), this file, [`SECURITY.md`](SECURITY.md).

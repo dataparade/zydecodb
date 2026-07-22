@@ -69,6 +69,7 @@ fn rate_limit_returns_engine_busy() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();
@@ -128,6 +129,7 @@ fn tenant_quota_rejects_oversized_write() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use zydecodb_engine::engine::{Engine, EngineConfig, BatchOp};
+use zydecodb_engine::engine::{BatchOp, Engine, EngineConfig};
 
 fn base_config(tmp: &TempDir) -> EngineConfig {
     let data_dir = tmp.path().join("data");
@@ -27,11 +27,13 @@ fn test_crash_resilience_torn_write() {
         let mut key = vec![0x01];
         key.extend_from_slice(format!("k{}", i).as_bytes());
         let value = format!("v{}", i).into_bytes();
-        engine.write_batch(vec![BatchOp::Put {
-            key,
-            value,
-            expires_at: 0,
-        }]).unwrap();
+        engine
+            .write_batch(vec![BatchOp::Put {
+                key,
+                value,
+                expires_at: 0,
+            }])
+            .unwrap();
     }
 
     // 2. Inject a simulated crash during a write
@@ -39,11 +41,13 @@ fn test_crash_resilience_torn_write() {
     // First, let's write a batch that we will corrupt.
     let mut torn_key = vec![0x01];
     torn_key.extend_from_slice(b"torn_key");
-    engine.write_batch(vec![BatchOp::Put {
-        key: torn_key.clone(),
-        value: b"torn_value".to_vec(),
-        expires_at: 0,
-    }]).unwrap();
+    engine
+        .write_batch(vec![BatchOp::Put {
+            key: torn_key.clone(),
+            value: b"torn_value".to_vec(),
+            expires_at: 0,
+        }])
+        .unwrap();
     engine.sync_wal().unwrap();
 
     // Close the engine cleanly first so we can manipulate the file
@@ -51,7 +55,13 @@ fn test_crash_resilience_torn_write() {
 
     // 3. Truncate the last 2 bytes of the active WAL segment
     let wal_dir = config.wal_dir.clone();
-    println!("wal_dir contents: {:?}", std::fs::read_dir(&wal_dir).unwrap().map(|e| e.unwrap().path()).collect::<Vec<_>>());
+    println!(
+        "wal_dir contents: {:?}",
+        std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect::<Vec<_>>()
+    );
     let mut active_wal = None;
     for entry in std::fs::read_dir(&wal_dir).unwrap() {
         let entry = entry.unwrap();
@@ -64,7 +74,10 @@ fn test_crash_resilience_torn_write() {
         }
     }
     let active_wal = active_wal.unwrap();
-    let file = std::fs::OpenOptions::new().write(true).open(&active_wal).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&active_wal)
+        .unwrap();
     let len = file.metadata().unwrap().len();
     assert!(len > 2);
     file.set_len(len - 2).unwrap(); // Truncate the last 2 bytes (CRC32 footer)
@@ -73,7 +86,10 @@ fn test_crash_resilience_torn_write() {
     // 4. Restart the server (re-open the Engine)
     // It should recover successfully, discarding the torn write, but keeping the first 100.
     let engine_res = Engine::open(config);
-    assert!(engine_res.is_ok(), "VULNERABILITY SURFACED: Engine failed to recover from torn write!");
+    assert!(
+        engine_res.is_ok(),
+        "VULNERABILITY SURFACED: Engine failed to recover from torn write!"
+    );
     let engine = engine_res.unwrap();
 
     // Verify the first 100 keys exist
@@ -86,5 +102,8 @@ fn test_crash_resilience_torn_write() {
 
     // Verify the torn key does NOT exist
     let torn_val = engine.get(&torn_key).unwrap();
-    assert!(torn_val.is_none(), "Torn key should not have been recovered!");
+    assert!(
+        torn_val.is_none(),
+        "Torn key should not have been recovered!"
+    );
 }

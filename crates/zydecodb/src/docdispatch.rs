@@ -9,7 +9,7 @@
 use crate::commit::CommitCoordinator;
 use crate::security::keys::KeyRole;
 use crate::security::{SecurityRuntime, SessionState};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use zydecodb_document::catalog::Catalog;
 use zydecodb_document::error::{DocError, DocResult};
 use zydecodb_document::filter::Filter;
@@ -21,7 +21,7 @@ use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope};
 use zydecodb_engine::keys::KS_USER;
 
-pub type SharedEngine = Arc<Mutex<Engine>>;
+pub type SharedEngine = Arc<zydecodb_engine::engine_handle::EngineHandle>;
 pub type SharedCatalog = Arc<RwLock<Catalog>>;
 
 /// Whether a command is handled by the document layer.
@@ -58,11 +58,16 @@ fn err_response(e: &DocError) -> ResponseEnvelope {
     ResponseEnvelope::error(e.status(), &e.to_string())
 }
 
+/// Apply write slowdown after the engine mutex is released.
+fn apply_pending_slowdown(slowdown: std::time::Duration) {
+    Engine::apply_write_slowdown(slowdown);
+}
+
 /// Capture a read snapshot for a paginated read. When the request carries a
 /// cursor, re-pin the same sequence ceiling the first page used (repeatable-read
 /// pagination) via `snapshot_at`; otherwise capture the latest committed state.
 fn read_snapshot(engine: &SharedEngine, cursor: Option<&[u8]>) -> zydecodb_engine::SnapshotHandle {
-    let guard = engine.lock().unwrap();
+    let guard = engine.write();
     match query::cursor_snapshot_seq(cursor) {
         Some(seq) => guard.snapshot_at(seq),
         None => guard.snapshot_owned(),
@@ -165,7 +170,7 @@ fn doc_put(
         Ok(p) => p,
         Err(e) => return err_response(&e),
     };
-    
+
     // Parse incoming JSON and build ZDoc
     let json_val: serde_json::Value = match serde_json::from_slice(&p.body) {
         Ok(v) => v,
@@ -182,34 +187,51 @@ fn doc_put(
         cat.collection(prefix, &p.collection).is_none()
     };
     if missing {
-        let ddl_seq = {
+        let (ddl_seq, slowdown) = {
             let mut cat = catalog.write().unwrap();
             if cat.collection(prefix, &p.collection).is_none() {
                 let mut working = cat.clone();
                 working.ensure_collection(prefix, &p.collection);
-                let mut guard = engine.lock().unwrap();
+                let mut guard = engine.write();
                 if let Err(e) = working.persist(&mut guard) {
+                    let s = guard.take_write_slowdown();
+                    drop(guard);
+                    apply_pending_slowdown(s);
                     return err_response(&e);
                 }
                 let seq = guard.last_buffered_seq();
+                let s = guard.take_write_slowdown();
                 drop(guard);
                 *cat = working;
-                Some(seq)
+                (Some(seq), s)
             } else {
-                None // another writer created it between our check and lock
+                (None, std::time::Duration::ZERO) // another writer created it
             }
         };
+        apply_pending_slowdown(slowdown);
         if let Some(seq) = ddl_seq {
             commit.commit(seq, false);
         }
     }
 
     // Lock order: catalog (read) then engine, consistent across all writers.
-    let outcome = {
+    let (outcome, slowdown) = {
         let cat = catalog.read().unwrap();
-        let mut guard = engine.lock().unwrap();
-        store::upsert(&mut guard, &cat, prefix, &p.collection, &p.doc_id, &zdoc_bytes, true)
+        let mut guard = engine.write();
+        let r = store::upsert_with_expiry(
+            &mut guard,
+            &cat,
+            prefix,
+            &p.collection,
+            &p.doc_id,
+            &zdoc_bytes,
+            true,
+            p.expires_at,
+        );
+        let s = guard.take_write_slowdown();
+        (r, s)
     };
+    apply_pending_slowdown(slowdown);
     match outcome {
         Ok(seq) => {
             commit.commit(seq, p.relaxed);
@@ -230,13 +252,15 @@ fn doc_del(
         Ok(p) => p,
         Err(e) => return err_response(&e),
     };
-    let outcome = {
+    let (outcome, slowdown) = {
         let cat = catalog.read().unwrap();
-        let mut guard = engine.lock().unwrap();
+        let mut guard = engine.write();
         let r = store::delete(&mut guard, &cat, prefix, &p.collection, &p.doc_id);
         let seq = guard.last_buffered_seq();
-        (r, seq)
+        let s = guard.take_write_slowdown();
+        ((r, seq), s)
     };
+    apply_pending_slowdown(slowdown);
     match outcome.0 {
         Ok(deleted) => {
             // A delete-by-id is always durable-by-default (no relaxed flag on
@@ -262,9 +286,9 @@ fn index_def(
     // Hold the catalog write lock for the whole DDL (serializing concurrent
     // DDL), and the engine lock for the backfill + catalog commit. Same
     // catalog-before-engine order as the write path, so no deadlock.
-    let outcome = {
+    let (outcome, slowdown) = {
         let mut cat = catalog.write().unwrap();
-        let mut guard = engine.lock().unwrap();
+        let mut guard = engine.write();
         let r = store::define_index(
             &mut guard,
             &mut cat,
@@ -275,8 +299,10 @@ fn index_def(
             p.unique,
         );
         let seq = guard.last_buffered_seq();
-        (r, seq)
+        let s = guard.take_write_slowdown();
+        ((r, seq), s)
     };
+    apply_pending_slowdown(slowdown);
     match outcome.0 {
         Ok(()) => {
             // DDL is always made durable before acknowledging.
@@ -301,7 +327,7 @@ fn query_cmd(
         wire::QueryPayload::ById { collection, doc_id } => {
             // Phase 1: capture a snapshot under the engine lock, then release.
             let snap = {
-                let guard = engine.lock().unwrap();
+                let guard = engine.write();
                 guard.snapshot_owned()
             };
             let cat = catalog.read().unwrap();
@@ -375,14 +401,7 @@ fn find_cmd(
     };
     let snap = read_snapshot(engine, spec.cursor.as_deref());
     let cat = catalog.read().unwrap();
-    let page = query::execute_find(
-        &snap,
-        &cat,
-        prefix,
-        &p.collection,
-        &spec,
-        max_sort_buffer,
-    )?;
+    let page = query::execute_find(&snap, &cat, prefix, &p.collection, &spec, max_sort_buffer)?;
     Ok(ResponseEnvelope::ok(wire::encode_query_page(&page)))
 }
 
@@ -413,9 +432,9 @@ fn update_cmd(
         p.multi,
         max_sort_buffer,
     )?;
-    let (modified, seq) = {
+    let ((modified, seq), slowdown) = {
         let cat = catalog.read().unwrap();
-        let mut guard = engine.lock().unwrap();
+        let mut guard = engine.write();
         let modified = update::apply_to_ids(
             &mut guard,
             &cat,
@@ -426,8 +445,10 @@ fn update_cmd(
             Some(&filter),
         )?;
         let seq = guard.last_buffered_seq();
-        (modified, seq)
+        let s = guard.take_write_slowdown();
+        ((modified, seq), s)
     };
+    apply_pending_slowdown(slowdown);
     // Stale candidates were skipped by the under-lock re-check; every counted
     // document both matched and was rewritten.
     let matched = modified;
@@ -459,14 +480,16 @@ fn delete_cmd(
         p.multi,
         max_sort_buffer,
     )?;
-    let (deleted, seq) = {
+    let ((deleted, seq), slowdown) = {
         let cat = catalog.read().unwrap();
-        let mut guard = engine.lock().unwrap();
+        let mut guard = engine.write();
         let deleted =
             store::delete_ids(&mut guard, &cat, prefix, &p.collection, &ids, Some(&filter))?;
         let seq = guard.last_buffered_seq();
-        (deleted, seq)
+        let s = guard.take_write_slowdown();
+        ((deleted, seq), s)
     };
+    apply_pending_slowdown(slowdown);
     commit.commit(seq, p.relaxed);
     Ok(ResponseEnvelope::ok(
         format!("{{\"deleted\":{deleted}}}").into_bytes(),
@@ -485,7 +508,7 @@ fn select_candidates(
     max_sort_buffer: usize,
 ) -> DocResult<Vec<Vec<u8>>> {
     let snap = {
-        let guard = engine.lock().unwrap();
+        let guard = engine.write();
         guard.snapshot_owned()
     };
     let cat = catalog.read().unwrap();
@@ -509,7 +532,7 @@ fn count_cmd(
 ) -> DocResult<ResponseEnvelope> {
     let p = wire::CountPayload::decode(payload)?;
     let snap = {
-        let guard = engine.lock().unwrap();
+        let guard = engine.write();
         guard.snapshot_owned()
     };
     let cat = catalog.read().unwrap();
@@ -549,7 +572,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
-    use zydecodb_engine::engine::EngineConfig;
+    use zydecodb_engine::engine::{Engine, EngineConfig};
 
     fn rand_suffix() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -573,14 +596,14 @@ mod tests {
 
     fn fixture(seed_ids: &[&str]) -> Fixture {
         let dir = std::env::temp_dir().join(format!("zydeco-docrelax-{}", rand_suffix()));
-        let engine = Arc::new(Mutex::new(
+        let engine = zydecodb_engine::engine_handle::EngineHandle::new(
             Engine::open(EngineConfig {
                 data_dir: dir.join("data"),
                 wal_dir: dir.join("wal"),
                 ..Default::default()
             })
             .unwrap(),
-        ));
+        );
         let catalog = Arc::new(RwLock::new(Catalog::default()));
         let prefix = vec![KS_USER];
         catalog.write().unwrap().ensure_collection(&prefix, "c");
@@ -588,14 +611,22 @@ mod tests {
         // commit wait needed — the data is visible from the memtable at once).
         {
             let cat = catalog.read().unwrap();
-            let mut e = engine.lock().unwrap();
+            let mut e = engine.write();
             for id in seed_ids {
                 let body = format!("{{\"_id\":\"{id}\",\"n\":1}}");
-                store::upsert(&mut e, &cat, &prefix, "c", id.as_bytes(), body.as_bytes(), false)
-                    .unwrap();
+                store::upsert(
+                    &mut e,
+                    &cat,
+                    &prefix,
+                    "c",
+                    id.as_bytes(),
+                    body.as_bytes(),
+                    false,
+                )
+                .unwrap();
             }
         }
-        let commit = CommitCoordinator::new(Arc::clone(&engine), DurabilityMode::Sync);
+        let commit = CommitCoordinator::new(&engine, DurabilityMode::Sync);
         Fixture {
             engine,
             catalog,

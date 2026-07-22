@@ -40,7 +40,7 @@ fn tcp_put_get_del_roundtrip() {
     let wal_dir2 = wal_dir.clone();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let engine = std::sync::Arc::new(std::sync::Mutex::new(
+        let engine = zydecodb_engine::engine_handle::EngineHandle::new(
             Engine::open(EngineConfig {
                 data_dir: data_dir2,
                 wal_dir: wal_dir2,
@@ -49,7 +49,7 @@ fn tcp_put_get_del_roundtrip() {
                 ..Default::default()
             })
             .unwrap(),
-        ));
+        );
 
         let security = zydecodb::security::SecurityRuntime::default();
         let mut session = zydecodb::security::SessionState::anonymous();
@@ -58,9 +58,9 @@ fn tcp_put_get_del_roundtrip() {
             let outcome = zydecodb::dispatch::handle_request(&engine, req, session, &security);
             session = outcome.session;
             zydecodb::dispatch::write_response(&mut stream, &outcome.response).unwrap();
-            let _ = engine.lock().unwrap().poll_compaction();
+            let _ = engine.write().poll_compaction();
         }
-        let _ = engine.lock().unwrap().shutdown();
+        let _ = engine.write().shutdown();
     });
 
     let mut stream = TcpStream::connect(addr).unwrap();
@@ -143,6 +143,7 @@ fn server_process_start_stop() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();

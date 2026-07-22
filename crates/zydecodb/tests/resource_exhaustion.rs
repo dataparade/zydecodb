@@ -4,9 +4,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-use zydecodb::config::{Config, SecurityConfig, RequireAuth};
-use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN};
+use zydecodb::config::{Config, RequireAuth, SecurityConfig};
 use zydecodb_engine::errors::Status;
+use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN};
 
 fn free_addr() -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -41,6 +41,7 @@ fn base_config(tmp: &TempDir, listen: SocketAddr) -> Config {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     }
 }
 
@@ -49,7 +50,7 @@ fn test_slowloris_connection_starvation() {
     let tmp = TempDir::new().unwrap();
     let addr = free_addr();
     let config = base_config(&tmp, addr);
-    
+
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
     let handle = thread::spawn(move || server.run(config).unwrap());
@@ -72,8 +73,10 @@ fn test_slowloris_connection_starvation() {
 
     // Try to open the 129th connection. It should be rejected or dropped instantly.
     let mut extra = TcpStream::connect(addr).unwrap();
-    extra.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-    
+    extra
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+
     // If we try to read from it, it should return 0 bytes (EOF) or error quickly.
     let mut buf = [0u8; 1];
     let res = extra.read(&mut buf);
@@ -99,16 +102,19 @@ fn test_slowloris_connection_starvation() {
         let mut buf = [0u8; 1];
         let res = s.read(&mut buf); // This will block until closed or timeout
         if let Err(e) = res {
-            if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut
+            {
                 panic!("VULNERABILITY SURFACED: Connections were not closed at the correct idle timeout!");
             }
         }
     }
     let elapsed = start.elapsed();
-    
+
     assert!(
         elapsed >= Duration::from_secs(0) && elapsed < Duration::from_secs(3),
-        "Connections were not closed at the correct idle timeout! Elapsed: {:?}", elapsed
+        "Connections were not closed at the correct idle timeout! Elapsed: {:?}",
+        elapsed
     );
 
     *shutdown.lock().unwrap() = true;
@@ -120,7 +126,7 @@ fn test_json_bomb_oom() {
     let tmp = TempDir::new().unwrap();
     let addr = free_addr();
     let config = base_config(&tmp, addr);
-    
+
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
     let handle = thread::spawn(move || server.run(config).unwrap());
@@ -157,15 +163,21 @@ fn test_json_bomb_oom() {
 
     let mut header = [0u8; ENVELOPE_HEADER_LEN];
     let res = stream.read_exact(&mut header);
-    
+
     // If the server crashed (stack overflow), read_exact will return an error (Connection reset by peer).
     // If it handled it securely, it should return a valid response (likely a ProtocolError or similar).
     if res.is_err() {
-        panic!("VULNERABILITY SURFACED: Server crashed (likely Stack Overflow) on deeply nested JSON!");
+        panic!(
+            "VULNERABILITY SURFACED: Server crashed (likely Stack Overflow) on deeply nested JSON!"
+        );
     }
 
     let (status, _) = ResponseEnvelope::parse_header(&header).unwrap();
-    assert_eq!(status, Status::ProtocolError, "Expected ProtocolError for overly deep JSON");
+    assert_eq!(
+        status,
+        Status::ProtocolError,
+        "Expected ProtocolError for overly deep JSON"
+    );
 
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();

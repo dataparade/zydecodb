@@ -45,6 +45,7 @@ fn base_config(tmp: &TempDir, listen: SocketAddr, keys_file: PathBuf) -> Config 
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     }
 }
 
@@ -81,7 +82,7 @@ fn test_auth_concurrency_revocation() {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp = TempDir::new().unwrap();
     let keys_file = tmp.path().join("keys.toml");
-    
+
     // Initial key
     let secret = KeyStore::create_key(
         &keys_file,
@@ -110,7 +111,7 @@ fn test_auth_concurrency_revocation() {
         let secret = secret.clone();
         threads.push(thread::spawn(move || {
             let mut stream = wait_connect(addr);
-            
+
             // SessionInit
             write_request(
                 &mut stream,
@@ -130,10 +131,13 @@ fn test_auth_concurrency_revocation() {
                     key: format!("key_{}", i).into_bytes(),
                     value: b"val".to_vec(),
                 };
-                
-                write_request(&mut stream, &RequestEnvelope::new(Command::Put, put.encode()));
+
+                write_request(
+                    &mut stream,
+                    &RequestEnvelope::new(Command::Put, put.encode()),
+                );
                 let resp = read_response(&mut stream);
-                
+
                 if resp.status == Status::Ok {
                     successes += 1;
                 } else if resp.status == Status::Unauthorized || resp.status == Status::Forbidden {
@@ -152,17 +156,17 @@ fn test_auth_concurrency_revocation() {
 
     // Revoke the key
     KeyStore::revoke_key(&keys_file, "test_key").unwrap();
-    
+
     // Trigger reload
     std::process::Command::new("kill")
         .arg("-HUP")
         .arg(std::process::id().to_string())
         .status()
         .unwrap();
-    
+
     // Wait for reload to process
     thread::sleep(Duration::from_millis(500));
-    
+
     // Now, any request should be rejected if the key was revoked.
     // Let's make one more request on a NEW connection to verify the key is gone.
     let mut stream = wait_connect(addr);
@@ -171,12 +175,12 @@ fn test_auth_concurrency_revocation() {
         &RequestEnvelope::new(Command::SessionInit, secret.as_bytes().to_vec()),
     );
     assert_eq!(read_response(&mut stream).status, Status::Unauthorized);
-    
+
     // But what about the EXISTING connections?
     // Let's wait a bit for the threads to hit their next request and get Unauthorized.
     thread::sleep(Duration::from_millis(500));
     running.store(false, Ordering::SeqCst);
-    
+
     let mut any_unauthorized = false;
     for t in threads {
         let (_succ, unauth) = t.join().unwrap();
@@ -187,7 +191,7 @@ fn test_auth_concurrency_revocation() {
 
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();
-    
+
     assert!(
         any_unauthorized,
         "VULNERABILITY SURFACED: Existing connections remained authenticated after their key was revoked!"

@@ -486,10 +486,14 @@ impl SstableReader {
 
     /// Fetch a data block by index entry. Uses the cache for file-backed
     /// readers and a direct slice for in-memory readers.
+    ///
+    /// `cache_owner` attributes the insert to a tenant for FairDB cache floors
+    /// (Phase 5a). Compaction passes `None` with `populate_cache=false`.
     pub(crate) fn read_block(
         &self,
         idx: &IndexEntry,
         populate_cache: bool,
+        cache_owner: Option<crate::tenant_fair::TenantId>,
     ) -> EngineResult<BlockBytes> {
         match &self.source {
             Source::Memory { data, version, .. } => {
@@ -527,7 +531,7 @@ impl SstableReader {
                 let body = verify_block_crc(*version, &buf, "data")?;
                 let arc = Arc::new(body);
                 if populate_cache {
-                    cache.insert(key, arc.clone());
+                    cache.insert_for_tenant(key, arc.clone(), cache_owner);
                 } else {
                     cache.record_compaction_read();
                 }
@@ -545,11 +549,12 @@ impl SstableReader {
         let Some(bi) = block_idx else {
             return Ok(None);
         };
+        let owner = crate::tenant_fair::tenant_from_user_key(user_key);
         for entry in &index[bi..] {
             if entry.first_user_key.as_slice() > user_key {
                 break;
             }
-            let block = self.read_block(entry, true)?;
+            let block = self.read_block(entry, true, owner)?;
             if let Some(found) = scan_block_for_latest(block.as_slice(), user_key)? {
                 return Ok(Some(found));
             }
@@ -601,7 +606,7 @@ impl SstableReader {
         let index = self.index_arc();
         let mut out = Vec::new();
         for entry in index.iter() {
-            let block = self.read_block(entry, false)?;
+            let block = self.read_block(entry, false, None)?;
             let mut data = block.as_slice();
             while !data.is_empty() {
                 let (k, e, consumed) = decode_entry(data)?;
@@ -693,7 +698,8 @@ impl SstableRangeIter {
                 return Ok(false);
             }
 
-            let block = self.reader.read_block(&idx, false)?;
+            // Scans use fill_cache=false (compaction + long ranges must not thrash).
+            let block = self.reader.read_block(&idx, false, None)?;
             let mut data = block.as_slice();
             let mut pairs: Vec<(InternalKey, Entry)> = Vec::new();
             while !data.is_empty() {

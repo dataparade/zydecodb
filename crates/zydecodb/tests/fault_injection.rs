@@ -42,6 +42,7 @@ fn base_config(tmp: &TempDir, listen: SocketAddr, keys_file: PathBuf) -> Config 
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     }
 }
 
@@ -77,7 +78,7 @@ fn wait_connect(addr: SocketAddr) -> TcpStream {
 fn test_keystore_load_io_error_fallback() {
     let tmp = TempDir::new().unwrap();
     let keys_file = tmp.path().join("keys.toml");
-    
+
     // Initial key
     let secret = KeyStore::create_key(
         &keys_file,
@@ -114,7 +115,7 @@ fn test_keystore_load_io_error_fallback() {
         .arg(std::process::id().to_string())
         .status()
         .unwrap();
-    
+
     // Wait for reload to process
     thread::sleep(Duration::from_millis(500));
 
@@ -124,15 +125,20 @@ fn test_keystore_load_io_error_fallback() {
         &mut stream2,
         &RequestEnvelope::new(Command::SessionInit, secret.as_bytes().to_vec()),
     );
-    assert_eq!(read_response(&mut stream2).status, Status::Ok, "Server should retain old keys on I/O error");
+    assert_eq!(
+        read_response(&mut stream2).status,
+        Status::Ok,
+        "Server should retain old keys on I/O error"
+    );
 
     // Also verify it didn't fail open (anonymous access should still be denied)
     let mut stream3 = wait_connect(addr);
-    write_request(
-        &mut stream3,
-        &RequestEnvelope::new(Command::Stats, vec![]),
+    write_request(&mut stream3, &RequestEnvelope::new(Command::Stats, vec![]));
+    assert_eq!(
+        read_response(&mut stream3).status,
+        Status::Unauthorized,
+        "Server should not fail open"
     );
-    assert_eq!(read_response(&mut stream3).status, Status::Unauthorized, "Server should not fail open");
 
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();

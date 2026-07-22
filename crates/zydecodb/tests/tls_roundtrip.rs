@@ -56,6 +56,7 @@ fn tls_ping_roundtrip() {
         },
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();

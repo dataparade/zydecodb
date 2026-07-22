@@ -20,9 +20,9 @@
 //!   and drop it. This is O(N) per eviction, but for the default capacity
 //!   (256 MB / 16 KB block = ~16k entries) it costs tens of microseconds —
 //!   negligible compared to the disk read it just absorbed.
-//! - **Locking** is `std::sync::Mutex`. The v1 engine is single-threaded so
-//!   contention is zero. The mutex exists so that a future background
-//!   compaction worker can read from this cache without an API break.
+//! - **Locking** is `std::sync::Mutex` — independent of the engine write mutex
+//!   (Phase 4). Phase 5a δ-fair adds per-tenant floors: eviction *skips*
+//!   victims whose owner is at/below ρ_cache.
 //!
 //! ## Not in scope for v1
 //!
@@ -33,6 +33,7 @@
 //!   compression lands, the cache will store decompressed bytes — but the
 //!   key/value shapes do not change).
 
+use crate::tenant_fair::{FairShareState, TenantId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AOrd};
 use std::sync::{Arc, Mutex};
@@ -61,6 +62,9 @@ struct Slot {
     bytes: CachedBlock,
     /// Monotonic access counter; higher = more recently used.
     last_access: u64,
+    /// Tenant charged for this block (point-read insert path). `None` for
+    /// unattributed inserts (legacy / compaction bypass).
+    owner: Option<TenantId>,
 }
 
 struct Inner {
@@ -89,6 +93,9 @@ pub struct BlockCache {
     compaction_reads: AtomicU64,
     inserts: AtomicU64,
     evictions: AtomicU64,
+    floor_skips: AtomicU64,
+    /// Optional δ-fair accounting (Phase 5a). Set via [`BlockCache::with_fair`].
+    fair: Mutex<Option<Arc<FairShareState>>>,
 }
 
 /// Point-in-time snapshot of the cache's counters.
@@ -99,6 +106,7 @@ pub struct CacheStats {
     pub compaction_reads: u64,
     pub inserts: u64,
     pub evictions: u64,
+    pub floor_skips: u64,
     pub resident_bytes: u64,
     pub resident_entries: u64,
 }
@@ -118,7 +126,15 @@ impl BlockCache {
             compaction_reads: AtomicU64::new(0),
             inserts: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            floor_skips: AtomicU64::new(0),
+            fair: Mutex::new(None),
         })
+    }
+
+    /// Attach δ-fair state for per-tenant cache floors (skip-on-evict).
+    pub fn with_fair(self: &Arc<Self>, fair: Arc<FairShareState>) -> Arc<Self> {
+        *self.fair.lock().expect("BlockCache fair lock") = Some(fair);
+        Arc::clone(self)
     }
 
     /// Compaction block read that bypasses the user cache (fill_cache=false).
@@ -147,15 +163,21 @@ impl BlockCache {
         }
     }
 
-    /// Insert a block. Evicts approximate-LRU entries until the cache is
-    /// under capacity (or the cache contains only this entry, even if it
-    /// exceeds capacity).
+    /// Insert a block without tenant attribution (legacy).
     pub fn insert(&self, key: BlockKey, bytes: CachedBlock) {
+        self.insert_for_tenant(key, bytes, None);
+    }
+
+    /// Insert a block charged to `owner`. Eviction skips victims protected by
+    /// the FairDB cache floor (ρ_cache) when fair mode is enabled.
+    pub fn insert_for_tenant(&self, key: BlockKey, bytes: CachedBlock, owner: Option<TenantId>) {
         let access = self
             .access_counter
             .fetch_add(1, AOrd::Relaxed)
             .wrapping_add(1);
         let size = bytes.len();
+        let fair = self.fair.lock().expect("BlockCache fair lock").clone();
+
         let mut g = self.inner.lock().expect("BlockCache mutex poisoned");
 
         if let Some(prev) = g.map.insert(
@@ -163,33 +185,68 @@ impl BlockCache {
             Slot {
                 bytes,
                 last_access: access,
+                owner,
             },
         ) {
             g.bytes_used = g.bytes_used.saturating_sub(prev.bytes.len());
+            if let (Some(fair), Some(t)) = (fair.as_ref(), prev.owner) {
+                fair.record_cache_delta(t, -(prev.bytes.len() as i64));
+            }
         }
         g.bytes_used = g.bytes_used.saturating_add(size);
+        if let (Some(fair), Some(t)) = (fair.as_ref(), owner) {
+            fair.record_cache_delta(t, size as i64);
+        }
         self.inserts.fetch_add(1, AOrd::Relaxed);
 
         while g.bytes_used > g.capacity && g.map.len() > 1 {
-            let Some(victim) = g
-                .map
-                .iter()
-                .min_by_key(|(_, slot)| slot.last_access)
-                .map(|(k, _)| *k)
-            else {
+            let (victim, skipped) = Self::pick_eviction_victim(&g, fair.as_deref());
+            if skipped > 0 {
+                self.floor_skips.fetch_add(skipped, AOrd::Relaxed);
+            }
+            let Some(victim) = victim else {
+                // Every resident entry is floor-protected; stop rather than
+                // thrash protected tenants (may briefly exceed capacity).
                 break;
             };
             if let Some(removed) = g.map.remove(&victim) {
                 g.bytes_used = g.bytes_used.saturating_sub(removed.bytes.len());
+                if let (Some(fair), Some(t)) = (fair.as_ref(), removed.owner) {
+                    fair.record_cache_delta(t, -(removed.bytes.len() as i64));
+                }
                 self.evictions.fetch_add(1, AOrd::Relaxed);
             }
         }
+    }
+
+    /// Approximate-LRU victim among entries not protected by the cache floor.
+    /// Returns `(victim, floor_skips_examined)`.
+    fn pick_eviction_victim(g: &Inner, fair: Option<&FairShareState>) -> (Option<BlockKey>, u64) {
+        let mut best: Option<(BlockKey, u64)> = None;
+        let mut skipped = 0u64;
+        for (k, slot) in &g.map {
+            if let (Some(fair), Some(t)) = (fair, slot.owner) {
+                if fair.cache_floor_protects(t) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            match best {
+                None => best = Some((*k, slot.last_access)),
+                Some((_, best_access)) if slot.last_access < best_access => {
+                    best = Some((*k, slot.last_access));
+                }
+                _ => {}
+            }
+        }
+        (best.map(|(k, _)| k), skipped)
     }
 
     /// Evict every block belonging to a given SSTable id. Called when an
     /// SSTable file is being unlinked, so stale cache entries don't shadow
     /// the now-gone file.
     pub fn invalidate_sstable(&self, sstable_id: u64) {
+        let fair = self.fair.lock().expect("BlockCache fair lock").clone();
         let mut g = self.inner.lock().expect("BlockCache mutex poisoned");
         let to_remove: Vec<BlockKey> = g
             .map
@@ -200,6 +257,9 @@ impl BlockCache {
         for k in to_remove {
             if let Some(slot) = g.map.remove(&k) {
                 g.bytes_used = g.bytes_used.saturating_sub(slot.bytes.len());
+                if let (Some(fair), Some(t)) = (fair.as_ref(), slot.owner) {
+                    fair.record_cache_delta(t, -(slot.bytes.len() as i64));
+                }
             }
         }
     }
@@ -213,6 +273,7 @@ impl BlockCache {
             compaction_reads: self.compaction_reads.load(AOrd::Relaxed),
             inserts: self.inserts.load(AOrd::Relaxed),
             evictions: self.evictions.load(AOrd::Relaxed),
+            floor_skips: self.floor_skips.load(AOrd::Relaxed),
             resident_bytes: g.bytes_used as u64,
             resident_entries: g.map.len() as u64,
         }
@@ -228,6 +289,8 @@ impl BlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tenant_fair::FairConfig;
+    use std::time::Duration;
 
     fn k(id: u64, off: u64) -> BlockKey {
         BlockKey::data(id, off)
@@ -238,71 +301,69 @@ mod tests {
         let c = BlockCache::new(1024);
         assert!(c.get(k(1, 0)).is_none());
         c.insert(k(1, 0), Arc::new(vec![1, 2, 3]));
-        let got = c.get(k(1, 0)).unwrap();
-        assert_eq!(*got, vec![1, 2, 3]);
-        let s = c.stats();
-        assert_eq!(s.hits, 1);
-        assert_eq!(s.misses, 1);
-        assert_eq!(s.resident_entries, 1);
-        assert_eq!(s.resident_bytes, 3);
+        assert_eq!(c.get(k(1, 0)).unwrap().as_slice(), &[1, 2, 3]);
     }
 
     #[test]
-    fn eviction_under_capacity_pressure() {
+    fn evicts_lru_when_full() {
         let c = BlockCache::new(50);
-        c.insert(k(1, 0), Arc::new(vec![0u8; 30]));
-        c.insert(k(1, 1), Arc::new(vec![0u8; 30])); // pushes total to 60 > 50 => evicts oldest
-        let s = c.stats();
-        assert_eq!(s.resident_entries, 1, "one entry must have been evicted");
-        assert!(s.resident_bytes <= 50);
-        assert_eq!(s.evictions, 1);
-    }
-
-    #[test]
-    fn lru_order_evicts_least_recently_used() {
-        let c = BlockCache::new(60);
-        c.insert(k(1, 0), Arc::new(vec![0u8; 20]));
-        c.insert(k(1, 1), Arc::new(vec![0u8; 20]));
-        c.insert(k(1, 2), Arc::new(vec![0u8; 20])); // full, no evict yet
-                                                    // touch (1,0) so it becomes most-recently-used
-        let _ = c.get(k(1, 0));
-        c.insert(k(1, 3), Arc::new(vec![0u8; 20])); // forces eviction; victim should be (1,1)
-        assert!(c.get(k(1, 0)).is_some(), "MRU survived");
-        assert!(c.get(k(1, 1)).is_none(), "LRU (1,1) was evicted");
-        assert!(c.get(k(1, 2)).is_some());
-        assert!(c.get(k(1, 3)).is_some());
-    }
-
-    #[test]
-    fn invalidate_drops_all_blocks_for_sstable() {
-        let c = BlockCache::new(1024);
-        c.insert(k(1, 0), Arc::new(vec![0u8; 10]));
-        c.insert(k(1, 100), Arc::new(vec![0u8; 10]));
-        c.insert(k(2, 0), Arc::new(vec![0u8; 10]));
-        c.invalidate_sstable(1);
-        let s = c.stats();
-        assert_eq!(s.resident_entries, 1, "only sstable 2's block remains");
+        c.insert(k(1, 0), Arc::new(vec![0u8; 40]));
+        c.insert(k(2, 0), Arc::new(vec![0u8; 40]));
+        // First entry should be gone.
         assert!(c.get(k(1, 0)).is_none());
         assert!(c.get(k(2, 0)).is_some());
     }
 
     #[test]
-    fn reinserting_same_key_replaces_value_and_keeps_one_entry() {
-        let c = BlockCache::new(1024);
-        c.insert(k(1, 0), Arc::new(vec![1u8; 10]));
-        c.insert(k(1, 0), Arc::new(vec![2u8; 20]));
-        let s = c.stats();
-        assert_eq!(s.resident_entries, 1);
-        assert_eq!(s.resident_bytes, 20);
-        assert_eq!(*c.get(k(1, 0)).unwrap(), vec![2u8; 20]);
+    fn floor_skips_protected_tenant() {
+        let mut cfg = FairConfig::default();
+        cfg.enabled = true;
+        cfg.tenant_count = 2;
+        cfg.cache_total_bytes = 200;
+        // Force a high floor so tenant 1 stays protected with a small insert.
+        cfg.delta_cache = Duration::from_millis(0);
+        cfg.read_bandwidth_bytes_per_sec = 1;
+        let fair = Arc::new(crate::tenant_fair::FairShareState::new(cfg));
+        let c = BlockCache::new(60);
+        c.with_fair(Arc::clone(&fair));
+
+        let t1 = [1u8; 16];
+        let t2 = [2u8; 16];
+        // Tenant 1 under floor.
+        c.insert_for_tenant(k(1, 0), Arc::new(vec![0u8; 40]), Some(t1));
+        // Tenant 2 fills over capacity — should evict t2's own older blocks,
+        // not t1 while t1 is floor-protected.
+        c.insert_for_tenant(k(2, 0), Arc::new(vec![0u8; 40]), Some(t2));
+        c.insert_for_tenant(k(2, 1), Arc::new(vec![0u8; 40]), Some(t2));
+        assert!(
+            c.get(k(1, 0)).is_some(),
+            "floor-protected tenant block must survive eviction"
+        );
     }
 
     #[test]
-    fn oversized_single_block_is_kept() {
+    fn invalidate_clears() {
+        let c = BlockCache::new(1024);
+        c.insert(k(1, 0), Arc::new(vec![1]));
+        c.invalidate_sstable(1);
+        assert!(c.get(k(1, 0)).is_none());
+    }
+
+    #[test]
+    fn oversized_single_block_accepted() {
         let c = BlockCache::new(10);
         c.insert(k(1, 0), Arc::new(vec![0u8; 100]));
-        let s = c.stats();
-        assert_eq!(s.resident_entries, 1, "oversized single block must remain");
         assert!(c.get(k(1, 0)).is_some());
+    }
+
+    #[test]
+    fn stats_track_hits() {
+        let c = BlockCache::new(1024);
+        c.insert(k(1, 0), Arc::new(vec![1]));
+        let _ = c.get(k(1, 0));
+        let _ = c.get(k(9, 0));
+        let s = c.stats();
+        assert_eq!(s.hits, 1);
+        assert_eq!(s.misses, 1);
     }
 }

@@ -94,8 +94,9 @@ enum AdminCommands {
         #[command(subcommand)]
         command: KeysCommands,
     },
-    /// Offboard a tenant: delete all its data and catalog entries. Run with the
-    /// node stopped (the data_dir lock enforces exclusive access).
+    /// Offboard a tenant: delete all its data and catalog entries.
+    /// Default is offline (node stopped). Pass `--live` to drop via a running
+    /// server (UDS/`listen` + `ZYDECODB_API_KEY` admin).
     DropTenant {
         #[arg(long, short)]
         config: PathBuf,
@@ -106,6 +107,9 @@ enum AdminCommands {
         /// background compaction.
         #[arg(long)]
         compact: bool,
+        /// Drop against a running server instead of opening the data dir offline.
+        #[arg(long)]
+        live: bool,
     },
     /// Manage per-tenant resource limits (byte cap, request rate).
     Tenant {
@@ -297,7 +301,14 @@ fn main() {
                 config,
                 tenant,
                 compact,
-            } => zydecodb::admin::drop_tenant(&config, &tenant, compact),
+                live,
+            } => {
+                if live {
+                    zydecodb::admin::drop_tenant_live(&config, &tenant, compact)
+                } else {
+                    zydecodb::admin::drop_tenant(&config, &tenant, compact)
+                }
+            }
             AdminCommands::Tenant { command } => match command {
                 TenantCommands::SetLimit {
                     tenant,

@@ -49,6 +49,7 @@ fn base_config(dir: &TempDir, name: &str, listen: SocketAddr) -> Config {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     }
 }
 

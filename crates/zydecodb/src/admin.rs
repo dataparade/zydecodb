@@ -7,13 +7,7 @@ use zydecodb_engine::keys::KS_USER;
 
 /// Build an [`EngineConfig`] from a server [`Config`] for offline admin commands.
 fn engine_cfg_from(cfg: &Config) -> EngineConfig {
-    EngineConfig {
-        data_dir: cfg.data_dir.clone(),
-        wal_dir: cfg.wal_dir.clone(),
-        block_cache_bytes: cfg.block_cache_mb.saturating_mul(1024 * 1024),
-        max_open_readers: cfg.max_open_readers,
-        ..Default::default()
-    }
+    cfg.to_engine_config()
 }
 
 pub fn keys_create(
@@ -218,46 +212,167 @@ pub fn tenant_list(keys_file: PathBuf) -> Result<(), KeyError> {
     Ok(())
 }
 
-/// Offboard a tenant: delete all of its KV / document / index keys (everything
-/// under `KS_USER + tenant`) and remove its catalog collections. Runs offline
-/// against a stopped node — the engine's `data_dir` lock guarantees no live
-/// server is using the directory concurrently. With `compact`, the tombstoned
-/// space is reclaimed before returning instead of being left to background
-/// compaction.
-pub fn drop_tenant(config: &Path, tenant_hex: &str, compact: bool) -> Result<(), String> {
-    let tenant = parse_tenant_hex(tenant_hex).map_err(|e| e.to_string())?;
-    // The all-zero tenant aliases legacy single-tenant data (stored directly
-    // under `KS_USER` without a tenant segment); refuse it to avoid deleting the
-    // wrong keys.
-    if tenant == [0u8; 16] {
+/// Result of dropping a tenant's user-keyspace prefix and catalog entries.
+#[derive(Debug, Clone, Copy)]
+pub struct DropTenantResult {
+    pub deleted_keys: u64,
+    pub removed_collections: usize,
+}
+
+/// Core offboard logic shared by offline CLI and live `AdminDropTenant`.
+///
+/// Deletes all keys under `KS_USER | tenant` and removes matching catalog
+/// collections. With `compact`, runs `compact_all` before returning (slow).
+/// Refuses the all-zero tenant (legacy single-tenant layout).
+pub fn drop_tenant_on_engine(
+    engine: &mut Engine,
+    catalog: &mut Catalog,
+    tenant: &[u8; 16],
+    compact: bool,
+) -> Result<DropTenantResult, String> {
+    if *tenant == [0u8; 16] {
         return Err("refusing to drop the all-zero tenant (reserved for legacy \
                     single-tenant data); pass a real 32-hex tenant id"
             .into());
     }
 
-    let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
-    let mut engine = Engine::open(engine_cfg_from(&cfg)).map_err(|e| e.to_string())?;
-
     let mut prefix = Vec::with_capacity(1 + 16);
     prefix.push(KS_USER);
-    prefix.extend_from_slice(&tenant);
+    prefix.extend_from_slice(tenant);
 
     let deleted = engine
         .delete_prefix(prefix.clone())
         .map_err(|e| e.to_string())?;
 
-    let mut catalog = Catalog::load(&engine).map_err(|e| e.to_string())?;
     let removed = catalog.remove_collections_with_prefix(&prefix);
-    catalog.persist(&mut engine).map_err(|e| e.to_string())?;
+    catalog.persist(engine).map_err(|e| e.to_string())?;
 
     if compact {
         engine.compact_all().map_err(|e| e.to_string())?;
     }
+
+    Ok(DropTenantResult {
+        deleted_keys: deleted,
+        removed_collections: removed,
+    })
+}
+
+/// Offline offboard against a stopped node (exclusive `data_dir` lock).
+pub fn drop_tenant(config: &Path, tenant_hex: &str, compact: bool) -> Result<(), String> {
+    let tenant = parse_tenant_hex(tenant_hex).map_err(|e| e.to_string())?;
+    let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
+    let mut engine = Engine::open(engine_cfg_from(&cfg)).map_err(|e| e.to_string())?;
+    let mut catalog = Catalog::load(&engine).map_err(|e| e.to_string())?;
+
+    let result = drop_tenant_on_engine(&mut engine, &mut catalog, &tenant, compact)?;
     engine.shutdown().map_err(|e| e.to_string())?;
 
     println!(
-        "dropped tenant {tenant_hex}: {deleted} key(s) deleted, {removed} collection(s) removed{}",
+        "dropped tenant {tenant_hex}: {} key(s) deleted, {} collection(s) removed{}",
+        result.deleted_keys,
+        result.removed_collections,
         if compact { ", space reclaimed" } else { "" }
     );
     Ok(())
+}
+
+/// Live offboard: connect to a running server and issue `AdminDropTenant`.
+/// Prefers `listen_unix` from the config when set; otherwise TCP `listen`.
+/// Requires `ZYDECODB_API_KEY` (admin role) in the environment.
+pub fn drop_tenant_live(config: &Path, tenant_hex: &str, compact: bool) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::os::unix::net::UnixStream;
+    use zydecodb_engine::errors::Status;
+    use zydecodb_engine::frame::{Command, RequestEnvelope};
+
+    let tenant = parse_tenant_hex(tenant_hex).map_err(|e| e.to_string())?;
+    let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
+    let admin_key = std::env::var("ZYDECODB_API_KEY").map_err(|_| {
+        "live drop-tenant requires ZYDECODB_API_KEY (admin role) in the environment".to_string()
+    })?;
+
+    let mut payload = Vec::with_capacity(17);
+    payload.extend_from_slice(&tenant);
+    payload.push(if compact { 1 } else { 0 });
+
+    enum Conn {
+        Tcp(TcpStream),
+        Unix(UnixStream),
+    }
+    impl Read for Conn {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self {
+                Conn::Tcp(s) => s.read(buf),
+                Conn::Unix(s) => s.read(buf),
+            }
+        }
+    }
+    impl Write for Conn {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self {
+                Conn::Tcp(s) => s.write(buf),
+                Conn::Unix(s) => s.write(buf),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self {
+                Conn::Tcp(s) => s.flush(),
+                Conn::Unix(s) => s.flush(),
+            }
+        }
+    }
+
+    let mut stream = if let Some(ref uds) = cfg.listen_unix {
+        Conn::Unix(
+            UnixStream::connect(uds).map_err(|e| format!("connect unix {}: {e}", uds.display()))?,
+        )
+    } else {
+        Conn::Tcp(
+            TcpStream::connect(cfg.listen).map_err(|e| format!("connect {}: {e}", cfg.listen))?,
+        )
+    };
+
+    let init = RequestEnvelope::new(Command::SessionInit, admin_key.into_bytes());
+    stream
+        .write_all(&init.encode())
+        .map_err(|e| e.to_string())?;
+    let (init_status, _) = read_response_status(&mut stream)?;
+    if init_status != Status::Ok {
+        return Err(format!("SessionInit failed: {init_status:?}"));
+    }
+
+    let drop_req = RequestEnvelope::new(Command::AdminDropTenant, payload);
+    stream
+        .write_all(&drop_req.encode())
+        .map_err(|e| e.to_string())?;
+    let (drop_status, msg) = read_response_status(&mut stream)?;
+    if drop_status != Status::Ok {
+        return Err(format!("AdminDropTenant failed: {drop_status:?} {msg}"));
+    }
+
+    println!(
+        "live-dropped tenant {tenant_hex}{}",
+        if compact { " (compact requested)" } else { "" }
+    );
+    Ok(())
+}
+
+fn read_response_status(
+    stream: &mut dyn std::io::Read,
+) -> Result<(zydecodb_engine::errors::Status, String), String> {
+    use zydecodb_engine::errors::Status;
+    use zydecodb_engine::frame::{ENVELOPE_HEADER_LEN, PROTO_VERSION};
+    let mut header = [0u8; ENVELOPE_HEADER_LEN];
+    stream.read_exact(&mut header).map_err(|e| e.to_string())?;
+    if header[0] != PROTO_VERSION {
+        return Err("bad protocol version".into());
+    }
+    let status = Status::from_u8(header[1]).ok_or_else(|| "unknown status".to_string())?;
+    let len = u32::from_be_bytes(header[2..6].try_into().unwrap()) as usize;
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    }
+    Ok((status, String::from_utf8_lossy(&payload).into_owned()))
 }

@@ -60,6 +60,7 @@ fn uds_put_get_roundtrip() {
         tls: Default::default(),
         listen_unix: Some(sock.clone()),
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();

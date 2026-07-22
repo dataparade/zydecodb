@@ -68,3 +68,39 @@ fn drop_tenant_removes_only_that_tenant() {
         Some(b"b1".to_vec())
     );
 }
+
+#[test]
+fn drop_tenant_on_engine_live_path_leaves_other_tenant() {
+    use zydecodb_document::catalog::Catalog;
+
+    let tmp = TempDir::new().unwrap();
+    let tenant_a = 1u128.to_be_bytes();
+    let tenant_b = 2u128.to_be_bytes();
+    let mut engine = Engine::open(engine_cfg(tmp.path())).unwrap();
+    engine
+        .put(tenant_key(&tenant_a, b":k1"), b"a1".to_vec(), 0)
+        .unwrap();
+    engine
+        .put(tenant_key(&tenant_b, b":k1"), b"b1".to_vec(), 0)
+        .unwrap();
+    let mut catalog = Catalog::load(&engine).unwrap();
+
+    // Simulate live drop while the engine remains open (server holds data_dir).
+    let result =
+        zydecodb::admin::drop_tenant_on_engine(&mut engine, &mut catalog, &tenant_a, false)
+            .unwrap();
+    assert_eq!(result.deleted_keys, 1);
+    assert_eq!(engine.get(&tenant_key(&tenant_a, b":k1")).unwrap(), None);
+    assert_eq!(
+        engine.get(&tenant_key(&tenant_b, b":k1")).unwrap(),
+        Some(b"b1".to_vec())
+    );
+    // Concurrent-style write from the surviving tenant still works.
+    engine
+        .put(tenant_key(&tenant_b, b":k2"), b"b2".to_vec(), 0)
+        .unwrap();
+    assert_eq!(
+        engine.get(&tenant_key(&tenant_b, b":k2")).unwrap(),
+        Some(b"b2".to_vec())
+    );
+}

@@ -8,6 +8,21 @@ The soak answers: is memory stable? Are errors zero? Is compaction healthy? Is t
 **Driver:** `scripts/soak.sh`  
 **Analyzer:** `scripts/analyze-soak.py`
 
+### Multi-tenant isolation (simulated pods)
+
+No real multi-tenant fleet required. Two tenants on one engine — victim vs noisy neighbor — measuring e2e put p99 delta (Busy retries included):
+
+```bash
+./scripts/tenant-isolation-soak.sh              # steady + ramp-up (default)
+MODE=steady ./scripts/tenant-isolation-soak.sh  # ship bar only (δ ≤ 50ms)
+MODE=rampup ./scripts/tenant-isolation-soak.sh  # FairDB reclaim (δ ≤ 350ms)
+```
+
+Binary: `crates/zydecodb-engine/src/bin/tenant-isolation-soak.rs`.
+
+- **Steady:** V solo → V|N fair=off → V|N fair=on. Ship gate: fair-on e2e put p99 δ ≤ 50 ms, success ≥ 85%.
+- **Ramp-up:** N floods while V is idle, then V bursts to reclaim ~one fair share of the write buffer. Gate: fair-on reclaim p99 δ ≤ 350 ms (paper-like buffer δ). This is the honest hard case — do not confuse it with steady ship.
+
 ## Quick commands
 
 ```bash

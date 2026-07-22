@@ -119,16 +119,19 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 **Multi-tenant hosting (pods)**
 - One process can host many tenants. Operational levers are `zydecodb admin ...` subcommands an external control plane shells out to:
-  - `admin drop-tenant --tenant <hex> [--compact]` — offboard a tenant (delete its data + catalog entries)
+  - `admin drop-tenant --tenant <hex> [--compact]` — offline offboard (node stopped)
+  - `admin drop-tenant --live --tenant <hex> [--compact]` — live offboard via running server (`ZYDECODB_API_KEY` admin; prefers `listen_unix`)
   - `admin tenant set-limit --tenant <hex> [--max-bytes N] [--rate-rps R]` / `admin tenant list` — per-tenant byte cap and request-rate ceiling (reloaded live on `SIGHUP`)
 - Optional Unix-domain-socket listener (`listen_unix`) for local control-plane traffic without a per-instance TCP port
 - A `[runtime] profile = "low_footprint"` that trims cache, open readers, and idle wakeups for dense multi-instance boxes
+
+**Multi-tenant sharing model (read this):** tenants get **namespace isolation** (key prefix, ACLs, byte/RPS quotas, drop-tenant). Write/catalog mutations still serialize on the engine write lock; block cache, fair-share accounting, and WAL fsync are separate domains. δ-fair memtable/cache/stall isolation is implemented but **off by default** (`EngineConfig::fair`) — until you enable and tune it, do not assume one tenant’s write storm cannot affect another’s latency. See [`docs/SECURITY.md`](docs/SECURITY.md#multi-tenant-sharing-model).
 
 ## Beta scope
 
 **Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). Filters, sort, projection, pagination, partial updates, `count`/`distinct`, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits.
 
-**Not yet:** aggregation pipeline (`$group`/`$lookup`/`$unwind`), `$regex`/`$type`/array operators, upsert, document TTL, MVCC/multi-document transactions, and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). See [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) for the gap list and roadmap.
+**Not yet:** aggregation pipeline (`$group`/`$lookup`/`$unwind`), `$regex`/`$type`/array operators, filter upsert, TTL *indexes* / expireAfterSeconds (per-document `expires_at` on insert is supported), MVCC/multi-document transactions, and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). δ-fair multi-tenant isolation clears the simulated pods soak ship bar (steady victim put p99 δ ≤ 50 ms with `[fair]` on) and the FairDB-style ramp-up reclaim gate (≤ 350 ms) but stays **off by default** — enable and prove on your hardware via `scripts/tenant-isolation-soak.sh` (`MODE=rampup` for reclaim). See [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) for the gap list and roadmap.
 
 ## Expectations, gotchas, advice
 
@@ -154,6 +157,7 @@ cargo test --workspace
 - [`clients/conformance/README.md`](clients/conformance/README.md) — shared wire conformance vectors that keep every driver byte-compatible with the server
 - [`examples/README.md`](examples/README.md) — client and user-backend walkthroughs
 - [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) — document layer architecture, gaps, and roadmap
-- [`docs/SECURITY.md`](docs/SECURITY.md) — auth, TLS, tenants, deployment
+- [`docs/SECURITY.md`](docs/SECURITY.md) — auth, TLS, tenants, δ-fair / pods sharing model
+- [`docs/SOAK.md`](docs/SOAK.md) — engine soak + multi-tenant isolation soak
 - [`docs/SHIPPING.md`](docs/SHIPPING.md) — off-box WAL durability for disaster recovery
 - [`docs/REPLICATION.md`](docs/REPLICATION.md) — read replicas, WAL shipping, and the failover runbook

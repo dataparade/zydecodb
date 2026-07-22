@@ -56,7 +56,7 @@ fn connect(addr: SocketAddr) -> TcpStream {
 /// Two connections hammer the server concurrently. With the thread-per-connection
 /// model neither connection can monopolize the engine, both must make progress,
 /// and shutdown must join cleanly. This is the regression guard for the
-/// Arc<Mutex<Engine>> concurrency swap.
+/// EngineHandle write-domain concurrency.
 #[test]
 fn concurrent_connections_make_progress() {
     let tmp = TempDir::new().unwrap();
@@ -88,6 +88,7 @@ fn concurrent_connections_make_progress() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();

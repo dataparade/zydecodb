@@ -13,6 +13,7 @@ use zydecodb::commit::{CommitCoordinator, DurabilityMode};
 use zydecodb::dispatch::handle_request;
 use zydecodb::security::{SecurityRuntime, SessionState};
 use zydecodb_engine::engine::{Engine, EngineConfig};
+use zydecodb_engine::engine_handle::EngineHandle;
 use zydecodb_engine::failpoints::WAL_BEFORE_FSYNC;
 use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope};
 
@@ -52,16 +53,16 @@ fn raw_kv_get_proceeds_during_in_flight_write_fsync() {
     let _scenario = fail::FailScenario::setup();
 
     let dir = TempDir::new().unwrap();
-    let engine = Arc::new(Mutex::new(
+    let engine = EngineHandle::new(
         Engine::open(EngineConfig {
             data_dir: dir.path().join("data"),
             wal_dir: dir.path().join("wal"),
             ..Default::default()
         })
         .unwrap(),
-    ));
+    );
 
-    let commit = CommitCoordinator::new(Arc::clone(&engine), DurabilityMode::Sync);
+    let commit = CommitCoordinator::new(&engine, DurabilityMode::Sync);
     let commit_thread = commit.spawn().unwrap();
     let security = SecurityRuntime::default();
 

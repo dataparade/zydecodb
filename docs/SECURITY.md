@@ -210,6 +210,43 @@ filter). The Docker config additionally lowers `rate_limit_rps` to 200 and
 
 Exceeded rate → `EngineBusy` (`0x07`). Exceeded quota → `PolicyRejected` (`0x09`).
 
+### Multi-tenant sharing model
+
+One ZydecoDB process can host many tenants. What is isolated **today**:
+
+| Isolated | Mechanism |
+|----------|-----------|
+| Key namespace | `KS_USER \| tenant[16] \| …` prefix |
+| Auth / ACL | API keys scoped to a tenant; optional prefix ACLs |
+| Admission | Per-tenant byte caps and RPS; global connection limits |
+| Offboard | `admin drop-tenant` (offline) or `--live` / `AdminDropTenant` |
+
+What is still **shared** (noisy-neighbor risk) when δ-fair is disabled (default):
+
+| Shared | Effect |
+|--------|--------|
+| Engine mutex domain | Writers serialize; compaction slowdown was moved off-lock but admission is still global |
+| WAL + memtable + block cache | One tenant’s burst can evict or fill shared buffers |
+| L0 / compaction backpressure | `EngineBusy` / stalls can affect all tenants |
+
+Product target: well-behaved tenant **steady-state** p99 delay bounded by **δ ≈ 50 ms** under a noisy neighbor. **Measured (simulated soak):** with `[fair]` on, e2e victim put p99 δ clears **≤ 50 ms** on a two-tenant write-flood + cache-thrash harness; fair-off remains much worse. Treat **ramp-up / fair-share reclaim** separately (**≤ 350 ms**) — do not market one number for both.
+
+**Mechanisms when `[fair]` is on:** cache floors; memtable reserved/global pools (`f/4` reserve floor when the ρ formula is 0); per-tenant stall / L0 token attribution + over-share pacing; fair soft flush-queue skips. Optional **Fork B** (`fork_b_l0_domains`) stalls a tenant on its own L0 file debt instead of global L0 `EngineBusy` — off by default; enable only if 5a+5b still miss δ after tuning.
+
+**Lock domains:** the server shares [`EngineHandle`](../crates/zydecodb-engine/src/engine_handle.rs) — write mutex for memtable/WAL append/SST publish; block cache, fair-share state, and WAL group-commit use separate interior locks so cache inserts and fsync do not take the write mutex. Never `thread::sleep` while holding the write lock.
+
+**Enable under pods:** set `[fair] enabled = true` in the server TOML (see `config/zydecodb.example.toml`), typically with `legacy_single_tenant = false`. Off by default until you prove the soak on your box.
+
+**Prove it (simulated pods — no fleet required):**
+
+```bash
+./scripts/tenant-isolation-soak.sh                 # steady (≤50ms) + ramp-up reclaim (≤350ms)
+MODE=steady ./scripts/tenant-isolation-soak.sh     # ship bar only
+MODE=rampup ./scripts/tenant-isolation-soak.sh     # FairDB idle→reclaim hard case
+```
+
+Harness: `tenant-isolation-soak` — steady V solo / V\|N fair=off / V\|N fair=on, plus ramp-up (N floods while V idle, then V reclaim burst ≈ fair-share bytes). Steady δ ≤ 50 ms and ramp-up δ ≤ 350 ms are **separate** claims. Re-run on your hardware before claiming numbers. Driver notes: [`SOAK.md`](SOAK.md).
+
 ### Per-tenant limits
 
 `rate_limit_rps` and `max_connections` above are per-connection/global. For

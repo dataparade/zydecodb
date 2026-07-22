@@ -184,17 +184,19 @@ Catalog and bookkeeping records live in the system keyspace (`0x00`,
 
 ## Concurrency model
 
-The server holds the engine as `Arc<Mutex<Engine>>` and serves each connection on
-its own thread (`spawn_tcp_conn` / `spawn_uds_conn`), bounded by
+The server holds the engine as
+[`EngineHandle`](../crates/zydecodb-engine/src/engine_handle.rs)
+(`write` mutex plus separate cache / fair / WAL-sync domains) and serves each
+connection on its own thread (`spawn_tcp_conn` / `spawn_uds_conn`), bounded by
 `security.max_connections`. Queries are **two-phase**: the planner takes a
-consistent snapshot under the lock, then the scan runs lock-free against that
-pinned view, so a long scan does not block other clients' writes. This is why
-pagination can be repeatable-read across pages.
+consistent snapshot under the write lock, then the scan runs lock-free against
+that pinned view, so a long scan does not block other clients' writes. This is
+why pagination can be repeatable-read across pages.
 
 ### Single write lane (by design)
 
 ZydecoDB is **single-node, single-write-lane** on purpose. Every mutation
-funnels through the one engine `Mutex`, so writes are totally ordered by a
+funnels through the engine write mutex, so writes are totally ordered by a
 single `seq` counter and there is exactly one writer at any instant. The target
 deployment is **one application per database**, where this is the right trade:
 
@@ -260,12 +262,15 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 - Aggregation pipeline (`$group` / `$lookup` / `$unwind`)
 - `$regex` / `$type` / array operators (`$elemMatch` / `$all`)
 - Projection pushdown / covered queries (the body is always fetched)
-- Upsert
-- Document-level TTL indexes (the engine has per-entry `expires_at`; the document
-  layer does not yet map a TTL index onto it)
+- Filter upsert (`update` + insert-if-missing)
+- TTL indexes / `expireAfterSeconds` on a date field (per-document `expires_at` on
+  `DocPut` is supported and swept periodically by the server)
 - MVCC / multi-document transactions (opcodes `0x10`–`0x12` reserved; `seq` is
   ordering only)
 - Enforced collection schemas (`SchemaDef`, `0x31`, reserved)
+- Marketed multi-tenant p99 SLA (simulated soak ship bar δ≤50 ms clears with
+  `[fair]` on; still off by default — prove with `scripts/tenant-isolation-soak.sh`;
+  see [`SECURITY.md`](SECURITY.md#multi-tenant-sharing-model))
 
 ---
 
@@ -279,6 +284,6 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 6. [`crates/zydecodb-document/src/store.rs`](../crates/zydecodb-document/src/store.rs) — body + index write batch
 7. [`crates/zydecodb-document/src/planner.rs`](../crates/zydecodb-document/src/planner.rs) / [`query.rs`](../crates/zydecodb-document/src/query.rs) — plan + execution
 8. [`crates/zydecodb/src/docdispatch.rs`](../crates/zydecodb/src/docdispatch.rs) — opcode routing
-9. [`crates/zydecodb/src/server.rs`](../crates/zydecodb/src/server.rs) — `Arc<Mutex<Engine>>` + thread-per-connection
+9. [`crates/zydecodb/src/server.rs`](../crates/zydecodb/src/server.rs) — `EngineHandle` + thread-per-connection
 
 **Tests:** `crates/zydecodb/tests/document_e2e.rs`, `crates/zydecodb-engine/tests/range_scan.rs`.

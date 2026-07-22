@@ -169,6 +169,12 @@ primaries against the same shipped stream.**
 - The replica is **eventually consistent** with the primary and **read-only**.
   Promotion is deliberate; the epoch fence guards the shared-stream case but the
   death decision and hard fencing remain the operator's responsibility.
+- **Catch-up path:** after installing new segments, the replica **incrementally
+  applies** them into the live engine (`Engine::apply_installed_wal_segment`)
+  under the engine lock (flush + replay). A full `Engine::open` reopen is only
+  the fallback if incremental apply fails. Catch-up still pauses writers briefly
+  while the lock is held; happy-path RTO is bounded by flush+replay of new
+  segments, not a cold open of the whole WAL history.
 - SSTables are **not** shipped; the replica reconstructs state purely from the
   WAL stream, so the primary must ship every segment and the replica must replay
   them all in order.

@@ -91,6 +91,7 @@ impl Client {
             doc_id: doc_id.as_bytes().to_vec(),
             body: body_json.to_vec(),
             relaxed: false,
+            expires_at: 0,
         }
         .encode();
         let (status, resp) = self.request_retrying(Command::DocPut, payload)?;

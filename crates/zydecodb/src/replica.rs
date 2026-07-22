@@ -421,10 +421,11 @@ mod tests {
         std::fs::write(ship.join(wal::segment_filename(1)), b"tampered!!").unwrap();
 
         let mut replica = Replica::new(ship, replica_wal.clone());
-        let out = replica.sync().unwrap();
+        // verify_entry returns Err on hash mismatch — sync must not install.
+        let err = replica.sync().unwrap_err().to_string();
         assert!(
-            !out.made_progress(),
-            "corrupt segment must not be installed"
+            err.contains("hash mismatch") || err.contains("corrupt"),
+            "unexpected error: {err}"
         );
         assert!(!replica_wal.join(wal::segment_filename(1)).exists());
     }

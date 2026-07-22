@@ -53,6 +53,7 @@ fn doc_put(s: &mut TcpStream, collection: &str, doc_id: &[u8], body: &str) {
         doc_id: doc_id.to_vec(),
         body: body.as_bytes().to_vec(),
         relaxed: false,
+        expires_at: 0,
     };
     let resp = roundtrip(s, &RequestEnvelope::new(Command::DocPut, p.encode()));
     assert_eq!(resp.status, Status::Ok, "DocPut failed");
@@ -171,6 +172,7 @@ fn spawn_server() -> (
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();

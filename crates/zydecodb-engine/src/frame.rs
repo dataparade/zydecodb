@@ -52,6 +52,8 @@ pub enum Command {
     /// Reserved byte for caller-defined per-connection routing context. The
     /// engine parses but does not interpret it.
     SetContext = 0x41,
+    /// Admin: drop a tenant's data on a live server (prefix delete + catalog).
+    AdminDropTenant = 0x42,
     Ping = 0xF0,
     Stats = 0xF1,
 }
@@ -80,14 +82,16 @@ impl Command {
             0x31 => Command::SchemaDef,
             0x40 => Command::SessionInit,
             0x41 => Command::SetContext,
+            0x42 => Command::AdminDropTenant,
             0xF0 => Command::Ping,
             0xF1 => Command::Stats,
             _ => return None,
         })
     }
 
-    /// Whether this command is implemented in v1.
-    pub fn is_v1(self) -> bool {
+    /// Raw key-value and session/control commands handled by the KV dispatcher
+    /// (not the document layer).
+    pub fn is_kv_command(self) -> bool {
         matches!(
             self,
             Command::Put
@@ -95,9 +99,31 @@ impl Command {
                 | Command::Del
                 | Command::SessionInit
                 | Command::SetContext
+                | Command::AdminDropTenant
                 | Command::Ping
                 | Command::Stats
         )
+    }
+
+    /// Document-layer commands (routed via docdispatch).
+    pub fn is_document_command(self) -> bool {
+        matches!(
+            self,
+            Command::Query
+                | Command::DocPut
+                | Command::DocDel
+                | Command::Find
+                | Command::Update
+                | Command::Delete
+                | Command::Count
+                | Command::IndexDef
+        )
+    }
+
+    /// Deprecated alias for [`Self::is_kv_command`].
+    #[deprecated(note = "use is_kv_command or is_document_command")]
+    pub fn is_v1(self) -> bool {
+        self.is_kv_command()
     }
 }
 
@@ -315,15 +341,18 @@ mod tests {
 
     #[test]
     fn only_expected_commands_are_v1() {
-        assert!(Command::Put.is_v1());
-        assert!(Command::Get.is_v1());
-        assert!(Command::Del.is_v1());
-        assert!(Command::Ping.is_v1());
-        assert!(Command::Stats.is_v1());
-        assert!(Command::SessionInit.is_v1());
-        assert!(Command::SetContext.is_v1());
-        assert!(!Command::Begin.is_v1());
-        assert!(!Command::Query.is_v1());
+        assert!(Command::Put.is_kv_command());
+        assert!(Command::Get.is_kv_command());
+        assert!(Command::Del.is_kv_command());
+        assert!(Command::Ping.is_kv_command());
+        assert!(Command::Stats.is_kv_command());
+        assert!(Command::SessionInit.is_kv_command());
+        assert!(Command::SetContext.is_kv_command());
+        assert!(Command::AdminDropTenant.is_kv_command());
+        assert!(!Command::Begin.is_kv_command());
+        assert!(!Command::Query.is_kv_command());
+        assert!(Command::Query.is_document_command());
+        assert!(Command::Find.is_document_command());
     }
 
     #[test]

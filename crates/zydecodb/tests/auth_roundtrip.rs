@@ -68,6 +68,7 @@ fn auth_required_rejects_anonymous_put() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();
@@ -149,6 +150,7 @@ fn read_only_key_cannot_put() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();
@@ -231,6 +233,7 @@ fn tenant_isolation() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();
@@ -302,6 +305,7 @@ fn prefix_acl_denies_out_of_scope_keys() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();
@@ -381,6 +385,7 @@ fn prefix_acl_applies_to_document_collections() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();
@@ -408,6 +413,7 @@ fn prefix_acl_applies_to_document_collections() {
         doc_id: b"1".to_vec(),
         body: br#"{"n":1}"#.to_vec(),
         relaxed: false,
+        expires_at: 0,
     };
     write_request(
         &mut stream,
@@ -420,6 +426,7 @@ fn prefix_acl_applies_to_document_collections() {
         doc_id: b"1".to_vec(),
         body: br#"{"n":1}"#.to_vec(),
         relaxed: false,
+        expires_at: 0,
     };
     write_request(
         &mut stream,

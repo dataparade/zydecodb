@@ -56,6 +56,10 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
     fn u32(&mut self) -> DocResult<usize> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
@@ -88,6 +92,9 @@ pub struct DocPutPayload {
     /// Acknowledge without waiting for the durability fsync. Optional on the
     /// wire (a missing trailing flags byte decodes as `false`).
     pub relaxed: bool,
+    /// Absolute expiry time (unix millis). `0` = never. Optional on the wire:
+    /// after the flags byte, an 8-byte big-endian `expires_at` may follow.
+    pub expires_at: u64,
 }
 
 impl DocPutPayload {
@@ -97,6 +104,9 @@ impl DocPutPayload {
         put_lp(&mut out, &self.doc_id);
         put_lp(&mut out, &self.body);
         out.push(if self.relaxed { FLAG_RELAXED } else { 0 });
+        if self.expires_at != 0 {
+            out.extend_from_slice(&self.expires_at.to_be_bytes());
+        }
         out
     }
 
@@ -106,11 +116,19 @@ impl DocPutPayload {
         let doc_id = r.lp()?.to_vec();
         let body = r.lp()?.to_vec();
         let relaxed = r.opt_u8() & FLAG_RELAXED != 0;
+        let expires_at = if r.remaining() >= 8 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(r.take(8)?);
+            u64::from_be_bytes(buf)
+        } else {
+            0
+        };
         Ok(DocPutPayload {
             collection,
             doc_id,
             body,
             relaxed,
+            expires_at,
         })
     }
 }
@@ -557,6 +575,7 @@ mod tests {
             doc_id: b"u1".to_vec(),
             body: br#"{"age":30}"#.to_vec(),
             relaxed: false,
+            expires_at: 0,
         };
         assert_eq!(DocPutPayload::decode(&p.encode()).unwrap(), p);
 

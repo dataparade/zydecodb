@@ -55,10 +55,13 @@ impl PinState {
 }
 
 /// An owned snapshot that survives concurrent engine mutation.
+///
+/// Memtables are `Arc`-shared with the engine (cheap pin); writers use
+/// `Arc::make_mut` so a live snapshot is not mutated in place.
 pub struct SnapshotHandle {
     seq_upper: u64,
-    active: Memtable,
-    immutables: Vec<Memtable>,
+    active: Arc<Memtable>,
+    immutables: Vec<Arc<Memtable>>,
     sstables: Vec<Arc<SstableReader>>,
     sstable_metas: Vec<SstableMeta>,
     sstable_ids: Vec<u64>,
@@ -72,8 +75,8 @@ impl SnapshotHandle {
     #[allow(clippy::too_many_arguments)] // a snapshot captures the full read-path state in one shot
     pub(crate) fn new(
         seq_upper: u64,
-        active: Memtable,
-        immutables: Vec<Memtable>,
+        active: Arc<Memtable>,
+        immutables: Vec<Arc<Memtable>>,
         sstables: Vec<Arc<SstableReader>>,
         sstable_metas: Vec<SstableMeta>,
         sstable_ids: Vec<u64>,
@@ -114,7 +117,8 @@ impl SnapshotHandle {
                 return Ok(Some(v));
             }
         }
-        for (sst, meta) in self.sstables.iter().zip(self.sstable_metas.iter()) {
+        // Newest SSTable first — catalog is newest-last (matches Engine::snapshot_get).
+        for (sst, meta) in self.sstables.iter().zip(self.sstable_metas.iter()).rev() {
             if !key_in_range(key, meta) {
                 continue;
             }
@@ -140,8 +144,8 @@ impl SnapshotHandle {
             .map(|(r, _)| r.clone())
             .collect();
         let inner = crate::snapshot::build_sources(
-            &self.active,
-            self.immutables.iter(),
+            self.active.as_ref(),
+            self.immutables.iter().map(|m| m.as_ref()),
             &sst_refs,
             self.seq_upper,
             lo,

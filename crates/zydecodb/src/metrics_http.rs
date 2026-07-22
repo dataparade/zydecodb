@@ -37,9 +37,7 @@ pub fn check_bind_policy(
     }
     match token {
         Some(t) if !t.is_empty() => Ok(()),
-        _ => Err(
-            "metrics allow_remote = true requires a non-empty [metrics] token".to_string(),
-        ),
+        _ => Err("metrics allow_remote = true requires a non-empty [metrics] token".to_string()),
     }
 }
 
@@ -81,9 +79,8 @@ fn handle(req: Request, metrics: &Metrics, token: Option<&str>) {
         "/metrics" => {
             if let Some(expected) = token {
                 if !bearer_ok(&req, expected) {
-                    let _ = req.respond(
-                        Response::from_string("unauthorized\n").with_status_code(401),
-                    );
+                    let _ =
+                        req.respond(Response::from_string("unauthorized\n").with_status_code(401));
                     return;
                 }
             }
@@ -102,7 +99,12 @@ fn bearer_ok(req: &Request, expected: &str) -> bool {
     let presented = req
         .headers()
         .iter()
-        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+        .find(|h| {
+            h.field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("authorization")
+        })
         .map(|h| h.value.as_str());
     let Some(value) = presented else {
         return false;

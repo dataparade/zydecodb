@@ -1,9 +1,9 @@
 use crate::security::keys::KeyRole;
 use crate::security::{SecurityRuntime, SessionState};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use zydecodb_engine::engine::Engine;
+use zydecodb_engine::engine_handle::EngineHandle;
 use zydecodb_engine::errors::{EngineError, Status};
 use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope, ResponseEnvelope};
 use zydecodb_engine::keys::KS_USER;
@@ -23,7 +23,7 @@ pub struct DispatchOutcome {
 /// and only `Put`/`Del` hold the lock across the write. This mirrors the document
 /// path and keeps the engine mutex free during the (lock-free) read of a `Get`.
 pub fn handle_request(
-    engine: &Arc<Mutex<Engine>>,
+    engine: &EngineHandle,
     req: RequestEnvelope,
     session: SessionState,
     security: &SecurityRuntime,
@@ -56,12 +56,12 @@ struct InnerOutcome {
 }
 
 fn handle_request_inner(
-    engine: &Arc<Mutex<Engine>>,
+    engine: &EngineHandle,
     req: RequestEnvelope,
     session: SessionState,
     security: &SecurityRuntime,
 ) -> InnerOutcome {
-    if !req.command.is_v1() {
+    if !req.command.is_kv_command() {
         return InnerOutcome {
             response: ResponseEnvelope::error(Status::ProtocolError, "unimplemented"),
             session,
@@ -74,6 +74,17 @@ fn handle_request_inner(
     match req.command {
         Command::SessionInit => handle_session_init(req, session, security),
         Command::SetContext => handle_set_context(req, session),
+        Command::AdminDropTenant => InnerOutcome {
+            // Handled in the server loop with catalog access; should not reach here.
+            response: ResponseEnvelope::error(
+                Status::ProtocolError,
+                "AdminDropTenant must be routed with catalog",
+            ),
+            session,
+            command: Command::AdminDropTenant,
+            client_key: None,
+            commit_seq: None,
+        },
         Command::Ping => {
             if security.require_auth
                 && !session.authenticated
@@ -99,7 +110,7 @@ fn handle_request_inner(
                 Command::Del => handle_del(engine, req, session, security),
                 Command::Stats => {
                     // Brief lock: stats are in-memory counters, no disk I/O.
-                    let json = engine.lock().unwrap().stats().to_json();
+                    let json = engine.write().stats().to_json();
                     InnerOutcome {
                         response: ResponseEnvelope::ok(json),
                         session,
@@ -180,7 +191,7 @@ fn handle_set_context(req: RequestEnvelope, session: SessionState) -> InnerOutco
 }
 
 fn handle_put(
-    engine: &Arc<Mutex<Engine>>,
+    engine: &EngineHandle,
     req: RequestEnvelope,
     session: SessionState,
     security: &SecurityRuntime,
@@ -201,7 +212,13 @@ fn handle_put(
                 };
             }
             let key = storage_key(&session, &p.key, security.legacy_single_tenant);
-            let result = engine.lock().unwrap().put(key, p.value, p.expires_at);
+            let (result, slowdown) = {
+                let mut guard = engine.write();
+                let r = guard.put(key, p.value, p.expires_at);
+                let s = guard.take_write_slowdown();
+                (r, s)
+            };
+            Engine::apply_write_slowdown(slowdown);
             match result {
                 Ok(seq) => InnerOutcome {
                     response: ResponseEnvelope::ok(seq.to_be_bytes().to_vec()),
@@ -230,7 +247,7 @@ fn handle_put(
 }
 
 fn handle_get(
-    engine: &Arc<Mutex<Engine>>,
+    engine: &EngineHandle,
     req: RequestEnvelope,
     session: SessionState,
     security: &SecurityRuntime,
@@ -250,7 +267,7 @@ fn handle_get(
             // Mirror the document read path: capture an owned snapshot under a
             // brief lock, release the engine mutex, then read off the snapshot
             // lock-free so a slow SSTable block read never serializes writers.
-            let snapshot = engine.lock().unwrap().snapshot_owned();
+            let snapshot = engine.write().snapshot_owned();
             match snapshot.get(&key) {
                 Ok(Some(value)) => InnerOutcome {
                     response: ResponseEnvelope::ok(value),
@@ -286,7 +303,7 @@ fn handle_get(
 }
 
 fn handle_del(
-    engine: &Arc<Mutex<Engine>>,
+    engine: &EngineHandle,
     req: RequestEnvelope,
     session: SessionState,
     security: &SecurityRuntime,
@@ -306,7 +323,13 @@ fn handle_del(
                 };
             }
             let key = storage_key(&session, &p.key, security.legacy_single_tenant);
-            let result = engine.lock().unwrap().del(key);
+            let (result, slowdown) = {
+                let mut guard = engine.write();
+                let r = guard.del(key);
+                let s = guard.take_write_slowdown();
+                (r, s)
+            };
+            Engine::apply_write_slowdown(slowdown);
             match result {
                 Ok((deleted, seq)) => {
                     let mut payload = vec![if deleted { 1 } else { 0 }];

@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use zydecodb::security::{SessionState, check_key_prefix_acl, check_collection_prefix_acl};
+use zydecodb::security::{check_collection_prefix_acl, check_key_prefix_acl, SessionState};
 
 proptest! {
     #[test]
@@ -9,9 +9,9 @@ proptest! {
     ) {
         let mut session = SessionState::anonymous();
         session.allowed_prefixes = prefixes.clone();
-        
+
         let result = check_key_prefix_acl(&session, &key);
-        
+
         if prefixes.is_empty() {
             assert!(result.is_none(), "Empty prefixes should allow all keys");
         } else {
@@ -22,7 +22,7 @@ proptest! {
                     break;
                 }
             }
-            
+
             if allowed {
                 assert!(result.is_none(), "Key starting with prefix should be allowed");
             } else {
@@ -38,9 +38,9 @@ proptest! {
     ) {
         let mut session = SessionState::anonymous();
         session.allowed_prefixes = prefixes.clone();
-        
+
         let result = check_collection_prefix_acl(&session, &collection);
-        
+
         if prefixes.is_empty() {
             assert!(result.is_none(), "Empty prefixes should allow all collections");
         } else {
@@ -52,7 +52,7 @@ proptest! {
                     break;
                 }
             }
-            
+
             if allowed {
                 assert!(result.is_none(), "Collection matching prefix rules should be allowed");
             } else {

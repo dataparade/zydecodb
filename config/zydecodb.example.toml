@@ -73,6 +73,20 @@ log_client_key = false
 # 0 = unlimited
 max_bytes_per_tenant = 0
 
+# δ-fair isolation for multi-tenant pods (one process, many tenants).
+# Off by default. Enable when legacy_single_tenant = false and you care about
+# noisy-neighbor write/cache/stall isolation. See docs/SECURITY.md#multi-tenant-sharing-model.
+[fair]
+enabled = false
+# tenant_count = 8
+# delta_steady_ms = 50
+# delta_buffer_ms = 350
+# delta_cache_ms = 250
+# ramp_up_k = 6
+# memtable_total_mb = 0   # 0 = use engine memtable flush threshold
+# fork_b_l0_domains = false
+# l0_write_stall_threshold = 20
+
 [tls]
 enabled = false
 # cert = "/etc/zydecodb/tls.crt"

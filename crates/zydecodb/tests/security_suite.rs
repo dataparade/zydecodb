@@ -61,6 +61,7 @@ fn base_config(tmp: &TempDir, listen: SocketAddr, keys_file: PathBuf) -> Config 
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     }
 }
 
@@ -107,8 +108,7 @@ fn http_get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> (u16, String)
         Some(t) => format!("Authorization: Bearer {t}\r\n"),
         None => String::new(),
     };
-    let req =
-        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n");
     s.write_all(req.as_bytes()).unwrap();
     let mut buf = String::new();
     s.read_to_string(&mut buf).unwrap();
@@ -141,10 +141,9 @@ fn auth_lookup_single_argon_path() {
     let _env = ENV_LOCK.lock().unwrap();
     let tmp = TempDir::new().unwrap();
     let keys_file = tmp.path().join("keys.toml");
-    let s1 = KeyStore::create_key(&keys_file, "a", KeyRole::ReadWrite, ZERO_TENANT, vec![])
-        .unwrap();
-    let s2 = KeyStore::create_key(&keys_file, "b", KeyRole::ReadOnly, ZERO_TENANT, vec![])
-        .unwrap();
+    let s1 =
+        KeyStore::create_key(&keys_file, "a", KeyRole::ReadWrite, ZERO_TENANT, vec![]).unwrap();
+    let s2 = KeyStore::create_key(&keys_file, "b", KeyRole::ReadOnly, ZERO_TENANT, vec![]).unwrap();
 
     let addr = free_addr();
     let config = base_config(&tmp, addr, keys_file);
@@ -285,7 +284,9 @@ fn metrics_remote_without_token_refuses() {
         token: None,
     };
     let server = zydecodb::server::Server::new();
-    let err = server.run(config).expect_err("tokenless remote must refuse");
+    let err = server
+        .run(config)
+        .expect_err("tokenless remote must refuse");
     assert!(
         err.to_string().contains("token"),
         "expected token requirement, got: {err}"
@@ -348,7 +349,9 @@ fn shipping_without_hmac_refuses_when_enabled() {
         hmac_key_file: None,
     };
     let server = zydecodb::server::Server::new();
-    let err = server.run(config).expect_err("keyless shipping must refuse");
+    let err = server
+        .run(config)
+        .expect_err("keyless shipping must refuse");
     assert!(
         err.to_string().contains("hmac_key_file"),
         "expected HMAC requirement, got: {err}"
@@ -413,14 +416,13 @@ fn shipping_hmac_roundtrip_rejects_tampering() {
     let tampered_dir = tmp.path().join("ship_tampered");
     copy_dir(&ship, &tampered_dir);
     std::fs::write(tampered_dir.join(wal::segment_filename(1)), b"evil-bytes!").unwrap();
-    let mut rep = zydecodb::replica::Replica::new(
-        tampered_dir,
-        tmp.path().join("replica_wal_tampered"),
-    )
-    .with_hmac_key(Some(key.clone()));
+    let mut rep =
+        zydecodb::replica::Replica::new(tampered_dir, tmp.path().join("replica_wal_tampered"))
+            .with_hmac_key(Some(key.clone()));
+    let err = rep.sync().unwrap_err().to_string();
     assert!(
-        !rep.sync().unwrap().made_progress(),
-        "tampered segment must not install"
+        err.contains("hash mismatch") || err.contains("corrupt") || err.contains("hmac"),
+        "tampered segment must not install; got: {err}"
     );
 
     // A forged manifest: attacker rewrites the segment AND the sha256 in the
@@ -438,9 +440,10 @@ fn shipping_hmac_roundtrip_rejects_tampering() {
     let mut rep =
         zydecodb::replica::Replica::new(forged_dir, tmp.path().join("replica_wal_forged"))
             .with_hmac_key(Some(key));
+    let err = rep.sync().unwrap_err().to_string();
     assert!(
-        !rep.sync().unwrap().made_progress(),
-        "forged manifest without a valid HMAC must not install"
+        err.contains("hmac") || err.contains("missing"),
+        "forged manifest without a valid HMAC must not install; got: {err}"
     );
 }
 
@@ -521,7 +524,10 @@ fn doc_and_kv_prefix_acl() {
         key: b"events:click".to_vec(),
         value: b"1".to_vec(),
     };
-    write_request(&mut stream, &RequestEnvelope::new(Command::Put, put.encode()));
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::Put, put.encode()),
+    );
     assert_eq!(read_response(&mut stream).status, Status::Ok);
 
     let denied = KeyPayload {
@@ -553,6 +559,7 @@ fn doc_and_kv_prefix_acl() {
         doc_id: b"1".to_vec(),
         body: br#"{"n":1}"#.to_vec(),
         relaxed: false,
+        expires_at: 0,
     };
     write_request(
         &mut stream,
@@ -607,6 +614,7 @@ fn sort_buffer_cap_configurable() {
             doc_id: vec![b'0' + i],
             body: format!("{{\"n\":{i},\"m\":{}}}", 10 - i).into_bytes(),
             relaxed: false,
+            expires_at: 0,
         };
         write_request(
             &mut stream,

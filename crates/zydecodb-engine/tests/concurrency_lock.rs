@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use zydecodb_engine::engine::{Engine, EngineConfig};
+use zydecodb_engine::engine_handle::EngineHandle;
 use zydecodb_engine::failpoints::*;
 use zydecodb_engine::keys::KS_USER;
 
@@ -34,22 +35,18 @@ fn engine_lock_is_free_during_in_flight_fsync() {
     let _scenario = fail::FailScenario::setup();
 
     let dir = TempDir::new().unwrap();
-    let engine = Arc::new(Mutex::new(
+    let engine = EngineHandle::new(
         Engine::open(EngineConfig {
             data_dir: dir.path().join("data"),
             wal_dir: dir.path().join("data/wal"),
             ..Default::default()
         })
         .expect("engine open"),
-    ));
+    );
 
     // Buffer a write so there is an unsynced suffix to fsync.
-    engine
-        .lock()
-        .unwrap()
-        .put(uk(b"k1"), b"v1".to_vec(), 0)
-        .unwrap();
-    let wal = engine.lock().unwrap().wal_sync();
+    engine.write().put(uk(b"k1"), b"v1".to_vec(), 0).unwrap();
+    let wal = engine.write().wal_sync();
 
     // Delay the fsync by 500ms, INSIDE WalSync::sync (which does not hold the
     // engine lock).
@@ -66,11 +63,7 @@ fn engine_lock_is_free_during_in_flight_fsync() {
 
     // The engine lock must be free during the sleeping fsync.
     let start = Instant::now();
-    engine
-        .lock()
-        .unwrap()
-        .put(uk(b"k2"), b"v2".to_vec(), 0)
-        .unwrap();
+    engine.write().put(uk(b"k2"), b"v2".to_vec(), 0).unwrap();
     let elapsed = start.elapsed();
 
     assert!(
@@ -83,7 +76,7 @@ fn engine_lock_is_free_during_in_flight_fsync() {
     syncer.join().unwrap();
 
     // Both writes are present and the durability watermark advanced.
-    let e = engine.lock().unwrap();
+    let e = engine.write();
     assert_eq!(e.get(&uk(b"k1")).unwrap(), Some(b"v1".to_vec()));
     assert_eq!(e.get(&uk(b"k2")).unwrap(), Some(b"v2".to_vec()));
 }
@@ -97,21 +90,17 @@ fn snapshot_capture_proceeds_during_in_flight_fsync() {
     let _scenario = fail::FailScenario::setup();
 
     let dir = TempDir::new().unwrap();
-    let engine = Arc::new(Mutex::new(
+    let engine = EngineHandle::new(
         Engine::open(EngineConfig {
             data_dir: dir.path().join("data"),
             wal_dir: dir.path().join("data/wal"),
             ..Default::default()
         })
         .expect("engine open"),
-    ));
+    );
 
-    engine
-        .lock()
-        .unwrap()
-        .put(uk(b"a"), b"1".to_vec(), 0)
-        .unwrap();
-    let wal = engine.lock().unwrap().wal_sync();
+    engine.write().put(uk(b"a"), b"1".to_vec(), 0).unwrap();
+    let wal = engine.write().wal_sync();
 
     fail::cfg(WAL_BEFORE_FSYNC, "sleep(500)").expect("cfg");
     let wal_for_thread = Arc::clone(&wal);
@@ -120,7 +109,7 @@ fn snapshot_capture_proceeds_during_in_flight_fsync() {
 
     let start = Instant::now();
     let value = {
-        let snap = engine.lock().unwrap().snapshot_owned();
+        let snap = engine.write().snapshot_owned();
         snap.get(&uk(b"a")).unwrap()
     };
     let elapsed = start.elapsed();

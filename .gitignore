@@ -68,6 +68,7 @@ tls.key
 /scripts/*
 !/scripts/install.sh
 !/scripts/deploy-website.sh
+!/scripts/tenant-isolation-soak.sh
 
 # Internal / Archived Docs
 /docs/archive/

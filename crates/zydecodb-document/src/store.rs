@@ -106,7 +106,9 @@ pub fn upsert_ops(
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
-    payload: &[u8], is_zdoc: bool,
+    payload: &[u8],
+    is_zdoc: bool,
+    expires_at: u64,
 ) -> DocResult<Vec<BatchOp>> {
     let coll = catalog
         .collection(prefix, collection)
@@ -155,7 +157,7 @@ pub fn upsert_ops(
     ops.push(BatchOp::Put {
         key: doc_key,
         value,
-        expires_at: 0,
+        expires_at,
     });
     // Stale entries (old - new) are removed; fresh entries (new - old) are
     // added. The two sets are disjoint, and doc keys ('d') never collide with
@@ -167,7 +169,7 @@ pub fn upsert_ops(
         ops.push(BatchOp::Put {
             key: k.clone(),
             value: doc_id.to_vec(),
-            expires_at: 0,
+            expires_at: 0, // index entries do not expire independently of the body
         });
     }
 
@@ -177,17 +179,41 @@ pub fn upsert_ops(
     Ok(ops)
 }
 
-/// Insert or replace a document, diffing its index entries against the prior
-/// version so only changed index keys are touched. Returns the batch sequence.
+/// Insert or replace a document (no TTL). See [`upsert_with_expiry`].
 pub fn upsert(
     engine: &mut Engine,
     catalog: &Catalog,
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
-    payload: &[u8], is_zdoc: bool,
+    payload: &[u8],
+    is_zdoc: bool,
 ) -> DocResult<u64> {
-    let ops = upsert_ops(engine, catalog, prefix, collection, doc_id, payload, is_zdoc)?;
+    upsert_with_expiry(engine, catalog, prefix, collection, doc_id, payload, is_zdoc, 0)
+}
+
+/// Insert or replace a document with an optional absolute `expires_at` (unix
+/// millis; `0` = never). Diffs index entries against the prior version.
+pub fn upsert_with_expiry(
+    engine: &mut Engine,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+    payload: &[u8],
+    is_zdoc: bool,
+    expires_at: u64,
+) -> DocResult<u64> {
+    let ops = upsert_ops(
+        engine,
+        catalog,
+        prefix,
+        collection,
+        doc_id,
+        payload,
+        is_zdoc,
+        expires_at,
+    )?;
     Ok(engine.write_batch(ops)?)
 }
 

@@ -61,6 +61,7 @@ fn idle_connection_survives_and_ping_keepalive_works() {
         tls: Default::default(),
         listen_unix: None,
         runtime: Default::default(),
+        fair: Default::default(),
     };
 
     let server = zydecodb::server::Server::new();

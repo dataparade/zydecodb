@@ -277,16 +277,18 @@ pub fn read_shipped_log(ship_dir: &Path) -> EngineResult<Vec<ShippedEntry>> {
         } else {
             None
         };
-        
+
         if let Some(last) = out.last() {
             if segment_id <= last.segment_id {
                 return Err(EngineError::Io(format!(
                     "shipped.log line {}: out of order segment_id {} (<= {})",
-                    lineno + 1, segment_id, last.segment_id
+                    lineno + 1,
+                    segment_id,
+                    last.segment_id
                 )));
             }
         }
-        
+
         out.push(ShippedEntry {
             segment_id,
             seal_seq,
@@ -313,19 +315,32 @@ pub fn verify_segment(path: &Path, expected_sha256_hex: &str) -> EngineResult<bo
 /// Verify a shipped-log entry against the segment bytes and, when a key is
 /// configured, its HMAC. With a key, a missing or wrong HMAC fails — a legacy
 /// 3-field line is not acceptable on an authenticated stream.
-pub fn verify_entry(path: &Path, entry: &ShippedEntry, hmac_key: Option<&[u8]>) -> EngineResult<bool> {
+pub fn verify_entry(
+    path: &Path,
+    entry: &ShippedEntry,
+    hmac_key: Option<&[u8]>,
+) -> EngineResult<bool> {
     if !verify_segment(path, &entry.sha256_hex)? {
-        return Err(EngineError::Io(format!("segment {} hash mismatch or corrupt", entry.segment_id)));
+        return Err(EngineError::Io(format!(
+            "segment {} hash mismatch or corrupt",
+            entry.segment_id
+        )));
     }
     let Some(key) = hmac_key else {
         return Ok(true);
     };
     let Some(ref presented) = entry.hmac_hex else {
-        return Err(EngineError::Io(format!("segment {} missing hmac", entry.segment_id)));
+        return Err(EngineError::Io(format!(
+            "segment {} missing hmac",
+            entry.segment_id
+        )));
     };
     let expected = entry_hmac_hex(key, entry.segment_id, entry.seal_seq, &entry.sha256_hex);
     if !constant_time_eq_str(presented, &expected) {
-        return Err(EngineError::Io(format!("segment {} hmac mismatch", entry.segment_id)));
+        return Err(EngineError::Io(format!(
+            "segment {} hmac mismatch",
+            entry.segment_id
+        )));
     }
     Ok(true)
 }

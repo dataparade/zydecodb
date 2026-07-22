@@ -89,7 +89,9 @@ pub struct KeyStore {
 impl KeyStore {
     pub fn load(path: &Path) -> Result<Self, KeyError> {
         #[cfg(feature = "failpoints")]
-        fail::fail_point!("keystore_load_io_error", |_| Err(KeyError::Io("simulated I/O error".into())));
+        fail::fail_point!("keystore_load_io_error", |_| Err(KeyError::Io(
+            "simulated I/O error".into()
+        )));
 
         let bootstrap_secret = std::env::var("ZYDECODB_BOOTSTRAP_KEY").ok();
         if bootstrap_secret.is_some() {
@@ -234,22 +236,24 @@ impl KeyStore {
         if !session.authenticated {
             return false;
         }
-        
+
         let Some(key_id) = &session.key_id else {
             return false;
         };
-        
+
         if key_id == "bootstrap" {
             return self.bootstrap_secret.is_some();
         }
-        
+
         let Some(secret_hash) = &session.secret_hash else {
             return false;
         };
-        
+
         // Find the key by ID and ensure the secret hash matches exactly.
         // If the hash changed, the key was revoked and recreated with the same ID.
-        self.records.iter().any(|r| r.id == *key_id && r.secret_hash == *secret_hash)
+        self.records
+            .iter()
+            .any(|r| r.id == *key_id && r.secret_hash == *secret_hash)
     }
 
     pub fn list_ids(&self) -> Vec<String> {
@@ -407,12 +411,16 @@ mod tests {
     fn lookup_index_selects_correct_record_among_many() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("keys.toml");
-        let s1 =
-            KeyStore::create_key(&path, "a", KeyRole::ReadOnly, &default_tenant_hex(), vec![])
-                .unwrap();
-        let s2 =
-            KeyStore::create_key(&path, "b", KeyRole::ReadWrite, &default_tenant_hex(), vec![])
-                .unwrap();
+        let s1 = KeyStore::create_key(&path, "a", KeyRole::ReadOnly, &default_tenant_hex(), vec![])
+            .unwrap();
+        let s2 = KeyStore::create_key(
+            &path,
+            "b",
+            KeyRole::ReadWrite,
+            &default_tenant_hex(),
+            vec![],
+        )
+        .unwrap();
         let store = KeyStore::load(&path).unwrap();
         assert_eq!(store.verify(s1.as_bytes()).unwrap().id, "a");
         assert_eq!(store.verify(s2.as_bytes()).unwrap().id, "b");

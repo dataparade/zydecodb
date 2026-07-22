@@ -25,7 +25,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tracing::error;
-use zydecodb_engine::engine::Engine;
+use zydecodb_engine::engine_handle::EngineHandle;
+use zydecodb_engine::wal_sync::WalSync;
 
 /// How the server establishes durability for acknowledged writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,10 +62,13 @@ pub struct CommitCoordinator {
 }
 
 impl CommitCoordinator {
-    pub fn new(engine: Arc<Mutex<Engine>>, mode: DurabilityMode) -> Arc<Self> {
-        // Grab the WAL-sync handle once; the coordinator never needs the engine
-        // mutex again, which is the whole point of decoupling the fsync.
-        let wal_sync = engine.lock().unwrap().wal_sync();
+    /// Build a coordinator from the factorized handle's WAL-sync domain
+    /// (never takes the write mutex).
+    pub fn new(engine: &EngineHandle, mode: DurabilityMode) -> Arc<Self> {
+        Self::from_wal_sync(Arc::clone(engine.wal_sync()), mode)
+    }
+
+    pub fn from_wal_sync(wal_sync: Arc<WalSync>, mode: DurabilityMode) -> Arc<Self> {
         Arc::new(CommitCoordinator {
             wal_sync,
             mode,
@@ -190,7 +194,7 @@ mod tests {
     use std::time::Instant;
     use zydecodb_engine::engine::{Engine, EngineConfig};
 
-    fn temp_engine() -> Arc<Mutex<Engine>> {
+    fn temp_engine() -> Arc<EngineHandle> {
         let dir = std::env::temp_dir().join(format!("zydeco-commit-{}", rand_suffix()));
         let engine = Engine::open(EngineConfig {
             data_dir: dir.join("data"),
@@ -198,7 +202,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        Arc::new(Mutex::new(engine))
+        EngineHandle::new(engine)
     }
 
     fn rand_suffix() -> u64 {
@@ -212,11 +216,11 @@ mod tests {
     #[test]
     fn sync_mode_makes_write_durable_before_returning() {
         let engine = temp_engine();
-        let coord = CommitCoordinator::new(Arc::clone(&engine), DurabilityMode::Sync);
+        let coord = CommitCoordinator::new(&engine, DurabilityMode::Sync);
         let _h = coord.spawn().unwrap();
 
         let seq = {
-            let mut e = engine.lock().unwrap();
+            let mut e = engine.write();
             e.put(b"\x01k".to_vec(), b"v".to_vec(), 0).unwrap()
         };
         coord.commit(seq, false);
@@ -229,10 +233,10 @@ mod tests {
     #[test]
     fn relaxed_write_does_not_block() {
         let engine = temp_engine();
-        let coord = CommitCoordinator::new(Arc::clone(&engine), DurabilityMode::Sync);
+        let coord = CommitCoordinator::new(&engine, DurabilityMode::Sync);
         let _h = coord.spawn().unwrap();
         let seq = {
-            let mut e = engine.lock().unwrap();
+            let mut e = engine.write();
             e.put(b"\x01k".to_vec(), b"v".to_vec(), 0).unwrap()
         };
         let start = Instant::now();
@@ -246,14 +250,14 @@ mod tests {
     fn periodic_mode_fsyncs_in_background() {
         let engine = temp_engine();
         let coord = CommitCoordinator::new(
-            Arc::clone(&engine),
+            &engine,
             DurabilityMode::Periodic {
                 interval: Duration::from_millis(20),
             },
         );
         let _h = coord.spawn().unwrap();
         let seq = {
-            let mut e = engine.lock().unwrap();
+            let mut e = engine.write();
             e.put(b"\x01k".to_vec(), b"v".to_vec(), 0).unwrap()
         };
         // commit() returns immediately in periodic mode (no wait).
@@ -282,18 +286,18 @@ mod tests {
         let data_dir = dir.join("data");
         let wal_dir = dir.join("wal");
         {
-            let engine = Arc::new(Mutex::new(
+            let engine = EngineHandle::new(
                 Engine::open(EngineConfig {
                     data_dir: data_dir.clone(),
                     wal_dir: wal_dir.clone(),
                     ..Default::default()
                 })
                 .unwrap(),
-            ));
-            let coord = CommitCoordinator::new(Arc::clone(&engine), DurabilityMode::Sync);
+            );
+            let coord = CommitCoordinator::new(&engine, DurabilityMode::Sync);
             let handle = coord.spawn().unwrap();
             let seq = {
-                let mut e = engine.lock().unwrap();
+                let mut e = engine.write();
                 e.put(b"\x01durable".to_vec(), b"value".to_vec(), 0)
                     .unwrap()
             };

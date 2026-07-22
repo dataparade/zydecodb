@@ -116,6 +116,7 @@ fn payload_vectors() -> Vec<Value> {
         doc_id: b"u1".to_vec(),
         body: br#"{"age":30}"#.to_vec(),
         relaxed: false,
+    expires_at: 0,
     };
     v.push(req(
         "doc_put_basic",
@@ -325,7 +326,7 @@ fn payload_vectors() -> Vec<Value> {
         collection: "users".into(),
         filter: br#"{"stale":true}"#.to_vec(),
         multi: true,
-        relaxed: false,
+        relaxed: false
     };
     v.push(req(
         "delete_multi_durable",
@@ -338,7 +339,7 @@ fn payload_vectors() -> Vec<Value> {
         collection: "users".into(),
         filter: br#"{"_id":"u1"}"#.to_vec(),
         multi: false,
-        relaxed: true,
+        relaxed: true
     };
     v.push(req(
         "delete_one_relaxed",

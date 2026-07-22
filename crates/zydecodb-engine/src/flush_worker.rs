@@ -3,13 +3,20 @@
 //! SSTable build + disk publish runs on a dedicated OS thread so memtable
 //! freeze on the write path never blocks on multi-second flush I/O. The engine
 //! owner applies manifest/catalog updates via [`FlushScheduler::poll`].
+//!
+//! Phase 5b: work items carry per-tenant byte attribution for L0 token charge
+//! and fair-share metrics. Immutable memtables stay FIFO on a shared LSM
+//! (seq correctness); dual-queue flush reorder applies only if Fork B creates
+//! independent flush domains. **No WAL capacity reservation.**
 
 use crate::entry::Entry;
 use crate::errors::EngineResult;
 use crate::keys::InternalKey;
 use crate::manifest::SstableMeta;
 use crate::sstable;
+use crate::tenant_fair::TenantId;
 use crossbeam::channel::{Receiver, Sender, TryRecvError};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,12 +30,18 @@ use std::time::Duration;
 pub struct FlushExecuteResult {
     pub meta: SstableMeta,
     pub max_seq: u64,
+    /// Bytes per tenant in the flushed memtable (for pool release + L0 tokens).
+    pub tenant_bytes: HashMap<TenantId, u64>,
+    /// Hint: tenant with highest U_i/f_i among contributors (metrics / Fork B).
+    pub priority_tenant: Option<TenantId>,
 }
 
 struct WorkItem {
     pairs: Vec<(InternalKey, Entry)>,
     data_dir: PathBuf,
     next_sstable_id: Arc<AtomicU64>,
+    tenant_bytes: HashMap<TenantId, u64>,
+    priority_tenant: Option<TenantId>,
 }
 
 enum WorkerCommand {
@@ -43,6 +56,8 @@ pub struct FlushScheduler {
     worker_busy: Arc<AtomicBool>,
     worker_failed: Arc<AtomicBool>,
     last_error: Mutex<Option<String>>,
+    /// Last tenant preferred for flush service (fairness observability).
+    last_priority_tenant: Mutex<Option<TenantId>>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -72,6 +87,7 @@ impl FlushScheduler {
             worker_busy,
             worker_failed,
             last_error,
+            last_priority_tenant: Mutex::new(None),
             join_handle: Some(join_handle),
         }
     }
@@ -95,11 +111,20 @@ impl FlushScheduler {
         self.worker_busy.load(Ordering::Acquire)
     }
 
+    pub fn last_priority_tenant(&self) -> Option<TenantId> {
+        *self
+            .last_priority_tenant
+            .lock()
+            .expect("flush priority lock")
+    }
+
     pub fn try_submit(
         &self,
         pairs: Vec<(InternalKey, Entry)>,
         data_dir: PathBuf,
         next_sstable_id: Arc<AtomicU64>,
+        tenant_bytes: HashMap<TenantId, u64>,
+        priority_tenant: Option<TenantId>,
     ) -> bool {
         if pairs.is_empty() {
             return false;
@@ -109,11 +134,17 @@ impl FlushScheduler {
         }
         self.worker_failed.store(false, Ordering::Release);
         self.worker_busy.store(true, Ordering::Release);
+        *self
+            .last_priority_tenant
+            .lock()
+            .expect("flush priority lock") = priority_tenant;
         self.work_tx
             .send(WorkerCommand::Run(WorkItem {
                 pairs,
                 data_dir,
                 next_sstable_id,
+                tenant_bytes,
+                priority_tenant,
             }))
             .is_ok()
     }
@@ -158,8 +189,14 @@ fn flush_worker_loop(
             WorkerCommand::Shutdown => break,
             WorkerCommand::Run(item) => {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_flush(&item.pairs, &item.data_dir, &item.next_sstable_id)
-                        .map_err(|e| e.to_string())
+                    execute_flush(
+                        &item.pairs,
+                        &item.data_dir,
+                        &item.next_sstable_id,
+                        item.tenant_bytes,
+                        item.priority_tenant,
+                    )
+                    .map_err(|e| e.to_string())
                 }));
                 worker_busy.store(false, Ordering::Release);
                 let result = match result {
@@ -183,6 +220,8 @@ pub fn execute_flush(
     pairs: &[(InternalKey, Entry)],
     data_dir: &Path,
     next_sstable_id: &AtomicU64,
+    tenant_bytes: HashMap<TenantId, u64>,
+    priority_tenant: Option<TenantId>,
 ) -> EngineResult<FlushExecuteResult> {
     let max_seq = pairs.iter().map(|(k, _)| k.seq).max().unwrap_or(0);
     let sst = sstable::build(pairs, true);
@@ -217,7 +256,12 @@ pub fn execute_flush(
         max_seq: sst.max_seq,
         size_bytes: sst.bytes.len() as u64,
     };
-    Ok(FlushExecuteResult { meta, max_seq })
+    Ok(FlushExecuteResult {
+        meta,
+        max_seq,
+        tenant_bytes,
+        priority_tenant,
+    })
 }
 
 #[allow(dead_code)]

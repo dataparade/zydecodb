@@ -3,8 +3,10 @@
 //! The engine uses `&mut self` for writes — it is a single-owner type with no
 //! internal locking. Background flush/compaction/apply run on dedicated OS
 //! threads and communicate via channels. The server shares the engine across
-//! connection threads behind an `Arc<Mutex<Engine>>`, which serializes engine
-//! operations; long reads take the lock only briefly to build an owned snapshot.
+//! connection threads behind an [`crate::engine_handle::EngineHandle`], which
+//! serializes the write domain (`Mutex<Engine>`) while cache / fair / WAL sync
+//! use separate locks. Long reads take the write mutex only briefly to build
+//! an owned snapshot.
 
 use crate::entry::Entry;
 use crate::errors::{EngineError, EngineResult};
@@ -77,6 +79,12 @@ pub struct EngineConfig {
     /// any record with `seq > N`, so the engine boots at exactly that sequence.
     /// `None` (default) replays the entire WAL. Used by `admin restore`.
     pub wal_replay_max_seq: Option<u64>,
+    /// δ-fair multi-tenant isolation (Phase 5). Disabled by default; enable
+    /// under pods when per-tenant limits exist. See [`crate::tenant_fair`].
+    pub fair: crate::tenant_fair::FairConfig,
+    /// Override L0 file count that triggers write stall. `None` uses
+    /// `l0_trigger * 5` (floored at 20). Tests and dense pods may lower this.
+    pub l0_write_stall_threshold: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -92,6 +100,8 @@ impl Default for EngineConfig {
             manifest_sync_debounce_ms: 50,
             max_open_readers: 128,
             wal_replay_max_seq: None,
+            fair: crate::tenant_fair::FairConfig::default(),
+            l0_write_stall_threshold: None,
         }
     }
 }
@@ -142,8 +152,10 @@ impl BatchOp {
 pub struct Engine {
     cfg: EngineConfig,
     seq: Arc<SeqAllocator>,
-    active: Memtable,
-    immutable: VecDeque<Memtable>,
+    /// Active memtable behind `Arc` so owned snapshots pin without deep-clone.
+    /// Writers use [`Arc::make_mut`] (COW when a snapshot still holds the Arc).
+    active: Arc<Memtable>,
+    immutable: VecDeque<Arc<Memtable>>,
     sstables: Vec<LoadedSstable>, // newest last
     next_sstable_id: u64,
     active_wal_id: u64,
@@ -222,6 +234,12 @@ pub struct Engine {
     /// exists solely to keep the lock held.
     #[allow(dead_code)]
     data_dir_lock: File,
+    /// Write slowdown requested by the last backpressure check. Callers that
+    /// hold the engine mutex must [`Self::take_write_slowdown`] and sleep
+    /// *after* releasing the lock — never sleep under the mutex.
+    pending_write_slowdown: std::time::Duration,
+    /// δ-fair accounting (Phase 4–5). Disabled by default.
+    fair: std::sync::Arc<crate::tenant_fair::FairShareState>,
 }
 
 /// Name of the clean-shutdown marker written in the data dir by
@@ -279,8 +297,20 @@ impl Engine {
             state.live_sstables.iter().map(|m| m.id).collect();
         Self::delete_orphan_sstables(&cfg.data_dir, &live_ids)?;
 
-        // Construct shared caches before opening any reader.
+        // Construct shared caches before opening any reader. Block cache and
+        // fair-share state are independent lock domains (Phase 4).
+        let mut fair_cfg = cfg.fair.clone();
+        fair_cfg.cache_total_bytes = cfg.block_cache_bytes as u64;
+        // Respect an explicit fair memtable budget; only default to the flush
+        // threshold when the config left the pool size unset/zero.
+        if fair_cfg.memtable_total_bytes == 0 {
+            fair_cfg.memtable_total_bytes = cfg.memtable_flush_threshold as u64;
+        }
+        let fair = std::sync::Arc::new(crate::tenant_fair::FairShareState::new(fair_cfg));
         let block_cache = crate::block_cache::BlockCache::new(cfg.block_cache_bytes);
+        if cfg.fair.enabled {
+            block_cache.with_fair(std::sync::Arc::clone(&fair));
+        }
         let reader_cache = crate::reader_cache::ReaderCache::new(cfg.max_open_readers);
         let result_cache = if cfg.result_cache_bytes > 0 {
             Some(crate::result_cache::ResultCache::new(
@@ -333,6 +363,7 @@ impl Engine {
         //    allocate a fresh active segment id beyond max_wal_id+1.)
         let mut active = Memtable::new();
         let segments = wal::list_segments(&cfg.wal_dir)?;
+        // `active` is wrapped in Arc after replay (see Engine construction).
         let sstable_max_seq = sstables.iter().map(|s| s.meta.max_seq).max().unwrap_or(0);
         let mut replayed = 0usize;
         let mut max_wal_id = 0u64;
@@ -434,7 +465,7 @@ impl Engine {
         let mut engine = Engine {
             cfg,
             seq,
-            active,
+            active: Arc::new(active),
             immutable: VecDeque::new(),
             sstables,
             next_sstable_id,
@@ -473,10 +504,17 @@ impl Engine {
             manifest_dirty: false,
             last_manifest_sync: Instant::now(),
             data_dir_lock,
+            pending_write_slowdown: std::time::Duration::ZERO,
+            fair,
         };
         engine.open_new_wal_segment()?;
         engine.update_gauges();
         Ok(engine)
+    }
+
+    /// Shared block-cache handle (Phase 4: usable without the write mutex).
+    pub fn block_cache_arc(&self) -> Arc<crate::block_cache::BlockCache> {
+        Arc::clone(&self.block_cache)
     }
 
     pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
@@ -806,7 +844,7 @@ impl Engine {
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at: u64) -> EngineResult<u64> {
         keys::validate_user_key(&key)?;
         keys::validate_value(&value)?;
-        self.check_backpressure()?;
+        self.check_backpressure_for_key(&key)?;
 
         // Policy gate: reject before any WAL/memtable mutation. The policy is
         // cloned out so it can borrow `self` mutably (read/write the system
@@ -814,6 +852,11 @@ impl Engine {
         let existing_value_len = self.get(&key)?.map(|v| v.len());
         let policy = Arc::clone(&self.policy);
         policy.pre_write(self, &key, value.len(), existing_value_len, false)?;
+
+        // FairDB memtable admit (reserved + global pools). No WAL reservation.
+        if let Some(t) = crate::tenant_fair::tenant_from_user_key(&key) {
+            self.fair.admit_memtable(t, value.len() as u64)?;
+        }
 
         let seq = self.seq.next();
         let rec = WalRecord::put(seq, expires_at, key.clone(), value.clone());
@@ -833,7 +876,7 @@ impl Engine {
             },
         );
         crate::engine_fail_point!(crate::failpoints::ENGINE_BEFORE_MEMTABLE_INSERT);
-        self.active.insert(ik, entry);
+        self.active_mut().insert(ik, entry);
         crate::engine_fail_point!(crate::failpoints::ENGINE_AFTER_MEMTABLE_INSERT);
         if let Some(rc) = &self.result_cache {
             rc.invalidate(&key);
@@ -861,7 +904,7 @@ impl Engine {
     /// assigned sequence number (for group-commit durability waiting).
     pub fn del(&mut self, key: Vec<u8>) -> EngineResult<(bool, u64)> {
         keys::validate_user_key(&key)?;
-        self.check_backpressure()?;
+        self.check_backpressure_for_key(&key)?;
 
         let existing_value_len = self.get(&key)?.map(|v| v.len());
         let existed = existing_value_len.is_some();
@@ -880,7 +923,7 @@ impl Engine {
         }
 
         let ik = InternalKey::new(key.clone(), seq, EntryKind::Tombstone);
-        self.active.insert(ik, Entry::tombstone());
+        self.active_mut().insert(ik, Entry::tombstone());
         if let Some(rc) = &self.result_cache {
             rc.invalidate(&key);
         }
@@ -934,7 +977,7 @@ impl Engine {
                 }
             }
         }
-        self.check_backpressure()?;
+        self.check_backpressure_for_key(ops[0].key())?;
 
         // Policy gate: consult the policy for every op BEFORE any mutation. Any
         // rejection aborts the whole batch with nothing persisted. Existing
@@ -945,6 +988,15 @@ impl Engine {
             let existing = self.get(op.key())?.map(|v| v.len());
             existing_lens.push(existing);
             policy.pre_write(self, op.key(), op.value_len(), existing, op.is_delete())?;
+        }
+
+        // FairDB memtable admit for all puts (all-or-nothing with the batch).
+        for op in &ops {
+            if let BatchOp::Put { key, value, .. } = op {
+                if let Some(t) = crate::tenant_fair::tenant_from_user_key(key) {
+                    self.fair.admit_memtable(t, value.len() as u64)?;
+                }
+            }
         }
 
         // One seq for the whole batch.
@@ -1003,7 +1055,7 @@ impl Engine {
                     Entry::tombstone(),
                 ),
             };
-            self.active.insert(ik, entry);
+            self.active_mut().insert(ik, entry);
             if let Some(rc) = &self.result_cache {
                 rc.invalidate(op.key());
             }
@@ -1092,7 +1144,7 @@ impl Engine {
         }
         SnapshotHandle::new(
             seq_upper,
-            self.active.clone(),
+            Arc::clone(&self.active),
             self.immutable.iter().cloned().collect(),
             self.sstables.iter().map(|s| s.reader.clone()).collect(),
             self.sstables.iter().map(|s| s.meta.clone()).collect(),
@@ -1102,6 +1154,11 @@ impl Engine {
             self.block_cache.clone(),
             self.reader_cache.clone(),
         )
+    }
+
+    #[inline]
+    fn active_mut(&mut self) -> &mut Memtable {
+        Arc::make_mut(&mut self.active)
     }
 
     /// Count of SSTable readers currently resident in the table cache.
@@ -1420,8 +1477,8 @@ impl Engine {
         hi: Vec<u8>,
     ) -> EngineResult<crate::iter::MergingIterator<'_>> {
         crate::snapshot::build_sources(
-            &self.active,
-            self.immutable.iter(),
+            self.active.as_ref(),
+            self.immutable.iter().map(|m| m.as_ref()),
             &self
                 .sstables
                 .iter()
@@ -1515,7 +1572,7 @@ impl Engine {
         self.append_wal(&rec)?;
 
         let ik = InternalKey::new(key, seq, EntryKind::Value);
-        self.active.insert(ik, Entry::value(value, None));
+        self.active_mut().insert(ik, Entry::value(value, None));
 
         self.maybe_freeze();
         self.update_gauges();
@@ -1539,7 +1596,7 @@ impl Engine {
             self.append_wal(&rec)?;
         }
         let ik = InternalKey::new(key, seq, EntryKind::Value);
-        self.active.insert(ik, Entry::value(value, None));
+        self.active_mut().insert(ik, Entry::value(value, None));
         Ok(())
     }
 
@@ -1563,7 +1620,7 @@ impl Engine {
         self.append_wal(&rec)?;
 
         let ik = InternalKey::new(key, seq, EntryKind::Tombstone);
-        self.active.insert(ik, Entry::tombstone());
+        self.active_mut().insert(ik, Entry::tombstone());
 
         self.maybe_freeze();
         self.update_gauges();
@@ -1580,16 +1637,48 @@ impl Engine {
         entry.value.clone()
     }
 
-    fn check_backpressure(&self) -> EngineResult<()> {
+    fn check_backpressure(&mut self) -> EngineResult<()> {
+        self.check_backpressure_for_key(&[])
+    }
+
+    fn check_backpressure_for_key(&mut self, key: &[u8]) -> EngineResult<()> {
+        self.pending_write_slowdown = std::time::Duration::ZERO;
         if self.freeze_writes {
             return Err(EngineError::EngineBusy("writes frozen".into()));
         }
         if self.in_flight_wal_bytes > keys::MAX_IN_FLIGHT_WAL_BYTES {
             return Err(EngineError::EngineBusy("WAL in-flight limit".into()));
         }
-        if self.immutable.len() >= self.cfg.max_immutable_memtables {
+
+        let fair_on = self.fair.config().enabled;
+        let tenant = crate::tenant_fair::tenant_from_user_key(key);
+        let attribute_to_noisy = fair_on
+            && tenant
+                .map(|t| self.fair.should_attribute_stall(t))
+                .unwrap_or(false);
+
+        let imm_len = self.immutable.len();
+        let imm_soft = self.cfg.max_immutable_memtables;
+        // Absolute safety: always reject if the queue grows unboundedly even
+        // when fair mode would otherwise spare a well-behaved tenant.
+        let imm_hard = imm_soft.saturating_mul(2).max(imm_soft + 1);
+        if imm_len >= imm_hard {
             return Err(EngineError::EngineBusy("flush queue full".into()));
         }
+        if imm_len >= imm_soft {
+            if fair_on && !attribute_to_noisy {
+                // Well-behaved tenant: skip soft flush-queue reject.
+            } else {
+                if let Some(t) = tenant {
+                    if attribute_to_noisy {
+                        self.fair.note_stall(t);
+                        self.fair.charge_l0_tokens(t, 1);
+                    }
+                }
+                return Err(EngineError::EngineBusy("flush queue full".into()));
+            }
+        }
+
         let queue_depth = self.compaction_scheduler.queue_depth()
             + self.flush_scheduler.queue_depth()
             + if self.compaction_scheduler.compaction_needed() {
@@ -1597,47 +1686,166 @@ impl Engine {
             } else {
                 0
             };
-        if queue_depth >= 4 {
-            return Err(EngineError::EngineBusy(format!(
-                "compaction backlog (queue depth {})",
-                queue_depth
-            )));
-        }
-        // L0 stall: compaction can't keep up with flush. Threshold is 5x the
-        // compaction trigger — gives compaction headroom to catch up before
-        // we refuse writes. Tuned conservatively; the soak will inform it.
         let l0_count = self.sstables.iter().filter(|s| s.meta.level == 0).count();
-        let l0_stall_threshold = self.cfg.compaction.l0_trigger.saturating_mul(5).max(20);
-        if l0_count >= l0_stall_threshold {
-            return Err(EngineError::EngineBusy(format!(
-                "L0 compaction backlog ({} files)",
-                l0_count
-            )));
+        let l0_stall_threshold = self
+            .cfg
+            .l0_write_stall_threshold
+            .unwrap_or_else(|| self.cfg.compaction.l0_trigger.saturating_mul(5).max(20));
+
+        if queue_depth >= 4 {
+            if fair_on && !attribute_to_noisy {
+                // Well-behaved tenant under fair mode: skip hard reject.
+            } else {
+                if let Some(t) = tenant {
+                    if attribute_to_noisy {
+                        self.fair.note_stall(t);
+                        self.fair.charge_l0_tokens(t, 1);
+                    }
+                }
+                return Err(EngineError::EngineBusy(format!(
+                    "compaction backlog (queue depth {})",
+                    queue_depth
+                )));
+            }
         }
+        if l0_count >= l0_stall_threshold {
+            if fair_on && !attribute_to_noisy {
+                // skip
+            } else {
+                if let Some(t) = tenant {
+                    if attribute_to_noisy {
+                        self.fair.note_stall(t);
+                        self.fair.charge_l0_tokens(t, 1);
+                    }
+                }
+                return Err(EngineError::EngineBusy(format!(
+                    "L0 compaction backlog ({} files)",
+                    l0_count
+                )));
+            }
+        }
+
         let pending = self.estimate_pending_compaction_bytes();
         let hard = self.cfg.compaction.hard_pending_compaction_bytes;
         let soft = self.cfg.compaction.soft_pending_compaction_bytes;
+        // Compute slowdown but do NOT sleep here — callers hold the engine mutex.
         if hard > 0 && pending >= hard {
-            // Slow writes instead of rejecting them — matches RocksDB slowdown
-            // semantics and keeps soak/client loops from error-storming.
             let ratio = (pending - hard) as f64 / hard as f64;
             let delay_ms = (1.0 + ratio * 4.0).min(5.0) as u64;
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            self.pending_write_slowdown = std::time::Duration::from_millis(delay_ms);
         } else if soft > 0 && pending > soft {
             let ratio = (pending - soft) as f64 / soft as f64;
             let delay_us = (100.0 + ratio * 900.0).min(1000.0) as u64;
-            std::thread::sleep(std::time::Duration::from_micros(delay_us));
+            self.pending_write_slowdown = std::time::Duration::from_micros(delay_us);
+        }
+
+        // Cockroach-style: pace only over-share / token-debt tenants so they
+        // cannot deepen flush/L0 pressure at full rate. Well-behaved tenants
+        // keep the fast path. Callers must take_write_slowdown after unlock.
+        if fair_on && attribute_to_noisy {
+            let pace = std::time::Duration::from_millis(2);
+            if self.pending_write_slowdown < pace {
+                self.pending_write_slowdown = pace;
+            }
         }
         Ok(())
     }
 
-    /// Freeze the active memtable if it exceeds the flush threshold, then flush
-    /// synchronously in v1 (single executor; a background task is a Sprint 2 nicety).
+    /// Install δ-fair configuration (Phase 5). Off by default.
+    pub fn with_fair_share(
+        mut self,
+        fair: std::sync::Arc<crate::tenant_fair::FairShareState>,
+    ) -> Self {
+        self.fair = fair;
+        self
+    }
+
+    pub fn fair_share(&self) -> std::sync::Arc<crate::tenant_fair::FairShareState> {
+        Arc::clone(&self.fair)
+    }
+
+    /// Take the write slowdown suggested by the last successful backpressure
+    /// check. Apply with [`apply_write_slowdown`] only after releasing any
+    /// engine mutex.
+    pub fn take_write_slowdown(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.pending_write_slowdown)
+    }
+
+    /// Sleep for a write slowdown **outside** the engine mutex.
+    pub fn apply_write_slowdown(d: std::time::Duration) {
+        if !d.is_zero() {
+            std::thread::sleep(d);
+        }
+    }
+
+    /// Replay a sealed WAL segment already present in `wal_dir` into the live
+    /// memtable without a full [`Engine::open`]. Used by replica catch-up.
+    ///
+    /// Flushes current memtables first so only seqs not yet in SSTables are
+    /// applied. Reloading the document catalog is the caller's responsibility.
+    pub fn apply_installed_wal_segment(&mut self, segment_id: u64) -> EngineResult<usize> {
+        self.force_flush()?;
+        self.drain_background_work()?;
+
+        let path = self.cfg.wal_dir.join(wal::segment_filename(segment_id));
+        if !path.exists() {
+            return Err(EngineError::Io(format!(
+                "WAL segment {} missing at {}",
+                segment_id,
+                path.display()
+            )));
+        }
+        let (records, outcome) = Self::read_segment(&path)?;
+        match outcome {
+            wal::ReplayOutcome::Clean => {}
+            wal::ReplayOutcome::TornTail | wal::ReplayOutcome::Corruption => {
+                return Err(EngineError::Io(format!(
+                    "WAL: sealed segment {} is damaged; refusing catch-up apply",
+                    segment_id
+                )));
+            }
+        }
+
+        let sstable_max_seq = self
+            .sstables
+            .iter()
+            .map(|s| s.meta.max_seq)
+            .max()
+            .unwrap_or(0);
+        let seg_max = records.iter().map(|r| r.seq()).max().unwrap_or(0);
+        if seg_max > 0 {
+            self.sealed_segment_max_seq.insert(segment_id, seg_max);
+        }
+
+        let mut applied = 0usize;
+        let mut max_seq_seen = self.current_seq();
+        for rec in records {
+            let rec_seq = rec.seq();
+            if rec_seq <= sstable_max_seq {
+                continue;
+            }
+            max_seq_seen = max_seq_seen.max(rec_seq);
+            for (k, e) in rec.into_memtable_pairs() {
+                self.active_mut().insert(k, e);
+                applied += 1;
+            }
+        }
+        self.seq.bump_to_at_least(max_seq_seen.saturating_add(1));
+        self.wal_sync.set_watermarks(max_seq_seen);
+        self.maybe_freeze();
+        self.try_submit_flush();
+        self.maybe_submit_compaction();
+        self.update_gauges();
+        Ok(applied)
+    }
+
+    /// Freeze the active memtable if it exceeds the flush threshold, then queue
+    /// a background flush (Tidewalker / flush worker).
     fn maybe_freeze(&mut self) {
         if self.active.size_bytes() <= self.cfg.memtable_flush_threshold {
             return;
         }
-        let frozen = std::mem::replace(&mut self.active, Memtable::new());
+        let frozen = std::mem::replace(&mut self.active, Arc::new(Memtable::new()));
         self.immutable.push_back(frozen);
         self.update_gauges();
         self.try_submit_flush();
@@ -1657,10 +1865,24 @@ impl Engine {
         }
         let pairs: Vec<(InternalKey, Entry)> =
             mt.iter().map(|(k, e)| (k.clone(), e.clone())).collect();
+        // Tenant attribution for flush fairness + L0 token charge (Phase 5b).
+        // Immutable memtables stay FIFO (seq correctness); fairness is via
+        // admission + stall attribution, not flush reorder on a shared LSM.
+        let mut tenant_bytes: std::collections::HashMap<crate::tenant_fair::TenantId, u64> =
+            std::collections::HashMap::new();
+        for (ik, e) in &pairs {
+            if let Some(t) = crate::tenant_fair::tenant_from_user_key(&ik.user_key) {
+                let sz = (e.value_len() as u64).max(1);
+                *tenant_bytes.entry(t).or_default() += sz;
+            }
+        }
+        let priority_tenant = self.fair.pick_flush_priority_tenant(&tenant_bytes);
         let submitted = self.flush_scheduler.try_submit(
             pairs,
             self.cfg.data_dir.clone(),
             self.next_sstable_id_atomic.clone(),
+            tenant_bytes,
+            priority_tenant,
         );
         if submitted {
             self.immutable.pop_front();
@@ -1673,7 +1895,22 @@ impl Engine {
         &mut self,
         result: crate::flush_worker::FlushExecuteResult,
     ) -> EngineResult<()> {
-        let crate::flush_worker::FlushExecuteResult { meta, max_seq } = result;
+        let crate::flush_worker::FlushExecuteResult {
+            meta,
+            max_seq,
+            tenant_bytes,
+            ..
+        } = result;
+        // Release memtable pool credits and charge L0 byte tokens / Fork B domain.
+        let file_size = meta.size_bytes;
+        let total_attr: u64 = tenant_bytes.values().sum::<u64>().max(1);
+        let dominant = tenant_bytes.iter().max_by_key(|(_, b)| *b).map(|(k, _)| *k);
+        for (t, bytes) in &tenant_bytes {
+            self.fair.release_memtable(*t, *bytes);
+            let share = ((*bytes as u128) * file_size as u128 / total_attr as u128) as u64;
+            let files = u64::from(Some(*t) == dominant);
+            self.fair.note_l0_add(*t, files, share);
+        }
         let mut manifest_records = vec![ManifestRecord::SstableAdd(meta.clone())];
         let covered_up_to = self.wal_segments_covered(max_seq)?;
         if covered_up_to > 0 {
@@ -1702,7 +1939,7 @@ impl Engine {
             return Ok(());
         }
         if !self.active.is_empty() {
-            let frozen = std::mem::replace(&mut self.active, Memtable::new());
+            let frozen = std::mem::replace(&mut self.active, Arc::new(Memtable::new()));
             self.immutable.push_back(frozen);
         }
         self.drain_flush()?;
@@ -1996,6 +2233,18 @@ impl Engine {
 
         let remove_set: std::collections::HashSet<u64> =
             apply.remove_sstable_ids.iter().copied().collect();
+        // Credit L0 tokens for compacted-away L0 inputs (Phase 5b).
+        let removed_l0: Vec<_> = self
+            .sstables
+            .iter()
+            .filter(|s| remove_set.contains(&s.meta.id) && s.meta.level == 0)
+            .map(|s| s.meta.clone())
+            .collect();
+        for m in &removed_l0 {
+            if let Some(t) = crate::tenant_fair::tenant_from_user_key(&m.min_key) {
+                self.fair.note_l0_remove(t, 1, m.size_bytes);
+            }
+        }
         self.sstables.retain(|s| !remove_set.contains(&s.meta.id));
         for m in &apply.add_metas {
             let path = Self::sstable_path(&self.cfg.data_dir, m.id);
@@ -2315,7 +2564,7 @@ impl Engine {
                 if entry.is_expired(now) && !entry.is_tombstone() {
                     let seq = self.seq.next();
                     let ik = InternalKey::new(key.clone(), seq, EntryKind::Tombstone);
-                    self.active.insert(ik, Entry::tombstone());
+                    self.active_mut().insert(ik, Entry::tombstone());
                 }
             }
         }

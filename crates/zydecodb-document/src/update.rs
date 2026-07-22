@@ -228,7 +228,9 @@ pub fn apply_to_id(
 ) -> DocResult<bool> {
     match updated_body(engine, catalog, prefix, collection, doc_id, update, None)? {
         Some(bytes) => {
-            store::upsert(engine, catalog, prefix, collection, doc_id, &bytes, true)?;
+            store::upsert_with_expiry(
+                engine, catalog, prefix, collection, doc_id, &bytes, true, 0,
+            )?;
             Ok(true)
         }
         None => Ok(false),
@@ -268,7 +270,8 @@ pub fn apply_to_ids(
     let mut modified: u64 = 0;
     for id in ids {
         if let Some(bytes) = updated_body(engine, catalog, prefix, collection, id, update, filter)? {
-            let ops = store::upsert_ops(engine, catalog, prefix, collection, id, &bytes, true)?;
+            let ops =
+                store::upsert_ops(engine, catalog, prefix, collection, id, &bytes, true, 0)?;
             modified += 1;
             per_doc.push(ops);
         }

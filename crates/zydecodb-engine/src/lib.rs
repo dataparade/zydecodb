@@ -9,6 +9,7 @@ pub mod bloom;
 pub mod compaction;
 pub mod compaction_worker;
 pub mod engine;
+pub mod engine_handle;
 pub mod entry;
 pub mod errors;
 pub mod failpoints;
@@ -28,6 +29,7 @@ pub mod shipping;
 pub mod snapshot;
 pub mod sstable;
 pub mod stats;
+pub mod tenant_fair;
 pub mod wal;
 pub mod wal_sync;
 
@@ -35,7 +37,10 @@ pub mod wal_sync;
 /// hung off `Arc`s in every `SstableReader`. Embedders rarely touch this
 /// type directly; tune via [`engine::EngineConfig::block_cache_bytes`].
 pub use block_cache::{BlockCache, BlockKey, CacheStats};
+/// Phase 4 factorized shared handle (`write` / cache / fair / wal_sync).
+pub use engine_handle::EngineHandle;
 /// Snapshot-isolated read primitives. See [`snapshot`] module docs for
 /// the v1 (scoped) vs v2 (long-lived) trade-off.
 pub use owned_snapshot::SnapshotHandle;
 pub use snapshot::{RangeIter, SnapshotView};
+pub use tenant_fair::{FairConfig, FairShareState, TenantId};
