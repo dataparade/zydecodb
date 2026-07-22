@@ -93,7 +93,13 @@ npm test           # node --test (native type stripping; no transpiler)
 ```
 
 The codec is verified byte-for-byte against the shared
-[conformance vectors](../conformance) — no server required. The live
-integration tests run against a server selected by `ZYDECODB_TEST_HOST` /
-`ZYDECODB_TEST_PORT` (and optional `ZYDECODB_TEST_API_KEY`) and are skipped when
-it is unreachable.
+[conformance vectors](../conformance) (generated from Rust; Python is the
+hand-maintained reference client). No server required. CI job
+`wire-conformance` fails the PR on drift.
+
+```bash
+npm test test/conformance.test.ts
+```
+
+Live integration tests use `ZYDECODB_TEST_HOST` / `ZYDECODB_TEST_PORT` (and
+optional `ZYDECODB_TEST_API_KEY`) and are skipped when the server is unreachable.

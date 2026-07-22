@@ -3,6 +3,10 @@
 Official Python client for [ZydecoDB](../../README.md). Pure standard library,
 no runtime dependencies.
 
+**Wire reference:** this client is the hand-maintained reference codec. Go and
+TypeScript track the same bytes via [`../conformance/vectors.json`](../conformance/vectors.json)
+(CI job `wire-conformance`).
+
 ## Install
 
 ```bash
@@ -67,12 +71,12 @@ users.delete_many({"stale": True}, relaxed=True)
 
 ## Running the tests
 
-Unit tests for the wire codecs need no server:
+Unit + wire conformance (no server):
 
 ```bash
 cd clients/python
 pip install -e ".[dev]"
-pytest tests/test_protocol.py
+pytest tests/test_protocol.py tests/test_conformance.py
 ```
 
 Integration tests run against a live server selected by environment variables

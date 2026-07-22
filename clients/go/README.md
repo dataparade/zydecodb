@@ -102,12 +102,16 @@ Both read `ZYDECODB_ADDR` (default `127.0.0.1:9470`) and `ZYDECODB_API_KEY`.
 ## Running the tests
 
 The codec is verified byte-for-byte against the shared
-[conformance vectors](../conformance) — no server required:
+[conformance vectors](../conformance) (generated from Rust; Python is the
+hand-maintained reference client). No server required:
 
 ```bash
 cd clients/go
-go test ./...
+go test ./proto_conformance_test.go ./proto.go ./errors.go
+# or: go test ./...
 ```
+
+CI job `wire-conformance` fails the PR if this codec drifts from `vectors.json`.
 
 Integration tests run against a live server selected by environment variables
 (skipped automatically if it is unreachable):

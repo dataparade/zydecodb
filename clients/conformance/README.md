@@ -17,8 +17,14 @@ The authority is the Rust code in
 cargo run -p zydecodb-document --bin gen_conformance
 ```
 
-Commit the resulting `vectors.json`. CI for each client diffs its codec against
-this file, so a protocol change that breaks a client fails that client's tests.
+Commit the resulting `vectors.json`. CI job **`wire-conformance`** (see
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)):
+
+1. Regenerates vectors and fails if `vectors.json` is stale.
+2. Runs Python, Go, and TypeScript codec suites against that file.
+
+Python is the hand-maintained reference client; Go and TypeScript must match
+the same bytes. A protocol change that breaks any client fails the PR.
 
 ## File shape
 
