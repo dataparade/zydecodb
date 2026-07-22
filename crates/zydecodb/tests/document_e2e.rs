@@ -369,6 +369,44 @@ fn find_update_delete_count_over_wire() {
     handle.join().unwrap();
 }
 
+
+#[test]
+fn filter_type_array_over_wire() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    doc_put(
+        &mut s,
+        "misc",
+        b"1",
+        r#"{"name":"Ada","n":1,"tags":["a","b"],"items":[{"x":1,"y":2}]}"#,
+    );
+    doc_put(
+        &mut s,
+        "misc",
+        b"2",
+        r#"{"name":"Bo","n":"x","tags":["a"],"items":[{"x":1,"y":0}]}"#,
+    );
+
+    let hits = find(&mut s, "misc", r#"{"n":{"$type":"number"}}"#);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["name"], serde_json::json!("Ada"));
+
+    let hits = find(&mut s, "misc", r#"{"tags":{"$all":["a","b"]}}"#);
+    assert_eq!(hits.len(), 1);
+
+    let hits = find(
+        &mut s,
+        "misc",
+        r#"{"items":{"$elemMatch":{"x":1,"y":{"$gt":1}}}}"#,
+    );
+    assert_eq!(hits.len(), 1);
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
 #[test]
 fn filter_upsert_inserts_or_updates() {
     let (addr, shutdown, handle) = spawn_ephemeral_server();

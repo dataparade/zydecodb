@@ -3,7 +3,8 @@
 //!
 //! Surface:
 //! - Field conditions: `{field: value}` (equality) or `{field: {$op: operand}}`.
-//! - Comparison operators: `$eq $ne $gt $gte $lt $lte $in $nin $exists`.
+//! - Comparison operators: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type`.
+//! - Array operators: `$all` `$elemMatch` (residual filter only).
 //! - Logical: top-level multiple fields are implicitly ANDed; `$and`/`$or` take
 //!   arrays of sub-filters; `$not` wraps a single sub-filter.
 //! - Dotted paths (`"a.b.c"`) walk nested objects.
@@ -13,8 +14,8 @@
 //! secondary indexes use. Equality on arrays/objects falls back to structural
 //! JSON equality; ordering operators only apply to scalars.
 
-use crate::error::{DocError, DocResult};
 use crate::binary::ValueView;
+use crate::error::{DocError, DocResult};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
 
@@ -37,7 +38,7 @@ pub struct FieldPred {
 }
 
 /// A single comparison against a field's value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Atom {
     Eq(Value),
     Ne(Value),
@@ -48,6 +49,32 @@ pub enum Atom {
     In(Vec<Value>),
     Nin(Vec<Value>),
     Exists(bool),
+    /// BSON-ish type name (`"string"`, `"number"`, …).
+    Type(&'static str),
+    /// Field must be an array containing every operand (equality per element).
+    All(Vec<Value>),
+    /// Nested filter evaluated against each array element.
+    ElemMatch(Filter),
+}
+
+impl PartialEq for Atom {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Atom::Eq(a), Atom::Eq(b))
+            | (Atom::Ne(a), Atom::Ne(b))
+            | (Atom::Gt(a), Atom::Gt(b))
+            | (Atom::Gte(a), Atom::Gte(b))
+            | (Atom::Lt(a), Atom::Lt(b))
+            | (Atom::Lte(a), Atom::Lte(b)) => a == b,
+            (Atom::In(a), Atom::In(b))
+            | (Atom::Nin(a), Atom::Nin(b))
+            | (Atom::All(a), Atom::All(b)) => a == b,
+            (Atom::Exists(a), Atom::Exists(b)) => a == b,
+            (Atom::Type(a), Atom::Type(b)) => a == b,
+            (Atom::ElemMatch(a), Atom::ElemMatch(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl Filter {
@@ -178,6 +205,14 @@ fn parse_atom(op: &str, operand: &Value) -> DocResult<Atom> {
                 .as_bool()
                 .ok_or_else(|| DocError::BadFilter("$exists requires a boolean".into()))?,
         ),
+        "$type" => Atom::Type(parse_type_name(operand)?),
+        "$all" => Atom::All(arr()?),
+        "$elemMatch" => {
+            let obj = operand
+                .as_object()
+                .ok_or_else(|| DocError::BadFilter("$elemMatch requires a filter object".into()))?;
+            Atom::ElemMatch(parse_obj(obj)?)
+        }
         other => {
             return Err(DocError::BadFilter(format!(
                 "unsupported operator '{other}'"
@@ -186,13 +221,30 @@ fn parse_atom(op: &str, operand: &Value) -> DocResult<Atom> {
     })
 }
 
+fn parse_type_name(operand: &Value) -> DocResult<&'static str> {
+    let name = operand
+        .as_str()
+        .ok_or_else(|| DocError::BadFilter("$type requires a string type name".into()))?;
+    Ok(match name {
+        "string" => "string",
+        "number" => "number",
+        "bool" => "bool",
+        "null" => "null",
+        "array" => "array",
+        "object" => "object",
+        "binary" => "binary",
+        other => return Err(DocError::BadFilter(format!("unsupported $type '{other}'"))),
+    })
+}
+
+
 impl FieldPred {
     fn matches(&self, doc: ValueView<'_>, doc_id: Option<&[u8]>) -> bool {
         if self.path == crate::planner::ID_FIELD {
             if let Some(id_bytes) = doc_id {
                 let id_str = String::from_utf8_lossy(id_bytes).into_owned();
                 let id_val = serde_json::Value::String(id_str);
-                
+
                 // We evaluate atoms against this Value
                 // But atoms expect Option<ValueView>, which we can't easily make from an owned String without a ZDocBuilder
                 // Let's just build a tiny ZDoc for the ID
@@ -212,7 +264,9 @@ impl Atom {
             Atom::Eq(target) => eq_match(field, target),
             Atom::Ne(target) => !eq_match(field, target),
             Atom::Gt(target) => ordering_match(field, target, &[Ordering::Greater]),
-            Atom::Gte(target) => ordering_match(field, target, &[Ordering::Greater, Ordering::Equal]),
+            Atom::Gte(target) => {
+                ordering_match(field, target, &[Ordering::Greater, Ordering::Equal])
+            }
             Atom::Lt(target) => ordering_match(field, target, &[Ordering::Less]),
             Atom::Lte(target) => ordering_match(field, target, &[Ordering::Less, Ordering::Equal]),
             Atom::Exists(want) => field.is_some() == *want,
@@ -224,7 +278,41 @@ impl Atom {
                 Some(v) => !list.iter().any(|t| value_eq_view(v, t)),
                 None => !list.iter().any(Value::is_null),
             },
+            Atom::Type(name) => type_match(field, name),
+            Atom::All(operands) => match field.and_then(|v| v.as_array()) {
+                Some(arr) => operands
+                    .iter()
+                    .all(|op| (0..arr.len()).any(|i| value_eq_view(arr.get(i).unwrap(), op))),
+                None => false,
+            },
+            Atom::ElemMatch(sub) => match field.and_then(|v| v.as_array()) {
+                Some(arr) => (0..arr.len()).any(|i| sub.matches(arr.get(i).unwrap(), None)),
+                None => false,
+            },
         }
+    }
+}
+
+fn type_match(field: Option<ValueView<'_>>, name: &str) -> bool {
+    let Some(v) = field else {
+        return false;
+    };
+    match name {
+        "string" => v.type_byte() == crate::binary::TYPE_STRING,
+        "number" => matches!(
+            v.type_byte(),
+            crate::binary::TYPE_I64 | crate::binary::TYPE_F64
+        ),
+        "bool" => matches!(
+            v.type_byte(),
+            crate::binary::TYPE_BOOL_FALSE | crate::binary::TYPE_BOOL_TRUE
+        ),
+        "null" => v.is_null(),
+        "array" => v.type_byte() == crate::binary::TYPE_ARRAY,
+        "object" => v.type_byte() == crate::binary::TYPE_OBJECT,
+        // No binary value tag in ZDoc today.
+        "binary" => false,
+        _ => false,
     }
 }
 
@@ -238,7 +326,11 @@ fn eq_match(field: Option<crate::binary::ValueView<'_>>, target: &Value) -> bool
 
 /// Ordering operators require both sides to be scalars; missing or non-scalar
 /// fields never match.
-fn ordering_match(field: Option<crate::binary::ValueView<'_>>, target: &Value, accept: &[Ordering]) -> bool {
+fn ordering_match(
+    field: Option<crate::binary::ValueView<'_>>,
+    target: &Value,
+    accept: &[Ordering],
+) -> bool {
     match field.and_then(|v| cmp_scalar_view(v, target)) {
         Some(ord) => accept.contains(&ord),
         None => false,
@@ -256,7 +348,7 @@ fn cmp_scalar_view(a: crate::binary::ValueView<'_>, b: &Value) -> Option<Orderin
     if !is_scalar(b) {
         return None;
     }
-    
+
     let a_type = match a.type_byte() {
         crate::binary::TYPE_NULL => 0,
         crate::binary::TYPE_BOOL_FALSE | crate::binary::TYPE_BOOL_TRUE => 1,
@@ -264,7 +356,7 @@ fn cmp_scalar_view(a: crate::binary::ValueView<'_>, b: &Value) -> Option<Orderin
         crate::binary::TYPE_STRING => 3,
         _ => return None,
     };
-    
+
     let b_type = match b {
         Value::Null => 0,
         Value::Bool(_) => 1,
@@ -272,11 +364,11 @@ fn cmp_scalar_view(a: crate::binary::ValueView<'_>, b: &Value) -> Option<Orderin
         Value::String(_) => 3,
         _ => return None,
     };
-    
+
     if a_type != b_type {
         return Some(a_type.cmp(&b_type));
     }
-    
+
     match a_type {
         0 => Some(Ordering::Equal),
         1 => {
@@ -302,7 +394,9 @@ fn value_eq_view(a: crate::binary::ValueView<'_>, b: &Value) -> bool {
     if a.type_byte() == crate::binary::TYPE_ARRAY && b.is_array() {
         let a_arr = a.as_array().unwrap();
         let b_arr = b.as_array().unwrap();
-        if a_arr.len() != b_arr.len() { return false; }
+        if a_arr.len() != b_arr.len() {
+            return false;
+        }
         for i in 0..a_arr.len() {
             if !value_eq_view(a_arr.get(i).unwrap(), &b_arr[i]) {
                 return false;
@@ -313,18 +407,22 @@ fn value_eq_view(a: crate::binary::ValueView<'_>, b: &Value) -> bool {
     if a.type_byte() == crate::binary::TYPE_OBJECT && b.is_object() {
         let a_obj = a.as_object().unwrap();
         let b_obj = b.as_object().unwrap();
-        if a_obj.len() != b_obj.len() { return false; }
+        if a_obj.len() != b_obj.len() {
+            return false;
+        }
         for i in 0..a_obj.len() {
             let (k, v) = a_obj.get_at(i).unwrap();
             if let Some(bv) = b_obj.get(k) {
-                if !value_eq_view(v, bv) { return false; }
+                if !value_eq_view(v, bv) {
+                    return false;
+                }
             } else {
                 return false;
             }
         }
         return true;
     }
-    
+
     match cmp_scalar_view(a, b) {
         Some(Ordering::Equal) => true,
         _ => false,
@@ -373,12 +471,30 @@ mod tests {
 
     #[test]
     fn in_nin_and_exists() {
-        assert!(check_matches(&parse(json!({"c": {"$in": ["a", "b"]}})), &json!({"c": "b"})));
-        assert!(!check_matches(&parse(json!({"c": {"$in": ["a", "b"]}})), &json!({"c": "z"})));
-        assert!(check_matches(&parse(json!({"c": {"$nin": ["a"]}})), &json!({"c": "z"})));
-        assert!(check_matches(&parse(json!({"c": {"$exists": true}})), &json!({"c": null})));
-        assert!(!check_matches(&parse(json!({"c": {"$exists": true}})), &json!({"d": 1})));
-        assert!(check_matches(&parse(json!({"c": {"$exists": false}})), &json!({"d": 1})));
+        assert!(check_matches(
+            &parse(json!({"c": {"$in": ["a", "b"]}})),
+            &json!({"c": "b"})
+        ));
+        assert!(!check_matches(
+            &parse(json!({"c": {"$in": ["a", "b"]}})),
+            &json!({"c": "z"})
+        ));
+        assert!(check_matches(
+            &parse(json!({"c": {"$nin": ["a"]}})),
+            &json!({"c": "z"})
+        ));
+        assert!(check_matches(
+            &parse(json!({"c": {"$exists": true}})),
+            &json!({"c": null})
+        ));
+        assert!(!check_matches(
+            &parse(json!({"c": {"$exists": true}})),
+            &json!({"d": 1})
+        ));
+        assert!(check_matches(
+            &parse(json!({"c": {"$exists": false}})),
+            &json!({"d": 1})
+        ));
     }
 
     #[test]
@@ -412,8 +528,41 @@ mod tests {
 
     #[test]
     fn unknown_operator_is_rejected() {
-        assert!(Filter::parse(&json!({"a": {"$regex": "x"}})).is_err());
+        assert!(Filter::parse(&json!({"a": {"$bogus": "x"}})).is_err());
         assert!(Filter::parse(&json!({"$weird": 1})).is_err());
+    }
+
+    #[test]
+    fn type_all_elem_match() {
+        assert!(check_matches(
+            &parse(json!({"n": {"$type": "number"}})),
+            &json!({"n": 3})
+        ));
+        assert!(!check_matches(
+            &parse(json!({"n": {"$type": "string"}})),
+            &json!({"n": 3})
+        ));
+        assert!(check_matches(
+            &parse(json!({"tags": {"$all": ["a", "b"]}})),
+            &json!({"tags": ["a", "b", "c"]})
+        ));
+        assert!(!check_matches(
+            &parse(json!({"tags": {"$all": ["a", "z"]}})),
+            &json!({"tags": ["a", "b"]})
+        ));
+        assert!(check_matches(
+            &parse(json!({"items": {"$elemMatch": {"x": 1, "y": {"$gt": 0}}}})),
+            &json!({"items": [{"x": 1, "y": 2}, {"x": 9, "y": 0}]})
+        ));
+        assert!(!check_matches(
+            &parse(json!({"items": {"$elemMatch": {"x": 1, "y": {"$gt": 5}}}})),
+            &json!({"items": [{"x": 1, "y": 2}]})
+        ));
+    }
+
+    #[test]
+    fn regex_still_rejected() {
+        assert!(Filter::parse(&json!({"a": {"$regex": "x"}})).is_err());
     }
 
     #[test]
