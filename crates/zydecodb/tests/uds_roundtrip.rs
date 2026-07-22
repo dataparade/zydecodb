@@ -1,71 +1,26 @@
 //! End-to-end round-trip over a Unix-domain socket: the server should serve the
 //! same wire protocol on a UDS path as it does over TCP.
 
-use std::io::{Read, Write};
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
+
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use zydecodb_engine::errors::Status;
-use zydecodb_engine::frame::{
-    Command, KeyPayload, PutPayload, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN,
-};
-
-fn write_request(stream: &mut UnixStream, req: &RequestEnvelope) {
-    stream.write_all(&req.encode()).unwrap();
-    stream.flush().unwrap();
-}
-
-fn read_response(stream: &mut UnixStream) -> ResponseEnvelope {
-    let mut header = [0u8; ENVELOPE_HEADER_LEN];
-    stream.read_exact(&mut header).unwrap();
-    let (status, len) = ResponseEnvelope::parse_header(&header).unwrap();
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream.read_exact(&mut payload).unwrap();
-    }
-    ResponseEnvelope::new(status, payload)
-}
+use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope};
 
 #[test]
 fn uds_put_get_roundtrip() {
     let tmp = TempDir::new().unwrap();
-    let data_dir = tmp.path().join("data");
-    let wal_dir = tmp.path().join("wal");
-    std::fs::create_dir_all(&data_dir).unwrap();
-    std::fs::create_dir_all(&wal_dir).unwrap();
     let sock = tmp.path().join("zydeco.sock");
+    let addr = free_addr();
+    let mut config = base_config(&tmp, addr);
+    config.listen_unix = Some(sock.clone());
 
-    // The TCP listener is still required; bind an ephemeral loopback port for it.
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    let config = zydecodb::config::Config {
-        listen: addr,
-        data_dir,
-        wal_dir,
-        block_cache_mb: 64,
-        max_open_readers: 32,
-        poll_compaction_ms: 50,
-        durability: Default::default(),
-        fsync_interval_ms: 100,
-        shipping: Default::default(),
-        metrics: Default::default(),
-        replica: Default::default(),
-        security: zydecodb::config::SecurityConfig {
-            require_auth: zydecodb::config::RequireAuth::False,
-            ..Default::default()
-        },
-        tls: Default::default(),
-        listen_unix: Some(sock.clone()),
-        runtime: Default::default(),
-        fair: Default::default(),
-    };
-
-    let server = zydecodb::server::Server::new();
-    let shutdown = server.shutdown_flag();
-    let handle = thread::spawn(move || server.run(config).unwrap());
+    let (shutdown, handle) = spawn_server(config);
 
     // Wait for the socket to come up.
     let mut stream = None;
@@ -111,6 +66,5 @@ fn uds_put_get_roundtrip() {
     assert_eq!(get_resp.payload, b"world");
 
     drop(stream);
-    *shutdown.lock().unwrap() = true;
-    handle.join().unwrap();
+    shutdown_join(&shutdown, handle);
 }

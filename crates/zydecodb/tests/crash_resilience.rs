@@ -2,7 +2,7 @@ use tempfile::TempDir;
 
 use zydecodb_engine::engine::{BatchOp, Engine, EngineConfig};
 
-fn base_config(tmp: &TempDir) -> EngineConfig {
+fn engine_config(tmp: &TempDir) -> EngineConfig {
     let data_dir = tmp.path().join("data");
     let wal_dir = tmp.path().join("wal");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -15,7 +15,7 @@ fn base_config(tmp: &TempDir) -> EngineConfig {
 #[test]
 fn test_crash_resilience_torn_write() {
     let tmp = TempDir::new().unwrap();
-    let config = base_config(&tmp);
+    let config = engine_config(&tmp);
 
     // 1. Start engine and write some keys
     let mut engine = Engine::open(config.clone()).unwrap();

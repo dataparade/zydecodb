@@ -73,6 +73,12 @@ pub fn auth_config(tmp: &TempDir, listen: SocketAddr, keys_file: PathBuf) -> Con
     cfg
 }
 
+/// Replace the security block on an existing config.
+pub fn with_security(mut cfg: Config, security: SecurityConfig) -> Config {
+    cfg.security = security;
+    cfg
+}
+
 pub fn write_request(stream: &mut impl Write, req: &RequestEnvelope) {
     stream.write_all(&req.encode()).unwrap();
     stream.flush().unwrap();

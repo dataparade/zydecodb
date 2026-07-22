@@ -1,8 +1,12 @@
 //! End-to-end: a primary ships its WAL, a read replica ingests the
 //! sha256-verified segments, serves the replicated data, and refuses writes.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::free_addr;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -16,14 +20,7 @@ const CMD_GET: u8 = 0x02;
 const STATUS_OK: u8 = 0x00;
 const STATUS_FORBIDDEN: u8 = 0x0C;
 
-fn free_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
-}
-
-fn base_config(dir: &TempDir, name: &str, listen: SocketAddr) -> Config {
+fn named_base_config(dir: &TempDir, name: &str, listen: SocketAddr) -> Config {
     let root = dir.path().join(name);
     let data_dir = root.join("data");
     let wal_dir = root.join("wal");
@@ -116,7 +113,7 @@ fn replica_ingests_shipped_wal_and_is_read_only() {
 
     // --- Primary: ship WAL into ship_dir. ---
     let primary_addr = free_addr();
-    let mut primary_cfg = base_config(&tmp, "primary", primary_addr);
+    let mut primary_cfg = named_base_config(&tmp, "primary", primary_addr);
     primary_cfg.shipping = ShippingConfig {
         ship_dir: Some(ship_dir.clone()),
         mode: "copy".into(),
@@ -143,7 +140,7 @@ fn replica_ingests_shipped_wal_and_is_read_only() {
 
     // --- Replica: ingest the shipped WAL, serve read-only. ---
     let replica_addr = free_addr();
-    let mut replica_cfg = base_config(&tmp, "replica", replica_addr);
+    let mut replica_cfg = named_base_config(&tmp, "replica", replica_addr);
     replica_cfg.replica = ReplicaConfig {
         from: Some(ship_dir.clone()),
         poll_ms: 100,
@@ -197,7 +194,7 @@ fn promotion_bumps_epoch_and_fences_old_primary() {
     let old_addr = free_addr();
     let hmac_key = tmp.path().join("ship.hmac");
     std::fs::write(&hmac_key, b"e2e-shipping-hmac-key").unwrap();
-    let mut old_cfg = base_config(&tmp, "old_primary", old_addr);
+    let mut old_cfg = named_base_config(&tmp, "old_primary", old_addr);
     old_cfg.shipping = ShippingConfig {
         ship_dir: Some(ship.clone()),
         mode: "copy".into(),
