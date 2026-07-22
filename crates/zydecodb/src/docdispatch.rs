@@ -422,15 +422,8 @@ fn update_cmd(
         max_sort_buffer,
     )?;
     let (modified, seq) = with_catalog_engine_write(engine, catalog, |cat, guard| {
-        let modified = update::apply_to_ids(
-            guard,
-            cat,
-            prefix,
-            &p.collection,
-            &ids,
-            &upd,
-            Some(&filter),
-        )?;
+        let modified =
+            update::apply_to_ids(guard, cat, prefix, &p.collection, &ids, &upd, Some(&filter))?;
         let seq = guard.last_buffered_seq();
         Ok::<_, DocError>((modified, seq))
     })?;

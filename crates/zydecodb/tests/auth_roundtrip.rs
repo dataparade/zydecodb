@@ -8,9 +8,7 @@ use tempfile::TempDir;
 use zydecodb::config::{Config, RequireAuth, SecurityConfig};
 use zydecodb::security::keys::{KeyRole, KeyStore};
 use zydecodb_engine::errors::Status;
-use zydecodb_engine::frame::{
-    Command, KeyPayload, PutPayload, RequestEnvelope,
-};
+use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope};
 
 #[test]
 fn auth_required_rejects_anonymous_put() {

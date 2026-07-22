@@ -9,9 +9,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use zydecodb_engine::engine::{Engine, EngineConfig};
 use zydecodb_engine::errors::Status;
-use zydecodb_engine::frame::{
-    Command, KeyPayload, PutPayload, RequestEnvelope,
-};
+use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope};
 
 #[test]
 fn tcp_put_get_del_roundtrip() {

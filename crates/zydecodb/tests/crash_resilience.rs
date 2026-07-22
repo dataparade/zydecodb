@@ -8,7 +8,9 @@ fn engine_config(tmp: &TempDir) -> EngineConfig {
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
     EngineConfig {
-        data_dir, wal_dir, ..Default::default()
+        data_dir,
+        wal_dir,
+        ..Default::default()
     }
 }
 

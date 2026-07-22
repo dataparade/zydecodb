@@ -259,12 +259,12 @@ impl Drop for Engine {
     }
 }
 
-mod open;
-mod write;
-mod read;
 mod catalog;
 mod maintain;
+mod open;
+mod read;
 mod stats;
+mod write;
 
 // Allow reading a segment's seek position cleanly in tests/util.
 #[allow(dead_code)]

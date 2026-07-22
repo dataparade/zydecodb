@@ -6,9 +6,7 @@ use std::thread;
 use tempfile::TempDir;
 use zydecodb::config::{Config, QuotasConfig, RequireAuth, SecurityConfig};
 use zydecodb_engine::errors::Status;
-use zydecodb_engine::frame::{
-    Command, PutPayload, RequestEnvelope,
-};
+use zydecodb_engine::frame::{Command, PutPayload, RequestEnvelope};
 
 #[test]
 fn rate_limit_returns_engine_busy() {

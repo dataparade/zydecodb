@@ -128,7 +128,8 @@ fn test_json_bomb_oom() {
     }
 
     let payload = zydecodb_engine::frame::PutPayload {
-        routing_key: [0u8; 16], txid: 0,
+        routing_key: [0u8; 16],
+        txid: 0,
         expires_at: 0,
         key: b"bomb".to_vec(),
         value: json.into_bytes(),

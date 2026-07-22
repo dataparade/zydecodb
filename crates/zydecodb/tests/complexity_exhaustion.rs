@@ -26,7 +26,8 @@ fn test_filter_complexity_exhaustion() {
 
     // Create collection via index definition
     let idx = IndexDefPayload {
-        collection: "test".to_string(), index_name: "idx_a".to_string(),
+        collection: "test".to_string(),
+        index_name: "idx_a".to_string(),
         fields: vec!["a".to_string()],
         unique: false,
     };

@@ -35,7 +35,6 @@ use zydecodb_engine::metrics::Metrics;
 mod soak_common;
 use soak_common::Lcg;
 
-
 // ---------------------------------------------------------------------------
 // CLI
 

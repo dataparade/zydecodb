@@ -247,5 +247,4 @@ impl Engine {
             .map(|(&a, &b)| (a, b))
             .collect()
     }
-
 }

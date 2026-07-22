@@ -526,5 +526,4 @@ impl Engine {
                 compaction: None,
             })
     }
-
 }

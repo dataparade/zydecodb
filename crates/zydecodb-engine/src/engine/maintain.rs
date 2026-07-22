@@ -229,7 +229,10 @@ impl Engine {
         ps.live_snapshot_seqs.is_empty()
     }
 
-    pub(crate) fn compaction_drop_tombstones(&self, job: &crate::compaction::CompactionJob) -> bool {
+    pub(crate) fn compaction_drop_tombstones(
+        &self,
+        job: &crate::compaction::CompactionJob,
+    ) -> bool {
         job.output_level == self.cfg.compaction.max_level && self.compaction_allow_tombstone_drop()
     }
 
@@ -257,7 +260,9 @@ impl Engine {
         )
     }
 
-    pub(crate) fn plan_compaction_job(&self) -> Option<(crate::compaction::CompactionJob, Vec<SstableMeta>)> {
+    pub(crate) fn plan_compaction_job(
+        &self,
+    ) -> Option<(crate::compaction::CompactionJob, Vec<SstableMeta>)> {
         let metas: Vec<SstableMeta> = self.sstables.iter().map(|s| s.meta.clone()).collect();
         let planner = crate::compaction::CompactionPlanner::new(&metas, &self.cfg.compaction);
         let job = planner.plan()?;
@@ -640,5 +645,4 @@ impl Engine {
         self.active_wal_id += 1;
         self.open_new_wal_segment()
     }
-
 }

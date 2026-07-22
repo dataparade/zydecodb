@@ -15,14 +15,10 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
-use zydecodb::config::{
-    MetricsConfig, ReplicaConfig, ShippingConfig,
-};
+use zydecodb::config::{MetricsConfig, ReplicaConfig, ShippingConfig};
 use zydecodb::security::keys::{KeyRole, KeyStore};
 use zydecodb_engine::errors::Status;
-use zydecodb_engine::frame::{
-    Command, KeyPayload, PutPayload, RequestEnvelope,
-};
+use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope};
 
 /// Serializes tests that read or mutate `ZYDECODB_BOOTSTRAP_KEY`: the keystore
 /// reads the env at load, so a bootstrap set by one test must never leak into

@@ -395,7 +395,9 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn read_segment(path: &Path) -> EngineResult<(Vec<wal::WalEntry>, wal::ReplayOutcome)> {
+    pub(crate) fn read_segment(
+        path: &Path,
+    ) -> EngineResult<(Vec<wal::WalEntry>, wal::ReplayOutcome)> {
         let mut f = File::open(path)?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
@@ -549,5 +551,4 @@ impl Engine {
         self.wal_sync.advance_buffered(seq);
         Ok(())
     }
-
 }
