@@ -49,7 +49,7 @@ func main() {
 	}
 
 	_, _ = users.UpdateOne(ctx, zydecodb.Document{"_id": id},
-		zydecodb.Document{"$inc": zydecodb.Document{"age": 1}}, false)
+		zydecodb.Document{"$inc": zydecodb.Document{"age": 1}}, false, false)
 }
 ```
 
@@ -83,7 +83,7 @@ the fsync.
 ```go
 users.InsertOne(ctx, doc, true)
 users.UpdateOne(ctx, zydecodb.Document{"_id": "ada"},
-	zydecodb.Document{"$inc": zydecodb.Document{"hits": 1}}, true)
+	zydecodb.Document{"$inc": zydecodb.Document{"hits": 1}}, true, false)
 ```
 
 ## Examples

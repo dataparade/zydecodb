@@ -10,9 +10,12 @@
 //! apply one atomic batch per document (not globally atomic across the set).
 
 use crate::error::{DocError, DocResult};
+use crate::filter::{Atom, Filter};
 use crate::store::{self, strip_value_kind};
 use crate::{catalog::Catalog, keys};
 use serde_json::{Map, Value};
+use std::io::Read;
+use std::time::{SystemTime, UNIX_EPOCH};
 use zydecodb_engine::engine::Engine;
 
 /// A parsed update document: an ordered list of operator applications.
@@ -209,7 +212,8 @@ fn updated_body(
     let mut body: Value = if stored[0] == crate::store::VK_ZDOC {
         crate::binary::ValueView::new(strip_value_kind(&stored)).to_value()
     } else {
-        serde_json::from_slice(strip_value_kind(&stored)).map_err(|e| DocError::InvalidJson(e.to_string()))?
+        serde_json::from_slice(strip_value_kind(&stored))
+            .map_err(|e| DocError::InvalidJson(e.to_string()))?
     };
     update.apply(&mut body)?;
     let new_bytes = crate::binary::ZDocBuilder::from_value(&body);
@@ -269,15 +273,125 @@ pub fn apply_to_ids(
     let mut per_doc: Vec<Vec<zydecodb_engine::engine::BatchOp>> = Vec::with_capacity(ids.len());
     let mut modified: u64 = 0;
     for id in ids {
-        if let Some(bytes) = updated_body(engine, catalog, prefix, collection, id, update, filter)? {
-            let ops =
-                store::upsert_ops(engine, catalog, prefix, collection, id, &bytes, true, 0)?;
+        if let Some(bytes) = updated_body(engine, catalog, prefix, collection, id, update, filter)?
+        {
+            let ops = store::upsert_ops(engine, catalog, prefix, collection, id, &bytes, true, 0)?;
             modified += 1;
             per_doc.push(ops);
         }
     }
     store::commit_batches(engine, per_doc)?;
     Ok(modified)
+}
+
+/// Build the document that an upsert would insert: equality fields from `filter`
+/// as the base, then apply `update`. Returns `(doc_id_bytes, zdoc_body)`.
+///
+/// The filter must be equality-extractable (top-level `Atom::Eq` only). `_id`
+/// must be a string equality when present; otherwise a UUIDv7-style hex id is
+/// generated (same shape drivers use).
+pub fn materialize_upsert(filter: &Filter, update: &UpdateDoc) -> DocResult<(Vec<u8>, Vec<u8>)> {
+    let (mut base, id_opt) = build_upsert_base(filter)?;
+    let id = id_opt.unwrap_or_else(generate_doc_id);
+    if let Value::Object(ref mut m) = base {
+        m.insert(
+            crate::planner::ID_FIELD.to_string(),
+            Value::String(id.clone()),
+        );
+    }
+    update.apply(&mut base)?;
+    let body = crate::binary::ZDocBuilder::from_value(&base);
+    Ok((id.into_bytes(), body))
+}
+
+/// Extract a usable insert base from top-level equality predicates only.
+pub fn build_upsert_base(filter: &Filter) -> DocResult<(Value, Option<String>)> {
+    let mut map = Map::new();
+    let mut id = None;
+    extract_eq_fields(filter, &mut map, &mut id)?;
+    if map.is_empty() && id.is_none() {
+        return Err(DocError::BadFilter(
+            "upsert requires equality predicates (or _id) to build an insert document".into(),
+        ));
+    }
+    Ok((Value::Object(map), id))
+}
+
+fn extract_eq_fields(
+    filter: &Filter,
+    out: &mut Map<String, Value>,
+    id: &mut Option<String>,
+) -> DocResult<()> {
+    match filter {
+        Filter::MatchAll => Err(DocError::BadFilter(
+            "upsert cannot build an insert document from an empty filter".into(),
+        )),
+        Filter::Or(_) | Filter::Not(_) => Err(DocError::BadFilter(
+            "upsert requires equality predicates; $or/$not cannot build an insert document".into(),
+        )),
+        Filter::And(fs) => {
+            for sub in fs {
+                extract_eq_fields(sub, out, id)?;
+            }
+            Ok(())
+        }
+        Filter::Field(fp) => {
+            if fp.atoms.len() != 1 {
+                return Err(DocError::BadFilter(format!(
+                    "upsert cannot extract equality for field '{}'",
+                    fp.path
+                )));
+            }
+            match &fp.atoms[0] {
+                Atom::Eq(v) => {
+                    if fp.path == crate::planner::ID_FIELD {
+                        let s = v.as_str().ok_or_else(|| {
+                            DocError::BadFilter("upsert _id equality must be a string".into())
+                        })?;
+                        *id = Some(s.to_string());
+                    }
+                    // Top-level path segment only for the object key when undotted;
+                    // dotted paths nest via set_path.
+                    if fp.path.contains('.') {
+                        let mut root = Value::Object(std::mem::take(out));
+                        set_path(&mut root, &fp.path, v.clone())?;
+                        *out = root.as_object().cloned().unwrap_or_default();
+                    } else {
+                        out.insert(fp.path.clone(), v.clone());
+                    }
+                    Ok(())
+                }
+                _ => Err(DocError::BadFilter(format!(
+                    "upsert requires equality on '{}'; non-eq operators cannot build an insert document",
+                    fp.path
+                ))),
+            }
+        }
+    }
+}
+
+/// UUIDv7-style hex id: 48-bit ms timestamp + 80 random bits (matches drivers).
+fn generate_doc_id() -> String {
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+        & ((1u64 << 48) - 1);
+    let mut rnd = [0u8; 10];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut rnd);
+    } else {
+        let mix = ts_ms.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        rnd[..8].copy_from_slice(&mix.to_le_bytes());
+    }
+    let mut out = String::with_capacity(32);
+    for b in &ts_ms.to_be_bytes()[2..] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    for b in &rnd {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -325,5 +439,42 @@ mod tests {
         assert!(UpdateDoc::parse(&json!({"name": "x"})).is_err());
         assert!(UpdateDoc::parse(&json!({})).is_err());
         assert!(UpdateDoc::parse(&json!({"$bogus": {"a": 1}})).is_err());
+    }
+
+    #[test]
+    fn upsert_base_from_equality_filter() {
+        let f = Filter::parse(&json!({"email": "a@b.c", "n": 1})).unwrap();
+        let (base, id) = build_upsert_base(&f).unwrap();
+        assert!(id.is_none());
+        assert_eq!(base, json!({"email": "a@b.c", "n": 1}));
+    }
+
+    #[test]
+    fn upsert_base_extracts_string_id() {
+        let f = Filter::parse(&json!({"_id": "u1", "city": "NOLA"})).unwrap();
+        let (base, id) = build_upsert_base(&f).unwrap();
+        assert_eq!(id.as_deref(), Some("u1"));
+        assert_eq!(base["city"], json!("NOLA"));
+        assert_eq!(base["_id"], json!("u1"));
+    }
+
+    #[test]
+    fn upsert_base_rejects_non_eq() {
+        let f = Filter::parse(&json!({"age": {"$gt": 18}})).unwrap();
+        assert!(build_upsert_base(&f).is_err());
+        let f = Filter::parse(&json!({"$or": [{"a": 1}, {"b": 2}]})).unwrap();
+        assert!(build_upsert_base(&f).is_err());
+    }
+
+    #[test]
+    fn materialize_upsert_applies_update() {
+        let f = Filter::parse(&json!({"_id": "x", "email": "a@b.c"})).unwrap();
+        let u = UpdateDoc::parse(&json!({"$set": {"email": "a@b.c", "n": 1}})).unwrap();
+        let (id, body) = materialize_upsert(&f, &u).unwrap();
+        assert_eq!(id, b"x");
+        let v = crate::binary::ValueView::new(&body).to_value();
+        assert_eq!(v["_id"], json!("x"));
+        assert_eq!(v["email"], json!("a@b.c"));
+        assert_eq!(v["n"], json!(1));
     }
 }

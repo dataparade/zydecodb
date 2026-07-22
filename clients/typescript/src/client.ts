@@ -57,6 +57,7 @@ export interface FindOptions {
 export interface UpdateResult {
   matched: number;
   modified: number;
+  upserted_id?: string;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -269,10 +270,11 @@ export class Client {
     update: Buffer,
     multi: boolean,
     relaxed: boolean,
+    upsert = false,
   ): Promise<UpdateResult> {
     const body = await this.execute(
       Cmd.Update,
-      encodeUpdate(collection, filter, update, multi, relaxed),
+      encodeUpdate(collection, filter, update, multi, relaxed, upsert),
       "Update",
       { retryable: false },
     );

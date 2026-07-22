@@ -155,7 +155,7 @@ func TestLiveInsertFindUpdateDelete(t *testing.T) {
 		t.Fatalf("unexpected find result: %v", names)
 	}
 
-	res, err := coll.UpdateOne(ctx, Document{"name": "Bo"}, Document{"$inc": Document{"age": 10}}, false)
+	res, err := coll.UpdateOne(ctx, Document{"name": "Bo"}, Document{"$inc": Document{"age": 10}}, false, false)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}

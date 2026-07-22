@@ -70,9 +70,7 @@ pub fn get_by_id(
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
     let dk = keys::doc_key(prefix, coll.id, doc_id);
-    Ok(snap
-        .get(&dk)?
-        .map(|stored| stored_to_json_vec(&stored)))
+    Ok(snap.get(&dk)?.map(|stored| stored_to_json_vec(&stored)))
 }
 
 /// Build a scan spec from the catalog and (optional) JSON-array bounds. Bounds
@@ -161,8 +159,7 @@ pub fn execute_index_scan(snap: &SnapshotHandle, spec: &ScanSpec) -> DocResult<Q
         let body = if spec.include_bodies {
             let mut dk = spec.doc_prefix.clone();
             dk.extend_from_slice(&doc_id);
-            snap.get(&dk)?
-                .map(|stored| stored_to_json_vec(&stored))
+            snap.get(&dk)?.map(|stored| stored_to_json_vec(&stored))
         } else {
             None
         };
@@ -283,11 +280,12 @@ pub(crate) fn check_filter(stored: &[u8], filter: &crate::filter::Filter, doc_id
     let view = if kind == crate::store::VK_ZDOC {
         crate::binary::ValueView::new(payload)
     } else {
-        let val: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+        let val: serde_json::Value =
+            serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
         temp_zdoc = crate::binary::ZDocBuilder::from_value(&val);
         crate::binary::ValueView::new(&temp_zdoc)
     };
-    
+
     filter.matches(view, Some(doc_id))
 }
 
@@ -299,10 +297,12 @@ fn parse_doc(stored: &[u8], doc_id: &[u8]) -> Option<serde_json::Value> {
     } else {
         serde_json::from_slice(payload).ok()?
     };
-    
+
     if let serde_json::Value::Object(map) = &mut v {
         map.entry(crate::planner::ID_FIELD.to_string())
-            .or_insert_with(|| serde_json::Value::String(String::from_utf8_lossy(doc_id).into_owned()));
+            .or_insert_with(|| {
+                serde_json::Value::String(String::from_utf8_lossy(doc_id).into_owned())
+            });
     }
     Some(v)
 }
@@ -600,21 +600,28 @@ pub fn distinct(
 ) -> DocResult<Vec<Value>> {
     let (path, doc_prefix, prefix_len) = plan_scan(catalog, prefix, collection, filter)?;
     let mut seen: Vec<Value> = Vec::new();
-    for_each_match(snap, filter, &path, &doc_prefix, prefix_len, |doc_id, stored| {
-        if let Some(v) = parse_doc(stored, &doc_id) {
-            let val = encoding::extract_path(&v, field);
-            if seen
-                .binary_search_by(|probe| encoding::cmp_values(probe, &val))
-                .is_err()
-            {
-                let pos = seen
+    for_each_match(
+        snap,
+        filter,
+        &path,
+        &doc_prefix,
+        prefix_len,
+        |doc_id, stored| {
+            if let Some(v) = parse_doc(stored, &doc_id) {
+                let val = encoding::extract_path(&v, field);
+                if seen
                     .binary_search_by(|probe| encoding::cmp_values(probe, &val))
-                    .unwrap_or_else(|e| e);
-                seen.insert(pos, val);
+                    .is_err()
+                {
+                    let pos = seen
+                        .binary_search_by(|probe| encoding::cmp_values(probe, &val))
+                        .unwrap_or_else(|e| e);
+                    seen.insert(pos, val);
+                }
             }
-        }
-        Ok(true)
-    })?;
+            Ok(true)
+        },
+    )?;
     Ok(seen)
 }
 
@@ -664,7 +671,8 @@ fn extract_sort_keys(stored: &[u8], sort: &[(String, bool)]) -> Vec<Vec<u8>> {
     let view = if kind == crate::store::VK_ZDOC {
         crate::binary::ValueView::new(payload)
     } else {
-        let val: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+        let val: serde_json::Value =
+            serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
         temp_zdoc = crate::binary::ZDocBuilder::from_value(&val);
         crate::binary::ValueView::new(&temp_zdoc)
     };

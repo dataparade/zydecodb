@@ -51,22 +51,22 @@ impl ZDocBuilder {
                 out.push(TYPE_ARRAY);
                 out.extend_from_slice(&0u32.to_le_bytes()); // placeholder for total len
                 out.extend_from_slice(&(arr.len() as u32).to_le_bytes());
-                
+
                 let offsets_start = out.len();
                 out.resize(out.len() + arr.len() * 4, 0); // placeholders for value offsets
-                
+
                 let mut offsets = Vec::with_capacity(arr.len());
                 for item in arr {
                     offsets.push((out.len() - start) as u32);
                     Self::write_value(item, out);
                 }
-                
+
                 // Backfill offsets
                 for (i, offset) in offsets.into_iter().enumerate() {
                     let pos = offsets_start + i * 4;
-                    out[pos..pos+4].copy_from_slice(&offset.to_le_bytes());
+                    out[pos..pos + 4].copy_from_slice(&offset.to_le_bytes());
                 }
-                
+
                 // Backfill total length
                 let total_len = (out.len() - start) as u32;
                 out[start + 1..start + 5].copy_from_slice(&total_len.to_le_bytes());
@@ -75,41 +75,41 @@ impl ZDocBuilder {
                 out.push(TYPE_OBJECT);
                 out.extend_from_slice(&0u32.to_le_bytes()); // placeholder for total len
                 out.extend_from_slice(&(obj.len() as u32).to_le_bytes());
-                
+
                 // Sort keys for O(log N) lookup
                 let mut sorted_keys: Vec<(&String, &Value)> = obj.iter().collect();
                 sorted_keys.sort_by(|a, b| a.0.cmp(b.0));
-                
+
                 let keys_offsets_start = out.len();
                 out.resize(out.len() + obj.len() * 4, 0); // placeholder for key offsets
                 let vals_offsets_start = out.len();
                 out.resize(out.len() + obj.len() * 4, 0); // placeholder for value offsets
-                
+
                 let mut key_offsets = Vec::with_capacity(obj.len());
                 let mut val_offsets = Vec::with_capacity(obj.len());
-                
+
                 for (k, v) in sorted_keys {
                     // Write key (raw utf8 bytes with length prefix)
                     key_offsets.push((out.len() - start) as u32);
                     let k_bytes = k.as_bytes();
                     out.extend_from_slice(&(k_bytes.len() as u32).to_le_bytes());
                     out.extend_from_slice(k_bytes);
-                    
+
                     // Write value
                     val_offsets.push((out.len() - start) as u32);
                     Self::write_value(v, out);
                 }
-                
+
                 // Backfill offsets
                 for (i, offset) in key_offsets.into_iter().enumerate() {
                     let pos = keys_offsets_start + i * 4;
-                    out[pos..pos+4].copy_from_slice(&offset.to_le_bytes());
+                    out[pos..pos + 4].copy_from_slice(&offset.to_le_bytes());
                 }
                 for (i, offset) in val_offsets.into_iter().enumerate() {
                     let pos = vals_offsets_start + i * 4;
-                    out[pos..pos+4].copy_from_slice(&offset.to_le_bytes());
+                    out[pos..pos + 4].copy_from_slice(&offset.to_le_bytes());
                 }
-                
+
                 // Backfill total length
                 let total_len = (out.len() - start) as u32;
                 out[start + 1..start + 5].copy_from_slice(&total_len.to_le_bytes());
@@ -131,25 +131,31 @@ impl<'a> ValueView<'a> {
     pub fn type_byte(&self) -> u8 {
         self.data.first().copied().unwrap_or(TYPE_NULL)
     }
-    
+
     pub fn len(&self) -> usize {
         match self.type_byte() {
             TYPE_NULL | TYPE_BOOL_FALSE | TYPE_BOOL_TRUE => 1,
             TYPE_I64 | TYPE_F64 => 9,
             TYPE_STRING => {
-                if self.data.len() < 5 { return self.data.len(); }
+                if self.data.len() < 5 {
+                    return self.data.len();
+                }
                 let slen = u32::from_le_bytes(self.data[1..5].try_into().unwrap()) as usize;
                 5 + slen
             }
             TYPE_ARRAY | TYPE_OBJECT => {
-                if self.data.len() < 5 { return self.data.len(); }
+                if self.data.len() < 5 {
+                    return self.data.len();
+                }
                 u32::from_le_bytes(self.data[1..5].try_into().unwrap()) as usize
             }
             _ => 1,
         }
     }
 
-    pub fn is_null(&self) -> bool { self.type_byte() == TYPE_NULL }
+    pub fn is_null(&self) -> bool {
+        self.type_byte() == TYPE_NULL
+    }
     pub fn as_bool(&self) -> Option<bool> {
         match self.type_byte() {
             TYPE_BOOL_FALSE => Some(false),
@@ -177,12 +183,12 @@ impl<'a> ValueView<'a> {
         if self.type_byte() == TYPE_STRING && self.data.len() >= 5 {
             let len = u32::from_le_bytes(self.data[1..5].try_into().unwrap()) as usize;
             if self.data.len() >= 5 + len {
-                return std::str::from_utf8(&self.data[5..5+len]).ok();
+                return std::str::from_utf8(&self.data[5..5 + len]).ok();
             }
         }
         None
     }
-    
+
     pub fn as_object(&self) -> Option<ObjectView<'a>> {
         if self.type_byte() == TYPE_OBJECT {
             Some(ObjectView { data: self.data })
@@ -257,29 +263,33 @@ pub struct ObjectView<'a> {
 
 impl<'a> ObjectView<'a> {
     pub fn len(&self) -> usize {
-        if self.data.len() < 9 { return 0; }
+        if self.data.len() < 9 {
+            return 0;
+        }
         u32::from_le_bytes(self.data[5..9].try_into().unwrap()) as usize
     }
 
     fn key_offset(&self, index: usize) -> u32 {
         let pos = 9 + index * 4;
-        u32::from_le_bytes(self.data[pos..pos+4].try_into().unwrap())
+        u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap())
     }
 
     fn val_offset(&self, index: usize) -> u32 {
         let count = self.len();
         let pos = 9 + count * 4 + index * 4;
-        u32::from_le_bytes(self.data[pos..pos+4].try_into().unwrap())
+        u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap())
     }
 
     fn key_str(&self, offset: u32) -> &'a str {
         let off = offset as usize;
-        let len = u32::from_le_bytes(self.data[off..off+4].try_into().unwrap()) as usize;
-        std::str::from_utf8(&self.data[off+4..off+4+len]).unwrap_or("")
+        let len = u32::from_le_bytes(self.data[off..off + 4].try_into().unwrap()) as usize;
+        std::str::from_utf8(&self.data[off + 4..off + 4 + len]).unwrap_or("")
     }
 
     pub fn get_at(&self, index: usize) -> Option<(&'a str, ValueView<'a>)> {
-        if index >= self.len() { return None; }
+        if index >= self.len() {
+            return None;
+        }
         let k_off = self.key_offset(index);
         let v_off = self.val_offset(index);
         let k = self.key_str(k_off);
@@ -289,17 +299,19 @@ impl<'a> ObjectView<'a> {
 
     pub fn get(&self, key: &str) -> Option<ValueView<'a>> {
         let count = self.len();
-        if count == 0 { return None; }
-        
+        if count == 0 {
+            return None;
+        }
+
         let mut low = 0;
         let mut high = count as isize - 1;
-        
+
         while low <= high {
             let mid = low + (high - low) / 2;
             let mid_idx = mid as usize;
             let k_off = self.key_offset(mid_idx);
             let mid_key = self.key_str(k_off);
-            
+
             match mid_key.cmp(key) {
                 Ordering::Equal => {
                     let v_off = self.val_offset(mid_idx);
@@ -319,14 +331,18 @@ pub struct ArrayView<'a> {
 
 impl<'a> ArrayView<'a> {
     pub fn len(&self) -> usize {
-        if self.data.len() < 9 { return 0; }
+        if self.data.len() < 9 {
+            return 0;
+        }
         u32::from_le_bytes(self.data[5..9].try_into().unwrap()) as usize
     }
 
     pub fn get(&self, index: usize) -> Option<ValueView<'a>> {
-        if index >= self.len() { return None; }
+        if index >= self.len() {
+            return None;
+        }
         let pos = 9 + index * 4;
-        let v_off = u32::from_le_bytes(self.data[pos..pos+4].try_into().unwrap());
+        let v_off = u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap());
         Some(ValueView::new(&self.data[v_off as usize..]))
     }
 }

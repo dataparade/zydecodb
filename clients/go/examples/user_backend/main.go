@@ -218,7 +218,7 @@ func (s *server) patchUserByID(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 	res, err := s.coll.UpdateOne(r.Context(), zydecodb.Document{"_id": id},
-		zydecodb.Document{"$set": fields}, false)
+		zydecodb.Document{"$set": fields}, false, false)
 	if err != nil {
 		if zydecodb.IsConflict(err) {
 			http.Error(w, "email already exists", http.StatusConflict)

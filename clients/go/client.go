@@ -312,8 +312,8 @@ func (c *Client) Find(ctx context.Context, collection string, filter []byte, opt
 
 // Update applies an update to matching documents and returns the raw JSON
 // summary ({"matched":N,"modified":M}). Never retried automatically.
-func (c *Client) Update(ctx context.Context, collection string, filter, update []byte, multi, relaxed bool) ([]byte, error) {
-	return c.execute(ctx, CmdUpdate, EncodeUpdate(collection, filter, update, multi, relaxed), "Update", execOptions{retryable: false})
+func (c *Client) Update(ctx context.Context, collection string, filter, update []byte, multi, relaxed, upsert bool) ([]byte, error) {
+	return c.execute(ctx, CmdUpdate, EncodeUpdate(collection, filter, update, multi, relaxed, upsert), "Update", execOptions{retryable: false})
 }
 
 // DeleteByFilter deletes matching documents and returns the deleted count.

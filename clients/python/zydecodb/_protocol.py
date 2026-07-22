@@ -43,6 +43,7 @@ PROJ_EXCLUDE = 0x02
 
 # Bit 0 of the optional trailing flags byte on write payloads.
 FLAG_RELAXED = 0x01
+FLAG_UPSERT = 0x02
 
 # --- status codes (response header byte 1) ---
 STATUS_OK = 0x00
@@ -192,14 +193,25 @@ def encode_find(
 
 
 def encode_update(
-    collection: str, filt: dict, update_doc: dict, *, multi: bool, relaxed: bool
+    collection: str,
+    filt: dict,
+    update_doc: dict,
+    *,
+    multi: bool,
+    relaxed: bool,
+    upsert: bool = False,
 ) -> bytes:
+    flags = 0
+    if relaxed:
+        flags |= FLAG_RELAXED
+    if upsert:
+        flags |= FLAG_UPSERT
     out = (
         _lp(collection.encode())
         + _lp(_filter_bytes(filt))
         + _lp(_json_bytes(update_doc))
         + bytes([1 if multi else 0])
-        + bytes([FLAG_RELAXED if relaxed else 0])
+        + bytes([flags])
     )
     return out
 

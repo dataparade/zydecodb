@@ -61,7 +61,7 @@ func main() {
 	}
 
 	res, err := users.UpdateMany(ctx, zydecodb.Document{"city": "NOLA"},
-		zydecodb.Document{"$set": zydecodb.Document{"region": "South"}}, false)
+		zydecodb.Document{"$set": zydecodb.Document{"region": "South"}}, false, false)
 	if err != nil {
 		log.Fatalf("update: %v", err)
 	}

@@ -115,7 +115,14 @@ function encodeRequest(v: ReqVector): Buffer {
       );
     }
     case "Update":
-      return encodeUpdate(s(i, "collection"), optBytes(s(i, "filter_json")), optBytes(s(i, "update_json")), b(i, "multi"), b(i, "relaxed"));
+      return encodeUpdate(
+        s(i, "collection"),
+        optBytes(s(i, "filter_json")),
+        optBytes(s(i, "update_json")),
+        b(i, "multi"),
+        b(i, "relaxed"),
+        Boolean(i["upsert"]),
+      );
     case "Delete":
       return encodeDelete(s(i, "collection"), optBytes(s(i, "filter_json")), b(i, "multi"), b(i, "relaxed"));
     case "Count":

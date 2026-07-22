@@ -244,10 +244,18 @@ class Client:
         *,
         multi: bool,
         relaxed: bool = False,
+        upsert: bool = False,
     ) -> dict:
         body = self._execute(
             proto.CMD_UPDATE,
-            proto.encode_update(collection, filt, update_doc, multi=multi, relaxed=relaxed),
+            proto.encode_update(
+                collection,
+                filt,
+                update_doc,
+                multi=multi,
+                relaxed=relaxed,
+                upsert=upsert,
+            ),
             "Update",
             retryable=False,
         )

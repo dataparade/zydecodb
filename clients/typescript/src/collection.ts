@@ -62,12 +62,36 @@ export class Collection {
     return this.client.putDocument(this.name, docId, jsonBytes(doc), relaxed);
   }
 
-  updateOne(filter: Document, update: Document, relaxed = false): Promise<UpdateResult> {
-    return this.client.update(this.name, filterBytes(filter), jsonBytes(update), false, relaxed);
+  updateOne(
+    filter: Document,
+    update: Document,
+    relaxed = false,
+    upsert = false,
+  ): Promise<UpdateResult> {
+    return this.client.update(
+      this.name,
+      filterBytes(filter),
+      jsonBytes(update),
+      false,
+      relaxed,
+      upsert,
+    );
   }
 
-  updateMany(filter: Document, update: Document, relaxed = false): Promise<UpdateResult> {
-    return this.client.update(this.name, filterBytes(filter), jsonBytes(update), true, relaxed);
+  updateMany(
+    filter: Document,
+    update: Document,
+    relaxed = false,
+    upsert = false,
+  ): Promise<UpdateResult> {
+    return this.client.update(
+      this.name,
+      filterBytes(filter),
+      jsonBytes(update),
+      true,
+      relaxed,
+      upsert,
+    );
   }
 
   deleteOne(filter: Document, relaxed = false): Promise<number> {

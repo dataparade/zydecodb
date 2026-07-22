@@ -91,15 +91,27 @@ fn update(
     upd: &str,
     multi: bool,
 ) -> serde_json::Value {
+    update_opts(s, collection, filter, upd, multi, false)
+}
+
+fn update_opts(
+    s: &mut TcpStream,
+    collection: &str,
+    filter: &str,
+    upd: &str,
+    multi: bool,
+    upsert: bool,
+) -> serde_json::Value {
     let p = wire::UpdatePayload {
         collection: collection.into(),
         filter: filter.as_bytes().to_vec(),
         update: upd.as_bytes().to_vec(),
         multi,
         relaxed: false,
+        upsert,
     };
     let resp = roundtrip(s, &RequestEnvelope::new(Command::Update, p.encode()));
-    assert_eq!(resp.status, Status::Ok, "Update failed");
+    assert_eq!(resp.status, Status::Ok, "Update failed: {:?}", resp);
     serde_json::from_slice(&resp.payload).unwrap()
 }
 
@@ -351,6 +363,74 @@ fn find_update_delete_count_over_wire() {
     // Filtered delete.
     assert_eq!(delete(&mut s, "people", r#"{"age":{"$lt":35}}"#, true), 1); // Ada(30)
     assert_eq!(count(&mut s, "people", "{}"), 2);
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn filter_upsert_inserts_or_updates() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    // Miss → insert (server-generated id when filter has no _id).
+    let res = update_opts(
+        &mut s,
+        "accounts",
+        r#"{"email":"a@b.c"}"#,
+        r#"{"$set":{"email":"a@b.c","n":1}}"#,
+        false,
+        true,
+    );
+    assert_eq!(res["matched"], serde_json::json!(0));
+    assert_eq!(res["modified"], serde_json::json!(0));
+    let upserted = res["upserted_id"].as_str().expect("upserted_id");
+    assert!(!upserted.is_empty());
+    assert_eq!(count(&mut s, "accounts", r#"{"email":"a@b.c"}"#), 1);
+
+    // Hit → update; no upserted_id.
+    let res = update_opts(
+        &mut s,
+        "accounts",
+        r#"{"email":"a@b.c"}"#,
+        r#"{"$inc":{"n":1}}"#,
+        false,
+        true,
+    );
+    assert_eq!(res["matched"], serde_json::json!(1));
+    assert_eq!(res["modified"], serde_json::json!(1));
+    assert!(res.get("upserted_id").is_none());
+    let docs = find(&mut s, "accounts", r#"{"email":"a@b.c"}"#);
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["n"], serde_json::json!(2));
+    assert_eq!(docs[0]["_id"], serde_json::json!(upserted));
+
+    // Explicit _id in filter on a miss inserts that id.
+    let res = update_opts(
+        &mut s,
+        "accounts",
+        r#"{"_id":"fixed1","email":"x@y.z"}"#,
+        r#"{"$set":{"email":"x@y.z"}}"#,
+        false,
+        true,
+    );
+    assert_eq!(res["upserted_id"], serde_json::json!("fixed1"));
+    let by_id = find(&mut s, "accounts", r#"{"_id":"fixed1"}"#);
+    assert_eq!(by_id.len(), 1);
+
+    // multi=true still inserts at most one on miss.
+    let res = update_opts(
+        &mut s,
+        "accounts",
+        r#"{"tag":"solo"}"#,
+        r#"{"$set":{"tag":"solo"}}"#,
+        true,
+        true,
+    );
+    assert_eq!(res["matched"], serde_json::json!(0));
+    assert!(res["upserted_id"].as_str().is_some());
+    assert_eq!(count(&mut s, "accounts", r#"{"tag":"solo"}"#), 1);
 
     drop(s);
     *shutdown.lock().unwrap() = true;

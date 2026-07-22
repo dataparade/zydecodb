@@ -251,7 +251,8 @@
         "filter_json": "{\"_id\":\"u1\"}",
         "multi": true,
         "relaxed": true,
-        "update_json": "{\"$set\":{\"name\":\"x\"}}"
+        "update_json": "{\"$set\":{\"name\":\"x\"}}",
+        "upsert": false
       },
       "kind": "Update",
       "name": "update_multi_relaxed",
@@ -265,11 +266,27 @@
         "filter_json": "{\"age\":{\"$lt\":0}}",
         "multi": false,
         "relaxed": false,
-        "update_json": "{\"$inc\":{\"n\":1}}"
+        "update_json": "{\"$inc\":{\"n\":1}}",
+        "upsert": false
       },
       "kind": "Update",
       "name": "update_one_durable",
       "payload_hex": "000000057573657273000000117b22616765223a7b22246c74223a307d7d000000107b2224696e63223a7b226e223a317d7d0000"
+    },
+    {
+      "command": 36,
+      "envelope_hex": "012400000044000000057573657273000000117b22656d61696c223a226140622e63227d000000207b2224736574223a7b22656d61696c223a226140622e63222c226e223a317d7d0002",
+      "input": {
+        "collection": "users",
+        "filter_json": "{\"email\":\"a@b.c\"}",
+        "multi": false,
+        "relaxed": false,
+        "update_json": "{\"$set\":{\"email\":\"a@b.c\",\"n\":1}}",
+        "upsert": true
+      },
+      "kind": "Update",
+      "name": "update_upsert",
+      "payload_hex": "000000057573657273000000117b22656d61696c223a226140622e63227d000000207b2224736574223a7b22656d61696c223a226140622e63222c226e223a317d7d0002"
     },
     {
       "command": 37,

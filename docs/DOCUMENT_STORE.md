@@ -97,6 +97,10 @@ is queryable whether it is indexed or not.
   from a lock-free snapshot, then **each matched document is rewritten in one
   atomic `write_batch`** (body + all of its index keys). Per-document writes are
   atomic; a multi-document update is **not** globally atomic.
+- Filter upsert (`FLAG_UPSERT` on Update): when no document survives the
+  under-lock filter recheck, insert at most one document built from top-level
+  equality fields in the filter plus the operator update. Response includes
+  `upserted_id` on insert; omit it on a normal update. No `$setOnInsert` yet.
 
 ---
 
@@ -262,7 +266,7 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 - Aggregation pipeline (`$group` / `$lookup` / `$unwind`)
 - `$regex` / `$type` / array operators (`$elemMatch` / `$all`)
 - Projection pushdown / covered queries (the body is always fetched)
-- Filter upsert (`update` + insert-if-missing)
+- `$setOnInsert` and other upsert edge-case Mongo parity
 - TTL indexes / `expireAfterSeconds` on a date field (per-document `expires_at` on
   `DocPut` is supported and swept periodically by the server)
 - MVCC / multi-document transactions (opcodes `0x10`–`0x12` reserved; `seq` is

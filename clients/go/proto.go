@@ -54,7 +54,11 @@ const (
 
 // flagRelaxed is bit 0 of the optional trailing flags byte on write payloads:
 // when set, the write is acknowledged without waiting for the durability fsync.
-const flagRelaxed byte = 0x01
+// flagUpsert is bit 1: insert one document when an update matches nothing.
+const (
+	flagRelaxed byte = 0x01
+	flagUpsert  byte = 0x02
+)
 
 // Status codes (response envelope byte 1).
 const (
@@ -127,6 +131,17 @@ func relaxedByte(relaxed bool) byte {
 		return flagRelaxed
 	}
 	return 0
+}
+
+func updateFlags(relaxed, upsert bool) byte {
+	var f byte
+	if relaxed {
+		f |= flagRelaxed
+	}
+	if upsert {
+		f |= flagUpsert
+	}
+	return f
 }
 
 func boolByte(v bool) byte {
@@ -264,13 +279,13 @@ func EncodeFind(collection string, filter []byte, sort []SortKey, proj Projectio
 
 // EncodeUpdate builds an Update payload:
 // [collection][filter][update][multi u8][flags]. filter/update are opaque JSON.
-func EncodeUpdate(collection string, filter, update []byte, multi, relaxed bool) []byte {
+func EncodeUpdate(collection string, filter, update []byte, multi, relaxed, upsert bool) []byte {
 	var buf bytes.Buffer
 	putLP(&buf, []byte(collection))
 	putLP(&buf, filter)
 	putLP(&buf, update)
 	buf.WriteByte(boolByte(multi))
-	buf.WriteByte(relaxedByte(relaxed))
+	buf.WriteByte(updateFlags(relaxed, upsert))
 	return buf.Bytes()
 }
 

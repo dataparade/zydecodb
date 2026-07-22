@@ -44,7 +44,9 @@ pub fn strip_value_kind(stored: &[u8]) -> &[u8] {
 }
 
 pub fn stored_to_json_vec(stored: &[u8]) -> Vec<u8> {
-    if stored.is_empty() { return Vec::new(); }
+    if stored.is_empty() {
+        return Vec::new();
+    }
     let kind = stored[0];
     let payload = strip_value_kind(stored);
     if kind == VK_ZDOC {
@@ -139,7 +141,9 @@ pub fn upsert_ops(
                     serde_json::from_slice::<Value>(old_payload).ok()
                 };
                 match old_val {
-                    Some(old) => index_keys_for(coll, prefix, doc_id, &old).into_iter().collect(),
+                    Some(old) => index_keys_for(coll, prefix, doc_id, &old)
+                        .into_iter()
+                        .collect(),
                     None => BTreeSet::new(),
                 }
             }
@@ -189,7 +193,9 @@ pub fn upsert(
     payload: &[u8],
     is_zdoc: bool,
 ) -> DocResult<u64> {
-    upsert_with_expiry(engine, catalog, prefix, collection, doc_id, payload, is_zdoc, 0)
+    upsert_with_expiry(
+        engine, catalog, prefix, collection, doc_id, payload, is_zdoc, 0,
+    )
 }
 
 /// Insert or replace a document with an optional absolute `expires_at` (unix
@@ -205,14 +211,7 @@ pub fn upsert_with_expiry(
     expires_at: u64,
 ) -> DocResult<u64> {
     let ops = upsert_ops(
-        engine,
-        catalog,
-        prefix,
-        collection,
-        doc_id,
-        payload,
-        is_zdoc,
-        expires_at,
+        engine, catalog, prefix, collection, doc_id, payload, is_zdoc, expires_at,
     )?;
     Ok(engine.write_batch(ops)?)
 }
@@ -315,25 +314,25 @@ pub(crate) fn commit_batches(engine: &mut Engine, per_doc: Vec<Vec<BatchOp>>) ->
     if total == 0 {
         return Ok(());
     }
-    
+
     let mut all = Vec::with_capacity(std::cmp::min(total, MAX_BATCH_KEYS));
     for mut ops in per_doc {
         // If adding this doc's ops would exceed the chunk limit, flush what we have
         if all.len() + ops.len() > MAX_BATCH_KEYS && !all.is_empty() {
             engine.write_batch(std::mem::take(&mut all))?;
         }
-        
-        // A single doc's ops should never exceed MAX_BATCH_KEYS in practice (unless 
+
+        // A single doc's ops should never exceed MAX_BATCH_KEYS in practice (unless
         // there are hundreds of indexes), but if it somehow does, we write it alone
         // and it'll get caught by the engine's internal check if it's strictly > MAX_BATCH_KEYS.
         if ops.len() > MAX_BATCH_KEYS {
             engine.write_batch(ops)?;
             continue;
         }
-        
+
         all.append(&mut ops);
     }
-    
+
     if !all.is_empty() {
         engine.write_batch(all)?;
     }

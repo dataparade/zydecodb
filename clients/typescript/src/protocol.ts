@@ -39,8 +39,9 @@ export const Proj = {
   Exclude: 0x02,
 } as const;
 
-// Bit 0 of the optional trailing flags byte on write payloads.
+// Bits of the optional trailing flags byte on write payloads.
 const FLAG_RELAXED = 0x01;
+const FLAG_UPSERT = 0x02;
 
 // Status codes (response envelope byte 1).
 export const Status = {
@@ -119,8 +120,11 @@ function u32(value: number): Buffer {
   return b;
 }
 
-function flag(relaxed: boolean): Buffer {
-  return Buffer.from([relaxed ? FLAG_RELAXED : 0]);
+function flag(relaxed: boolean, upsert = false): Buffer {
+  let flags = 0;
+  if (relaxed) flags |= FLAG_RELAXED;
+  if (upsert) flags |= FLAG_UPSERT;
+  return Buffer.from([flags]);
 }
 
 function boolByte(v: boolean): Buffer {
@@ -233,13 +237,14 @@ export function encodeUpdate(
   update: Buffer,
   multi: boolean,
   relaxed: boolean,
+  upsert = false,
 ): Buffer {
   return Buffer.concat([
     lp(utf8(collection)),
     lp(filter),
     lp(update),
     boolByte(multi),
-    flag(relaxed),
+    flag(relaxed, upsert),
   ]);
 }
 

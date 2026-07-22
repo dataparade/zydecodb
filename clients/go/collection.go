@@ -84,11 +84,12 @@ func (c *Collection) ReplaceOne(ctx context.Context, docID string, doc Document,
 
 // UpdateResult summarizes an update operation.
 type UpdateResult struct {
-	Matched  int64 `json:"matched"`
-	Modified int64 `json:"modified"`
+	Matched    int64  `json:"matched"`
+	Modified   int64  `json:"modified"`
+	UpsertedID string `json:"upserted_id,omitempty"`
 }
 
-func (c *Collection) update(ctx context.Context, filter, update Document, multi, relaxed bool) (UpdateResult, error) {
+func (c *Collection) update(ctx context.Context, filter, update Document, multi, relaxed, upsert bool) (UpdateResult, error) {
 	var res UpdateResult
 	fb, err := marshalFilter(filter)
 	if err != nil {
@@ -98,7 +99,7 @@ func (c *Collection) update(ctx context.Context, filter, update Document, multi,
 	if err != nil {
 		return res, fmt.Errorf("zydecodb: marshal update: %w", err)
 	}
-	body, err := c.client.Update(ctx, c.name, fb, ub, multi, relaxed)
+	body, err := c.client.Update(ctx, c.name, fb, ub, multi, relaxed, upsert)
 	if err != nil {
 		return res, err
 	}
@@ -109,13 +110,13 @@ func (c *Collection) update(ctx context.Context, filter, update Document, multi,
 }
 
 // UpdateOne applies update to the first matching document.
-func (c *Collection) UpdateOne(ctx context.Context, filter, update Document, relaxed bool) (UpdateResult, error) {
-	return c.update(ctx, filter, update, false, relaxed)
+func (c *Collection) UpdateOne(ctx context.Context, filter, update Document, relaxed, upsert bool) (UpdateResult, error) {
+	return c.update(ctx, filter, update, false, relaxed, upsert)
 }
 
 // UpdateMany applies update to all matching documents.
-func (c *Collection) UpdateMany(ctx context.Context, filter, update Document, relaxed bool) (UpdateResult, error) {
-	return c.update(ctx, filter, update, true, relaxed)
+func (c *Collection) UpdateMany(ctx context.Context, filter, update Document, relaxed, upsert bool) (UpdateResult, error) {
+	return c.update(ctx, filter, update, true, relaxed, upsert)
 }
 
 // DeleteOne deletes the first matching document and returns the deleted count.

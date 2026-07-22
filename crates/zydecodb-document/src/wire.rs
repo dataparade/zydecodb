@@ -15,6 +15,8 @@ const MODE_INDEX_RANGE: u8 = 0x01;
 /// Bit 0 of the optional trailing flags byte on write payloads: when set, the
 /// write is acknowledged without waiting for the durability fsync (`relaxed`).
 const FLAG_RELAXED: u8 = 0x01;
+/// Bit 1: filter upsert — insert one document if the update matches nothing.
+const FLAG_UPSERT: u8 = 0x02;
 
 /// Cursor reader over a payload buffer with bounds-checked primitives.
 struct Reader<'a> {
@@ -399,6 +401,8 @@ pub struct UpdatePayload {
     pub multi: bool,
     /// Acknowledge without waiting for the durability fsync (optional on wire).
     pub relaxed: bool,
+    /// Insert one document when the update matches nothing (optional on wire).
+    pub upsert: bool,
 }
 
 impl UpdatePayload {
@@ -408,7 +412,14 @@ impl UpdatePayload {
         put_lp(&mut out, &self.filter);
         put_lp(&mut out, &self.update);
         out.push(if self.multi { 1 } else { 0 });
-        out.push(if self.relaxed { FLAG_RELAXED } else { 0 });
+        let mut flags = 0u8;
+        if self.relaxed {
+            flags |= FLAG_RELAXED;
+        }
+        if self.upsert {
+            flags |= FLAG_UPSERT;
+        }
+        out.push(flags);
         out
     }
 
@@ -418,13 +429,14 @@ impl UpdatePayload {
         let filter = r.lp()?.to_vec();
         let update = r.lp()?.to_vec();
         let multi = r.u8()? != 0;
-        let relaxed = r.opt_u8() & FLAG_RELAXED != 0;
+        let flags = r.opt_u8();
         Ok(UpdatePayload {
             collection,
             filter,
             update,
             multi,
-            relaxed,
+            relaxed: flags & FLAG_RELAXED != 0,
+            upsert: flags & FLAG_UPSERT != 0,
         })
     }
 }
@@ -662,8 +674,19 @@ mod tests {
             update: br#"{"$set":{"name":"x"}}"#.to_vec(),
             multi: true,
             relaxed: true,
+            upsert: false,
         };
         assert_eq!(UpdatePayload::decode(&u.encode()).unwrap(), u);
+
+        let u2 = UpdatePayload {
+            collection: "users".into(),
+            filter: br#"{"email":"a@b.c"}"#.to_vec(),
+            update: br#"{"$set":{"email":"a@b.c"}}"#.to_vec(),
+            multi: false,
+            relaxed: false,
+            upsert: true,
+        };
+        assert_eq!(UpdatePayload::decode(&u2.encode()).unwrap(), u2);
 
         let d = DeletePayload {
             collection: "users".into(),

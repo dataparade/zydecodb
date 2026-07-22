@@ -25,7 +25,7 @@ use zydecodb_document::wire::{
     QueryPayload, UpdatePayload, WireProjection,
 };
 use zydecodb_engine::errors::Status;
-use zydecodb_engine::frame::{Command, RequestEnvelope, PutPayload, KeyPayload, PROTO_VERSION};
+use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope, PROTO_VERSION};
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -116,7 +116,7 @@ fn payload_vectors() -> Vec<Value> {
         doc_id: b"u1".to_vec(),
         body: br#"{"age":30}"#.to_vec(),
         relaxed: false,
-    expires_at: 0,
+        expires_at: 0,
     };
     v.push(req(
         "doc_put_basic",
@@ -125,10 +125,7 @@ fn payload_vectors() -> Vec<Value> {
         Command::DocPut,
         p.encode(),
     ));
-    let p = DocPutPayload {
-        relaxed: true,
-        ..p
-    };
+    let p = DocPutPayload { relaxed: true, ..p };
     v.push(req(
         "doc_put_relaxed",
         "DocPut",
@@ -292,13 +289,14 @@ fn payload_vectors() -> Vec<Value> {
         update: br#"{"$set":{"name":"x"}}"#.to_vec(),
         multi: true,
         relaxed: true,
+        upsert: false,
     };
     v.push(req(
         "update_multi_relaxed",
         "Update",
         json!({
             "collection":"users","filter_json":"{\"_id\":\"u1\"}",
-            "update_json":"{\"$set\":{\"name\":\"x\"}}","multi":true,"relaxed":true
+            "update_json":"{\"$set\":{\"name\":\"x\"}}","multi":true,"relaxed":true,"upsert":false
         }),
         Command::Update,
         p.encode(),
@@ -309,13 +307,33 @@ fn payload_vectors() -> Vec<Value> {
         update: br#"{"$inc":{"n":1}}"#.to_vec(),
         multi: false,
         relaxed: false,
+        upsert: false,
     };
     v.push(req(
         "update_one_durable",
         "Update",
         json!({
             "collection":"users","filter_json":"{\"age\":{\"$lt\":0}}",
-            "update_json":"{\"$inc\":{\"n\":1}}","multi":false,"relaxed":false
+            "update_json":"{\"$inc\":{\"n\":1}}","multi":false,"relaxed":false,"upsert":false
+        }),
+        Command::Update,
+        p.encode(),
+    ));
+    let p = UpdatePayload {
+        collection: "users".into(),
+        filter: br#"{"email":"a@b.c"}"#.to_vec(),
+        update: br#"{"$set":{"email":"a@b.c","n":1}}"#.to_vec(),
+        multi: false,
+        relaxed: false,
+        upsert: true,
+    };
+    v.push(req(
+        "update_upsert",
+        "Update",
+        json!({
+            "collection":"users","filter_json":"{\"email\":\"a@b.c\"}",
+            "update_json":"{\"$set\":{\"email\":\"a@b.c\",\"n\":1}}",
+            "multi":false,"relaxed":false,"upsert":true
         }),
         Command::Update,
         p.encode(),
@@ -326,7 +344,7 @@ fn payload_vectors() -> Vec<Value> {
         collection: "users".into(),
         filter: br#"{"stale":true}"#.to_vec(),
         multi: true,
-        relaxed: false
+        relaxed: false,
     };
     v.push(req(
         "delete_multi_durable",
@@ -339,7 +357,7 @@ fn payload_vectors() -> Vec<Value> {
         collection: "users".into(),
         filter: br#"{"_id":"u1"}"#.to_vec(),
         multi: false,
-        relaxed: true
+        relaxed: true,
     };
     v.push(req(
         "delete_one_relaxed",
@@ -382,13 +400,7 @@ fn payload_vectors() -> Vec<Value> {
         Command::SessionInit,
         b"zdk_example".to_vec(),
     ));
-    v.push(req(
-        "ping",
-        "Ping",
-        json!({}),
-        Command::Ping,
-        Vec::new(),
-    ));
+    v.push(req("ping", "Ping", json!({}), Command::Ping, Vec::new()));
 
     v
 }

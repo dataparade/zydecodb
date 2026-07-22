@@ -2,10 +2,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use std::sync::{Arc, OnceLock};
+use zydecodb::security::{SecurityRuntime, SessionState};
 use zydecodb_engine::engine::{Engine, EngineConfig};
 use zydecodb_engine::engine_handle::EngineHandle;
 use zydecodb_engine::frame::RequestEnvelope;
-use zydecodb::security::{SecurityRuntime, SessionState};
 
 struct FuzzContext {
     engine: Arc<EngineHandle>,

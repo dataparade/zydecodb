@@ -74,6 +74,7 @@ def _encode_request(kind: str, inp: dict) -> bytes:
         return proto.encode_update(
             inp["collection"], _json_field(inp["filter_json"]),
             _json_field(inp["update_json"]), multi=inp["multi"], relaxed=inp["relaxed"],
+            upsert=inp.get("upsert", False),
         )
     if kind == "Delete":
         return proto.encode_delete(

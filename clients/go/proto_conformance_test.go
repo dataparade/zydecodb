@@ -175,9 +175,10 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 			UpdateJSON string `json:"update_json"`
 			Multi      bool   `json:"multi"`
 			Relaxed    bool   `json:"relaxed"`
+			Upsert     bool   `json:"upsert"`
 		}
 		mustInput(t, v.Input, &in)
-		return EncodeUpdate(in.Collection, optBytes(in.FilterJSON), optBytes(in.UpdateJSON), in.Multi, in.Relaxed)
+		return EncodeUpdate(in.Collection, optBytes(in.FilterJSON), optBytes(in.UpdateJSON), in.Multi, in.Relaxed, in.Upsert)
 	case "Delete":
 		var in struct {
 			Collection string `json:"collection"`

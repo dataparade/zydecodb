@@ -62,6 +62,45 @@ fn with_catalog_engine_write<R>(
     r
 }
 
+/// Implicit collection creation (DocPut / filter upsert). Catalog write lock
+/// only when missing; durable catalog persist before ack.
+fn ensure_collection_exists(
+    engine: &SharedEngine,
+    catalog: &SharedCatalog,
+    commit: &CommitCoordinator,
+    prefix: &[u8],
+    collection: &str,
+) -> DocResult<()> {
+    let missing = {
+        let cat = catalog.read().unwrap();
+        cat.collection(prefix, collection).is_none()
+    };
+    if !missing {
+        return Ok(());
+    }
+    let (ddl_seq, slowdown) = {
+        let mut cat = catalog.write().unwrap();
+        if cat.collection(prefix, collection).is_none() {
+            let mut working = cat.clone();
+            working.ensure_collection(prefix, collection);
+            let mut guard = engine.write();
+            working.persist(&mut guard)?;
+            let seq = guard.last_buffered_seq();
+            let s = guard.take_write_slowdown();
+            drop(guard);
+            *cat = working;
+            (Some(seq), s)
+        } else {
+            (None, std::time::Duration::ZERO)
+        }
+    };
+    apply_pending_slowdown(slowdown);
+    if let Some(seq) = ddl_seq {
+        commit.commit(seq, false);
+    }
+    Ok(())
+}
+
 /// Capture a read snapshot for a paginated read. When the request carries a
 /// cursor, re-pin the same sequence ceiling the first page used (repeatable-read
 /// pagination) via `snapshot_at`; otherwise capture the latest committed state.
@@ -177,40 +216,8 @@ fn doc_put(
     };
     let zdoc_bytes = zydecodb_document::binary::ZDocBuilder::from_value(&json_val);
 
-    // Implicit collection creation on first insert: the catalog
-    // write lock is taken only when the collection is missing, so the steady
-    // state stays on the cheap read lock. Same catalog-before-engine lock
-    // order and durable-before-ack DDL policy as index_def.
-    let missing = {
-        let cat = catalog.read().unwrap();
-        cat.collection(prefix, &p.collection).is_none()
-    };
-    if missing {
-        let (ddl_seq, slowdown) = {
-            let mut cat = catalog.write().unwrap();
-            if cat.collection(prefix, &p.collection).is_none() {
-                let mut working = cat.clone();
-                working.ensure_collection(prefix, &p.collection);
-                let mut guard = engine.write();
-                if let Err(e) = working.persist(&mut guard) {
-                    let s = guard.take_write_slowdown();
-                    drop(guard);
-                    apply_pending_slowdown(s);
-                    return err_response(&e);
-                }
-                let seq = guard.last_buffered_seq();
-                let s = guard.take_write_slowdown();
-                drop(guard);
-                *cat = working;
-                (Some(seq), s)
-            } else {
-                (None, std::time::Duration::ZERO) // another writer created it
-            }
-        };
-        apply_pending_slowdown(slowdown);
-        if let Some(seq) = ddl_seq {
-            commit.commit(seq, false);
-        }
+    if let Err(e) = ensure_collection_exists(engine, catalog, commit, prefix, &p.collection) {
+        return err_response(&e);
     }
 
     let outcome = with_catalog_engine_write(engine, catalog, |cat, guard| {
@@ -411,6 +418,9 @@ fn update_cmd(
     let p = wire::UpdatePayload::decode(payload)?;
     let filter = Filter::parse_bytes(&p.filter)?;
     let upd = UpdateDoc::parse_bytes(&p.update)?;
+    if p.upsert {
+        ensure_collection_exists(engine, catalog, commit, prefix, &p.collection)?;
+    }
 
     let ids = select_candidates(
         engine,
@@ -421,20 +431,56 @@ fn update_cmd(
         p.multi,
         max_sort_buffer,
     )?;
-    let (modified, seq) = with_catalog_engine_write(engine, catalog, |cat, guard| {
+    let (outcome, seq) = with_catalog_engine_write(engine, catalog, |cat, guard| {
         let modified =
             update::apply_to_ids(guard, cat, prefix, &p.collection, &ids, &upd, Some(&filter))?;
+        if modified > 0 || !p.upsert {
+            let seq = guard.last_buffered_seq();
+            return Ok::<_, DocError>((UpdateWriteOutcome::Updated { modified }, seq));
+        }
+        // Upsert path: still under the write lock — another writer may have
+        // inserted a match between candidate selection and now.
+        let snap = guard.snapshot_owned();
+        if let Some(id) = query::find_first_id(&snap, cat, prefix, &p.collection, &filter)? {
+            let modified = update::apply_to_ids(
+                guard,
+                cat,
+                prefix,
+                &p.collection,
+                &[id],
+                &upd,
+                Some(&filter),
+            )?;
+            let seq = guard.last_buffered_seq();
+            return Ok((UpdateWriteOutcome::Updated { modified }, seq));
+        }
+        let (doc_id, body) = update::materialize_upsert(&filter, &upd)?;
+        store::upsert_with_expiry(guard, cat, prefix, &p.collection, &doc_id, &body, true, 0)?;
         let seq = guard.last_buffered_seq();
-        Ok::<_, DocError>((modified, seq))
+        let upserted_id = String::from_utf8(doc_id)
+            .map_err(|_| DocError::Protocol("upserted _id must be valid UTF-8".into()))?;
+        Ok((UpdateWriteOutcome::Upserted { upserted_id }, seq))
     })?;
-    // Stale candidates were skipped by the under-lock re-check; every counted
-    // document both matched and was rewritten.
-    let matched = modified;
     // One durability wait covers the whole (possibly atomic) write set above.
     commit.commit(seq, p.relaxed);
-    Ok(ResponseEnvelope::ok(
-        format!("{{\"matched\":{matched},\"modified\":{modified}}}").into_bytes(),
-    ))
+    match outcome {
+        UpdateWriteOutcome::Updated { modified } => Ok(ResponseEnvelope::ok(
+            format!("{{\"matched\":{modified},\"modified\":{modified}}}").into_bytes(),
+        )),
+        UpdateWriteOutcome::Upserted { upserted_id } => Ok(ResponseEnvelope::ok(
+            serde_json::to_vec(&serde_json::json!({
+                "matched": 0,
+                "modified": 0,
+                "upserted_id": upserted_id,
+            }))
+            .expect("upsert response is valid JSON"),
+        )),
+    }
+}
+
+enum UpdateWriteOutcome {
+    Updated { modified: u64 },
+    Upserted { upserted_id: String },
 }
 
 /// Filter-based delete, same candidate-then-write shape as `update_cmd`.
@@ -616,6 +662,7 @@ mod tests {
             update: b"{\"$inc\":{\"n\":1}}".to_vec(),
             multi: false,
             relaxed,
+            upsert: false,
         }
         .encode()
     }
