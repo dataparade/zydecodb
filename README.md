@@ -127,7 +127,7 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 **Multi-tenant sharing model (read this):** tenants get **namespace isolation** (key prefix, ACLs, byte/RPS quotas, drop-tenant). Write/catalog mutations still serialize on the engine write lock; block cache, fair-share accounting, and WAL fsync are separate domains. δ-fair memtable/cache/stall isolation is **off by default** for local/single-tenant; pods hosts should start from [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) (`[fair] enabled = true`) and follow the one-page runbook [`docs/PODS.md`](docs/PODS.md). Until fair is on and soak-proven, do not assume one tenant’s write storm cannot affect another’s latency. See [`docs/SECURITY.md`](docs/SECURITY.md#multi-tenant-sharing-model).
 
-## Beta scope
+## 0.9 scope
 
 **Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). Filters, sort, projection, pagination, partial updates, `count`/`distinct`, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits.
 
@@ -135,7 +135,7 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 ## Expectations, gotchas, advice
 
-- **Beta** (`0.9.0-beta.7`). Implemented opcodes, write flags, and status bytes are **frozen for 0.9.x** (append-only; see [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md#wire-protocol)). Reserved opcodes and listed Not-yet features may gain semantics without renumbering. On-disk format changes follow [`docs/UPGRADE.md`](docs/UPGRADE.md).
+- **0.9.0**. Implemented opcodes, write flags, and status bytes are **frozen for 0.9.x** (append-only; see [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md#wire-protocol)). Reserved opcodes and listed Not-yet features may gain semantics without renumbering. On-disk format changes follow [`docs/UPGRADE.md`](docs/UPGRADE.md).
 - **BSL license.** Self-hosting (including in production) is free; you may not offer ZydecoDB to third parties as a competing hosted/managed service. Converts to Apache 2.0 on the change date — see [LICENSE](LICENSE).
 - **Security:** run behind your API on localhost or a private network. See [`docs/SECURITY.md`](docs/SECURITY.md). Do not expose `:9470` to the internet without auth.
 - **Keys on the wire** are opaque bytes; the server stores them under the user keyspace (`KS_USER` prefix).
