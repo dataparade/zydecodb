@@ -66,7 +66,7 @@ func main() {
 	}
 	srv := &server{db: db, coll: db.Collection(collection)}
 	// A unique email per user — enforced by the database, not the app.
-	if _, err := srv.coll.CreateIndex(ctx, []string{"email"}, true); err != nil {
+	if _, err := srv.coll.CreateIndex(ctx, []string{"email"}, true, 0); err != nil {
 		log.Fatalf("create index: %v", err)
 	}
 
@@ -138,7 +138,7 @@ func (s *server) createUser(w http.ResponseWriter, r *http.Request) {
 	doc["password_hash"] = hashPassword(password, salt)
 	delete(doc, "password")
 
-	id, err := s.coll.InsertOne(r.Context(), doc, false)
+	id, err := s.coll.InsertOne(r.Context(), doc, false, 0)
 	if err != nil {
 		if zydecodb.IsConflict(err) {
 			http.Error(w, "email already exists", http.StatusConflict)

@@ -20,12 +20,14 @@ from .errors import (
     ConflictError,
     ConnectionError,
     InvalidRequestError,
+    PolicyError,
     ServerBusyError,
     ServerError,
+    UnsupportedFormatError,
     ZydecoError,
 )
 
-__version__ = "0.9.0b1"
+__version__ = "0.9.0b7"
 
 __all__ = [
     "Client",
@@ -39,5 +41,7 @@ __all__ = [
     "ConflictError",
     "InvalidRequestError",
     "ServerBusyError",
+    "PolicyError",
+    "UnsupportedFormatError",
     "__version__",
 ]

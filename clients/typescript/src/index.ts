@@ -7,8 +7,10 @@ export {
   ConflictError,
   ConnectionError,
   InvalidRequestError,
+  PolicyError,
   ServerBusyError,
   ServerError,
+  UnsupportedFormatError,
   ZydecoError,
 } from "./errors.ts";
 export type { Projection, Row, SortKey } from "./protocol.ts";

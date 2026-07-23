@@ -133,6 +133,20 @@ fn payload_vectors() -> Vec<Value> {
         Command::DocPut,
         p.encode(),
     ));
+    let p = DocPutPayload {
+        collection: "users".into(),
+        doc_id: b"u2".to_vec(),
+        body: br#"{"age":40}"#.to_vec(),
+        relaxed: false,
+        expires_at: 1700000000000,
+    };
+    v.push(req(
+        "doc_put_expires",
+        "DocPut",
+        json!({"collection":"users","doc_id":"u2","body_json":"{\"age\":40}","relaxed":false,"expires_at":1700000000000u64}),
+        Command::DocPut,
+        p.encode(),
+    ));
 
     // ---- DocDel ----
     let p = DocDelPayload {
@@ -153,6 +167,7 @@ fn payload_vectors() -> Vec<Value> {
         index_name: "by_age".into(),
         fields: vec!["age".into()],
         unique: false,
+        expire_after_seconds: 0,
     };
     v.push(req(
         "index_def_single",
@@ -166,11 +181,26 @@ fn payload_vectors() -> Vec<Value> {
         index_name: "by_email".into(),
         fields: vec!["email".into(), "name".into()],
         unique: true,
+        expire_after_seconds: 0,
     };
     v.push(req(
         "index_def_unique_multi",
         "IndexDef",
         json!({"collection":"users","index_name":"by_email","fields":["email","name"],"unique":true}),
+        Command::IndexDef,
+        p.encode(),
+    ));
+    let p = IndexDefPayload {
+        collection: "sess".into(),
+        index_name: "by_exp".into(),
+        fields: vec!["exp".into()],
+        unique: false,
+        expire_after_seconds: 3600,
+    };
+    v.push(req(
+        "index_def_ttl",
+        "IndexDef",
+        json!({"collection":"sess","index_name":"by_exp","fields":["exp"],"unique":false,"expire_after_seconds":3600}),
         Command::IndexDef,
         p.encode(),
     ));

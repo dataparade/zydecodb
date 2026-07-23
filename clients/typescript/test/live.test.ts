@@ -123,3 +123,40 @@ test("unique index conflict", { skip }, async () => {
     db.close();
   }
 });
+
+test("upsert setOnInsert", { skip }, async () => {
+  const db = newClient();
+  const coll = db.collection(uniqueCollection());
+  try {
+    const miss = await coll.updateOne(
+      { email: "soi@example.com" },
+      { $set: { email: "soi@example.com", n: 1 }, $setOnInsert: { created: true } },
+      false,
+      true,
+    );
+    assert.equal(miss.matched, 0);
+    assert.equal(miss.modified, 0);
+    assert.ok(miss.upserted_id);
+
+    let doc = await coll.findOne({ email: "soi@example.com" });
+    assert.equal(doc?.created, true);
+    assert.equal(doc?.n, 1);
+
+    const hit = await coll.updateOne(
+      { email: "soi@example.com" },
+      { $set: { n: 2 }, $setOnInsert: { created: false, extra: 1 } },
+      false,
+      true,
+    );
+    assert.equal(hit.matched, 1);
+    assert.equal(hit.modified, 1);
+    assert.equal(hit.upserted_id, undefined);
+
+    doc = await coll.findOne({ email: "soi@example.com" });
+    assert.equal(doc?.n, 2);
+    assert.equal(doc?.created, true);
+    assert.equal(doc?.extra, undefined);
+  } finally {
+    db.close();
+  }
+});

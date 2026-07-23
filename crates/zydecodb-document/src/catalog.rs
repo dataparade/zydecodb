@@ -23,6 +23,10 @@ pub struct IndexMeta {
     /// Dotted JSON paths whose values form the (composite) index key, in order.
     pub fields: Vec<String>,
     pub unique: bool,
+    /// When set, this is a TTL index: body `expires_at` is derived as
+    /// `field_unix_millis + expire_after_seconds * 1000`. At most one per collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_after_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +36,15 @@ pub struct CollectionMeta {
     pub prefix: Vec<u8>,
     pub name: String,
     pub indexes: Vec<IndexMeta>,
+}
+
+impl CollectionMeta {
+    /// The collection's TTL index, if any.
+    pub fn ttl_index(&self) -> Option<&IndexMeta> {
+        self.indexes
+            .iter()
+            .find(|i| i.expire_after_seconds.is_some())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,10 +119,16 @@ impl Catalog {
         name: &str,
         fields: Vec<String>,
         unique: bool,
+        expire_after_seconds: Option<u64>,
     ) -> DocResult<IndexMeta> {
         if fields.is_empty() {
             return Err(DocError::Protocol(
                 "index must have at least one field".into(),
+            ));
+        }
+        if expire_after_seconds.is_some() && fields.len() != 1 {
+            return Err(DocError::Protocol(
+                "TTL index must have exactly one field (unix millis)".into(),
             ));
         }
         let collection_id = self.ensure_collection(prefix, collection);
@@ -119,6 +138,7 @@ impl Catalog {
             name: name.to_string(),
             fields,
             unique,
+            expire_after_seconds,
         };
         let c = self
             .collections
@@ -127,6 +147,11 @@ impl Catalog {
             .expect("collection just ensured");
         if c.indexes.iter().any(|i| i.name == name) {
             return Err(DocError::AlreadyExists(format!("index '{name}'")));
+        }
+        if meta.expire_after_seconds.is_some() && c.ttl_index().is_some() {
+            return Err(DocError::Protocol(
+                "collection already has a TTL index".into(),
+            ));
         }
         c.indexes.push(meta.clone());
         self.next_index_id += 1;
@@ -142,7 +167,7 @@ mod tests {
     fn add_index_creates_collection_and_assigns_ids() {
         let mut cat = Catalog::default();
         let m = cat
-            .add_index(b"\x01", "users", "by_age", vec!["age".into()], false)
+            .add_index(b"\x01", "users", "by_age", vec!["age".into()], false, None)
             .unwrap();
         assert_eq!(m.id, 0);
         let c = cat.collection(b"\x01", "users").unwrap();
@@ -153,10 +178,10 @@ mod tests {
     #[test]
     fn duplicate_index_name_rejected() {
         let mut cat = Catalog::default();
-        cat.add_index(b"\x01", "users", "by_age", vec!["age".into()], false)
+        cat.add_index(b"\x01", "users", "by_age", vec!["age".into()], false, None)
             .unwrap();
         let err = cat
-            .add_index(b"\x01", "users", "by_age", vec!["age".into()], false)
+            .add_index(b"\x01", "users", "by_age", vec!["age".into()], false, None)
             .unwrap_err();
         assert!(matches!(err, DocError::AlreadyExists(_)));
     }
@@ -164,9 +189,9 @@ mod tests {
     #[test]
     fn same_name_isolated_by_prefix() {
         let mut cat = Catalog::default();
-        cat.add_index(b"\x01a", "users", "by_age", vec!["age".into()], false)
+        cat.add_index(b"\x01a", "users", "by_age", vec!["age".into()], false, None)
             .unwrap();
-        cat.add_index(b"\x01b", "users", "by_age", vec!["age".into()], false)
+        cat.add_index(b"\x01b", "users", "by_age", vec!["age".into()], false, None)
             .unwrap();
         assert_ne!(
             cat.collection(b"\x01a", "users").unwrap().id,
@@ -177,10 +202,52 @@ mod tests {
     #[test]
     fn round_trips_through_serde() {
         let mut cat = Catalog::default();
-        cat.add_index(b"\x01", "users", "by_age", vec!["age".into()], true)
+        cat.add_index(b"\x01", "users", "by_age", vec!["age".into()], true, None)
             .unwrap();
+        cat.add_index(
+            b"\x01",
+            "users",
+            "by_exp",
+            vec!["exp".into()],
+            false,
+            Some(3600),
+        )
+        .unwrap();
         let bytes = serde_json::to_vec(&cat).unwrap();
         let back: Catalog = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(cat, back);
+        assert_eq!(
+            back.collection(b"\x01", "users")
+                .unwrap()
+                .ttl_index()
+                .unwrap()
+                .expire_after_seconds,
+            Some(3600)
+        );
+    }
+
+    #[test]
+    fn second_ttl_index_rejected() {
+        let mut cat = Catalog::default();
+        cat.add_index(
+            b"\x01",
+            "users",
+            "ttl1",
+            vec!["exp".into()],
+            false,
+            Some(60),
+        )
+        .unwrap();
+        let err = cat
+            .add_index(
+                b"\x01",
+                "users",
+                "ttl2",
+                vec!["other".into()],
+                false,
+                Some(60),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DocError::Protocol(_)));
     }
 }

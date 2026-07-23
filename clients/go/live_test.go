@@ -126,7 +126,7 @@ func TestLiveInsertFindUpdateDelete(t *testing.T) {
 	ctx := context.Background()
 	coll := c.Collection(uniqueCollection())
 
-	if _, err := coll.CreateIndex(ctx, []string{"age"}, false); err != nil {
+	if _, err := coll.CreateIndex(ctx, []string{"age"}, false, 0); err != nil {
 		t.Fatalf("create index: %v", err)
 	}
 	ids, err := coll.InsertMany(ctx, []Document{
@@ -199,14 +199,68 @@ func TestLiveUniqueIndexConflict(t *testing.T) {
 	ctx := context.Background()
 	coll := c.Collection(uniqueCollection())
 
-	if _, err := coll.CreateIndex(ctx, []string{"email"}, true); err != nil {
+	if _, err := coll.CreateIndex(ctx, []string{"email"}, true, 0); err != nil {
 		t.Fatalf("create unique index: %v", err)
 	}
-	if _, err := coll.InsertOne(ctx, Document{"email": "a@b.com"}, false); err != nil {
+	if _, err := coll.InsertOne(ctx, Document{"email": "a@b.com"}, false, 0); err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
-	_, err := coll.InsertOne(ctx, Document{"email": "a@b.com"}, false)
+	_, err := coll.InsertOne(ctx, Document{"email": "a@b.com"}, false, 0)
 	if err == nil || !IsConflict(err) {
 		t.Fatalf("expected conflict error, got %v", err)
+	}
+}
+
+func TestLiveUpsertSetOnInsert(t *testing.T) {
+	c := liveClient(t)
+	defer c.Close()
+	ctx := context.Background()
+	coll := c.Collection(uniqueCollection())
+
+	miss, err := coll.UpdateOne(ctx,
+		Document{"email": "soi@example.com"},
+		Document{
+			"$set":         Document{"email": "soi@example.com", "n": 1.0},
+			"$setOnInsert": Document{"created": true},
+		},
+		false, true,
+	)
+	if err != nil {
+		t.Fatalf("upsert miss: %v", err)
+	}
+	if miss.Matched != 0 || miss.Modified != 0 || miss.UpsertedID == "" {
+		t.Fatalf("unexpected miss result: %+v", miss)
+	}
+	doc, err := coll.FindOne(ctx, Document{"email": "soi@example.com"}, QueryOptions{})
+	if err != nil {
+		t.Fatalf("find after upsert: %v", err)
+	}
+	if doc["created"] != true || doc["n"].(float64) != 1 {
+		t.Fatalf("unexpected doc after insert: %#v", doc)
+	}
+
+	hit, err := coll.UpdateOne(ctx,
+		Document{"email": "soi@example.com"},
+		Document{
+			"$set":         Document{"n": 2.0},
+			"$setOnInsert": Document{"created": false, "extra": 1.0},
+		},
+		false, true,
+	)
+	if err != nil {
+		t.Fatalf("upsert hit: %v", err)
+	}
+	if hit.Matched != 1 || hit.Modified != 1 || hit.UpsertedID != "" {
+		t.Fatalf("unexpected hit result: %+v", hit)
+	}
+	doc, err = coll.FindOne(ctx, Document{"email": "soi@example.com"}, QueryOptions{})
+	if err != nil {
+		t.Fatalf("find after hit: %v", err)
+	}
+	if doc["n"].(float64) != 2 || doc["created"] != true {
+		t.Fatalf("setOnInsert must be ignored on hit: %#v", doc)
+	}
+	if _, ok := doc["extra"]; ok {
+		t.Fatalf("extra must not appear on hit: %#v", doc)
 	}
 }

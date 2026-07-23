@@ -35,7 +35,7 @@ fn upsert_get_and_index_orders_by_field() {
     let dir = TempDir::new().unwrap();
     let mut e = open(&dir);
     let mut cat = Catalog::default();
-    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false)
+    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false, None)
         .unwrap();
     cat.persist(&mut e).unwrap();
 
@@ -79,7 +79,7 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
     let dir = TempDir::new().unwrap();
     let mut e = open(&dir);
     let mut cat = Catalog::default();
-    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false)
+    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false, None)
         .unwrap();
     cat.persist(&mut e).unwrap();
 
@@ -139,7 +139,7 @@ fn filtered_write_recheck_skips_stale_candidates() {
     let dir = TempDir::new().unwrap();
     let mut e = open(&dir);
     let mut cat = Catalog::default();
-    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false)
+    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false, None)
         .unwrap();
     cat.persist(&mut e).unwrap();
 
@@ -201,8 +201,15 @@ fn unique_index_rejects_duplicate_value() {
     let dir = TempDir::new().unwrap();
     let mut e = open(&dir);
     let mut cat = Catalog::default();
-    cat.add_index(PREFIX, "users", "by_email", vec!["email".into()], true)
-        .unwrap();
+    cat.add_index(
+        PREFIX,
+        "users",
+        "by_email",
+        vec!["email".into()],
+        true,
+        None,
+    )
+    .unwrap();
     cat.persist(&mut e).unwrap();
 
     store::upsert(
@@ -272,7 +279,7 @@ fn updating_indexed_field_moves_the_entry() {
     let dir = TempDir::new().unwrap();
     let mut e = open(&dir);
     let mut cat = Catalog::default();
-    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false)
+    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false, None)
         .unwrap();
     cat.persist(&mut e).unwrap();
 
@@ -339,7 +346,7 @@ fn delete_removes_doc_and_index_entries() {
     let dir = TempDir::new().unwrap();
     let mut e = open(&dir);
     let mut cat = Catalog::default();
-    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false)
+    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false, None)
         .unwrap();
     cat.persist(&mut e).unwrap();
 
@@ -374,7 +381,7 @@ fn pagination_walks_all_rows_in_order() {
     let dir = TempDir::new().unwrap();
     let mut e = open(&dir);
     let mut cat = Catalog::default();
-    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false)
+    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false, None)
         .unwrap();
     cat.persist(&mut e).unwrap();
 
@@ -467,6 +474,7 @@ fn define_index_backfills_existing_documents() {
         "by_age",
         vec!["age".into()],
         false,
+        None,
     )
     .unwrap();
 
@@ -545,6 +553,7 @@ fn oversized_document_batch_is_rejected() {
             &format!("idx{i}"),
             vec![format!("f{i}")],
             false,
+            None,
         )
         .unwrap();
     }

@@ -193,6 +193,7 @@ mod tests {
             name: name.into(),
             fields: fields.iter().map(|s| s.to_string()).collect(),
             unique: false,
+            expire_after_seconds: None,
         }
     }
 

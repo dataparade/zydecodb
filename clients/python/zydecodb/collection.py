@@ -34,33 +34,50 @@ class Collection:
         *,
         unique: bool = False,
         name: Optional[str] = None,
+        expire_after_seconds: int = 0,
     ) -> bool:
         """Create a secondary index over one or more dotted field paths. Returns
-        False if it already existed."""
+        False if it already existed. ``expire_after_seconds`` marks a TTL index
+        (field value = unix millis); ``0`` means not a TTL index."""
         index_name = name or "by_" + "_".join(f.replace(".", "_") for f in fields)
-        return self._c.define_index(self._name, index_name, fields, unique=unique)
+        return self._c.define_index(
+            self._name,
+            index_name,
+            fields,
+            unique=unique,
+            expire_after_seconds=expire_after_seconds,
+        )
 
     # --- writes ---
 
-    def insert_one(self, document: dict, *, relaxed: bool = False) -> str:
+    def insert_one(
+        self, document: dict, *, relaxed: bool = False, expires_at: int = 0
+    ) -> str:
         """Insert a document, generating ``_id`` if absent. Returns the id.
-        Raises `ConflictError` if a unique index would be violated."""
+        Raises `ConflictError` if a unique index would be violated.
+        ``expires_at`` is absolute unix millis; ``0`` means never."""
         from .client import generate_id
 
         doc = dict(document)
         doc_id = str(doc.get("_id") or generate_id())
         doc["_id"] = doc_id
-        self._c.put_document(self._name, doc_id, doc, relaxed=relaxed)
+        self._c.put_document(
+            self._name, doc_id, doc, relaxed=relaxed, expires_at=expires_at
+        )
         return doc_id
 
     def insert_many(self, documents: List[dict]) -> List[str]:
         return [self.insert_one(d) for d in documents]
 
-    def replace_one(self, doc_id: str, document: dict, *, relaxed: bool = False) -> int:
+    def replace_one(
+        self, doc_id: str, document: dict, *, relaxed: bool = False, expires_at: int = 0
+    ) -> int:
         """Insert or fully replace the document at ``doc_id``."""
         doc = dict(document)
         doc["_id"] = str(doc_id)
-        return self._c.put_document(self._name, str(doc_id), doc, relaxed=relaxed)
+        return self._c.put_document(
+            self._name, str(doc_id), doc, relaxed=relaxed, expires_at=expires_at
+        )
 
     def update_one(
         self, filt: dict, update: dict, *, relaxed: bool = False, upsert: bool = False

@@ -37,16 +37,33 @@ export class Collection {
    * Create a secondary index over one or more dotted field paths. Returns false
    * if the index already existed.
    */
-  createIndex(fields: string[], unique = false): Promise<boolean> {
+  /** `expireAfterSeconds` marks a TTL index (field = unix millis); 0 = not TTL. */
+  createIndex(
+    fields: string[],
+    unique = false,
+    expireAfterSeconds: number | bigint = 0,
+  ): Promise<boolean> {
     const indexName = "by_" + fields.map((f) => f.replaceAll(".", "_")).join("_");
-    return this.client.defineIndex(this.name, indexName, fields, unique);
+    return this.client.defineIndex(
+      this.name,
+      indexName,
+      fields,
+      unique,
+      true,
+      expireAfterSeconds,
+    );
   }
 
-  /** Insert a document, generating "_id" if absent. Returns the id. */
-  async insertOne(document: Document, relaxed = false): Promise<string> {
+  /** Insert a document, generating "_id" if absent. Returns the id.
+   * `expiresAt` is absolute unix millis; 0 means never expires. */
+  async insertOne(
+    document: Document,
+    relaxed = false,
+    expiresAt: number | bigint = 0,
+  ): Promise<string> {
     const id = typeof document._id === "string" && document._id ? document._id : generateId();
     const doc = { ...document, _id: id };
-    await this.client.putDocument(this.name, id, jsonBytes(doc), relaxed);
+    await this.client.putDocument(this.name, id, jsonBytes(doc), relaxed, expiresAt);
     return id;
   }
 
@@ -56,10 +73,16 @@ export class Collection {
     return ids;
   }
 
-  /** Insert or fully replace the document at docId. */
-  replaceOne(docId: string, document: Document, relaxed = false): Promise<bigint> {
+  /** Insert or fully replace the document at docId.
+   * `expiresAt` is absolute unix millis; 0 means never expires. */
+  replaceOne(
+    docId: string,
+    document: Document,
+    relaxed = false,
+    expiresAt: number | bigint = 0,
+  ): Promise<bigint> {
     const doc = { ...document, _id: docId };
-    return this.client.putDocument(this.name, docId, jsonBytes(doc), relaxed);
+    return this.client.putDocument(this.name, docId, jsonBytes(doc), relaxed, expiresAt);
   }
 
   updateOne(

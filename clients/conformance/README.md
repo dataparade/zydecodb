@@ -70,13 +70,13 @@ of scope here. Fields suffixed `_hex` (`cursor_hex`) carry raw bytes as hex.
 
 `input` shapes by `kind`:
 
-- **DocPut** — `collection`, `doc_id` (UTF-8 → bytes), `body_json`, `relaxed`.
-  Optional wire trailer (not yet in all driver APIs): after the flags byte, an
-  8-byte big-endian `expires_at` (unix millis) when non-zero. Vectors today
-  cover `relaxed` only; server encode/decode of `expires_at` is in
-  `DocPutPayload`.
+- **DocPut** — `collection`, `doc_id` (UTF-8 → bytes), `body_json`, `relaxed`,
+  optional `expires_at` (unix millis; omit or `0` means never). After the flags
+  byte, an 8-byte big-endian trailer is present only when `expires_at != 0`.
 - **DocDel** — `collection`, `doc_id`
-- **IndexDef** — `collection`, `index_name`, `fields` (string[]), `unique`
+- **IndexDef** — `collection`, `index_name`, `fields` (string[]), `unique`,
+  optional `expire_after_seconds` (u64; omit/`0` = not a TTL index; trailer only
+  when non-zero)
 - **QueryById** — `collection`, `doc_id`
 - **QueryIndexRange** — `collection`, `index_name`, `lo_json`, `hi_json`,
   `cursor_hex`, `limit`

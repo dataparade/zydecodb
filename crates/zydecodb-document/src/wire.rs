@@ -167,6 +167,8 @@ pub struct IndexDefPayload {
     pub index_name: String,
     pub fields: Vec<String>,
     pub unique: bool,
+    /// TTL duration in seconds. `0` = not a TTL index (trailer omitted on wire).
+    pub expire_after_seconds: u64,
 }
 
 impl IndexDefPayload {
@@ -178,6 +180,9 @@ impl IndexDefPayload {
         out.extend_from_slice(&(self.fields.len() as u32).to_be_bytes());
         for f in &self.fields {
             put_lp(&mut out, f.as_bytes());
+        }
+        if self.expire_after_seconds != 0 {
+            out.extend_from_slice(&self.expire_after_seconds.to_be_bytes());
         }
         out
     }
@@ -192,11 +197,19 @@ impl IndexDefPayload {
         for _ in 0..count {
             fields.push(r.lp_string()?);
         }
+        let expire_after_seconds = if r.remaining() >= 8 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(r.take(8)?);
+            u64::from_be_bytes(buf)
+        } else {
+            0
+        };
         Ok(IndexDefPayload {
             collection,
             index_name,
             fields,
             unique,
+            expire_after_seconds,
         })
     }
 }
@@ -613,8 +626,17 @@ mod tests {
             index_name: "by_age".into(),
             fields: vec!["age".into(), "name".into()],
             unique: true,
+            expire_after_seconds: 0,
         };
         assert_eq!(IndexDefPayload::decode(&p.encode()).unwrap(), p);
+        let ttl = IndexDefPayload {
+            collection: "sess".into(),
+            index_name: "by_exp".into(),
+            fields: vec!["exp".into()],
+            unique: false,
+            expire_after_seconds: 3600,
+        };
+        assert_eq!(IndexDefPayload::decode(&ttl.encode()).unwrap(), ttl);
     }
 
     #[test]

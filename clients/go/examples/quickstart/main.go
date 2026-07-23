@@ -36,7 +36,7 @@ func main() {
 
 	users := client.Collection(fmt.Sprintf("quickstart_%d", time.Now().Unix()))
 
-	if _, err := users.CreateIndex(ctx, []string{"age"}, false); err != nil {
+	if _, err := users.CreateIndex(ctx, []string{"age"}, false, 0); err != nil {
 		log.Fatalf("create index: %v", err)
 	}
 

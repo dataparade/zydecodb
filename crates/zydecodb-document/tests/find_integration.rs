@@ -28,7 +28,7 @@ fn seed(indexed: bool) -> (TempDir, Engine, Catalog) {
     let mut cat = Catalog::default();
     cat.ensure_collection(PREFIX, "people");
     if indexed {
-        cat.add_index(PREFIX, "people", "by_age", vec!["age".into()], false)
+        cat.add_index(PREFIX, "people", "by_age", vec!["age".into()], false, None)
             .unwrap();
     }
     cat.persist(&mut e).unwrap();

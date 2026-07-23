@@ -40,23 +40,44 @@ fn connect(addr: SocketAddr) -> TcpStream {
 }
 
 fn define_index(s: &mut TcpStream, collection: &str, name: &str, fields: &[&str]) {
+    define_index_ttl(s, collection, name, fields, 0);
+}
+
+fn define_index_ttl(
+    s: &mut TcpStream,
+    collection: &str,
+    name: &str,
+    fields: &[&str],
+    expire_after_seconds: u64,
+) {
     let p = wire::IndexDefPayload {
         collection: collection.into(),
         index_name: name.into(),
         fields: fields.iter().map(|f| f.to_string()).collect(),
         unique: false,
+        expire_after_seconds,
     };
     let resp = roundtrip(s, &RequestEnvelope::new(Command::IndexDef, p.encode()));
     assert_eq!(resp.status, Status::Ok, "IndexDef failed");
 }
 
 fn doc_put(s: &mut TcpStream, collection: &str, doc_id: &[u8], body: &str) {
+    doc_put_expires(s, collection, doc_id, body, 0);
+}
+
+fn doc_put_expires(
+    s: &mut TcpStream,
+    collection: &str,
+    doc_id: &[u8],
+    body: &str,
+    expires_at: u64,
+) {
     let p = wire::DocPutPayload {
         collection: collection.into(),
         doc_id: doc_id.to_vec(),
         body: body.as_bytes().to_vec(),
         relaxed: false,
-        expires_at: 0,
+        expires_at,
     };
     let resp = roundtrip(s, &RequestEnvelope::new(Command::DocPut, p.encode()));
     assert_eq!(resp.status, Status::Ok, "DocPut failed");
@@ -506,6 +527,90 @@ fn filter_upsert_inserts_or_updates() {
     assert_eq!(docs[0]["n"], serde_json::json!(2));
     assert_eq!(docs[0]["created"], serde_json::json!(true)); // unchanged
     assert!(docs[0].get("extra").is_none());
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn ttl_index_derives_expires_at() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    // Wire 0 = not a TTL index; use 1s so expires_at = field_ms + 1000.
+    define_index_ttl(&mut s, "sess", "by_exp", &["exp"], 1);
+    let past = 1_000u64; // expires_at = 2000 — long expired
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+
+    doc_put(&mut s, "sess", b"dead", &format!(r#"{{"exp":{past}}}"#));
+    doc_put(&mut s, "sess", b"live", &format!(r#"{{"exp":{future}}}"#));
+
+    let dead = query(
+        &mut s,
+        wire::QueryPayload::ById {
+            collection: "sess".into(),
+            doc_id: b"dead".to_vec(),
+        },
+    );
+    assert_eq!(dead.status, Status::NotFound);
+
+    let live = query(
+        &mut s,
+        wire::QueryPayload::ById {
+            collection: "sess".into(),
+            doc_id: b"live".to_vec(),
+        },
+    );
+    assert_eq!(live.status, Status::Ok);
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn doc_put_expires_at_lazy_expiry() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    let past = 1_000u64; // long expired
+
+    doc_put_expires(&mut s, "ttl", b"live", r#"{"n":1}"#, future);
+    doc_put_expires(&mut s, "ttl", b"dead", r#"{"n":2}"#, past);
+
+    let live = query(
+        &mut s,
+        wire::QueryPayload::ById {
+            collection: "ttl".into(),
+            doc_id: b"live".to_vec(),
+        },
+    );
+    assert_eq!(live.status, Status::Ok);
+    let v: serde_json::Value = serde_json::from_slice(&live.payload).unwrap();
+    assert_eq!(v["n"], serde_json::json!(1));
+
+    let dead = query(
+        &mut s,
+        wire::QueryPayload::ById {
+            collection: "ttl".into(),
+            doc_id: b"dead".to_vec(),
+        },
+    );
+    assert_eq!(
+        dead.status,
+        Status::NotFound,
+        "expired DocPut must be NotFound on Query ById"
+    );
 
     drop(s);
     *shutdown.lock().unwrap() = true;

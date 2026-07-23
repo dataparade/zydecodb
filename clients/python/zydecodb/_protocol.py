@@ -120,19 +120,39 @@ def encode_key(
 
 
 def encode_index_def(
-    collection: str, index: str, fields: List[str], *, unique: bool
+    collection: str,
+    index: str,
+    fields: List[str],
+    *,
+    unique: bool,
+    expire_after_seconds: int = 0,
 ) -> bytes:
     out = _lp(collection.encode()) + _lp(index.encode())
     out += bytes([1 if unique else 0])
     out += struct.pack(">I", len(fields))
     for field in fields:
         out += _lp(field.encode())
+    if expire_after_seconds:
+        out += struct.pack(">Q", int(expire_after_seconds))
     return out
 
 
-def encode_doc_put(collection: str, doc_id: str, document: Any, *, relaxed: bool) -> bytes:
+def encode_doc_put(
+    collection: str,
+    doc_id: str,
+    document: Any,
+    *,
+    relaxed: bool,
+    expires_at: int = 0,
+) -> bytes:
+    """DocPut payload: [collection][doc_id][body][flags][optional expires_at u64 BE].
+
+    ``expires_at`` is absolute unix millis; ``0`` omits the trailer (never expires).
+    """
     out = _lp(collection.encode()) + _lp(doc_id.encode()) + _lp(_json_bytes(document))
     out += bytes([FLAG_RELAXED if relaxed else 0])
+    if expires_at:
+        out += struct.pack(">Q", int(expires_at))
     return out
 
 

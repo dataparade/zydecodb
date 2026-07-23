@@ -76,11 +76,23 @@ function encodeRequest(v: ReqVector): Buffer {
     case "Del":
       return encodeKey(fromHex(s(i, "key_hex")));
     case "DocPut":
-      return encodeDocPut(s(i, "collection"), Buffer.from(s(i, "doc_id"), "utf8"), optBytes(s(i, "body_json")), b(i, "relaxed"));
+      return encodeDocPut(
+        s(i, "collection"),
+        Buffer.from(s(i, "doc_id"), "utf8"),
+        optBytes(s(i, "body_json")),
+        b(i, "relaxed"),
+        (i["expires_at"] as number | undefined) ?? 0,
+      );
     case "DocDel":
       return encodeDocDel(s(i, "collection"), Buffer.from(s(i, "doc_id"), "utf8"));
     case "IndexDef":
-      return encodeIndexDef(s(i, "collection"), s(i, "index_name"), arr(i, "fields"), b(i, "unique"));
+      return encodeIndexDef(
+        s(i, "collection"),
+        s(i, "index_name"),
+        arr(i, "fields"),
+        b(i, "unique"),
+        (i["expire_after_seconds"] as number | undefined) ?? 0,
+      );
     case "QueryById":
       return encodeQueryById(s(i, "collection"), Buffer.from(s(i, "doc_id"), "utf8"));
     case "QueryIndexRange":

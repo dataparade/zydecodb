@@ -93,3 +93,28 @@ def test_get_by_id(coll):
     fetched = coll.get(doc_id)
     assert fetched["name"] == "Zee"
     assert coll.get("does-not-exist") is None
+
+
+def test_upsert_set_on_insert(coll):
+    miss = coll.update_one(
+        {"email": "soi@example.com"},
+        {"$set": {"email": "soi@example.com", "n": 1}, "$setOnInsert": {"created": True}},
+        upsert=True,
+    )
+    assert miss["matched"] == 0 and miss["modified"] == 0
+    assert miss.get("upserted_id")
+    doc = coll.find_one({"email": "soi@example.com"})
+    assert doc["created"] is True
+    assert doc["n"] == 1
+
+    hit = coll.update_one(
+        {"email": "soi@example.com"},
+        {"$set": {"n": 2}, "$setOnInsert": {"created": False, "extra": 1}},
+        upsert=True,
+    )
+    assert hit["matched"] == 1 and hit["modified"] == 1
+    assert "upserted_id" not in hit
+    doc = coll.find_one({"email": "soi@example.com"})
+    assert doc["n"] == 2
+    assert doc["created"] is True
+    assert "extra" not in doc

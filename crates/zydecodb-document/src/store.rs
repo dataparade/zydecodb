@@ -124,6 +124,14 @@ pub fn upsert_ops(
     // Reject unique-index violations before mutating anything.
     enforce_unique(engine, coll, prefix, doc_id, &new_doc)?;
 
+    // TTL index derives body expiry from the date field; otherwise use the
+    // caller-supplied absolute expires_at (DocPut trailer).
+    let expires_at = if let Some(ttl) = coll.ttl_index() {
+        derive_ttl_expires_at(&new_doc, ttl)
+    } else {
+        expires_at
+    };
+
     let doc_key = keys::doc_key(prefix, coll.id, doc_id);
 
     // Old index footprint (empty for an insert; best-effort if the old body is
@@ -173,7 +181,8 @@ pub fn upsert_ops(
         ops.push(BatchOp::Put {
             key: k.clone(),
             value: doc_id.to_vec(),
-            expires_at: 0, // index entries do not expire independently of the body
+            // Share the body's expiry so index keys do not outlive the document.
+            expires_at,
         });
     }
 
@@ -357,11 +366,19 @@ pub fn define_index(
     index_name: &str,
     fields: Vec<String>,
     unique: bool,
+    expire_after_seconds: Option<u64>,
 ) -> DocResult<()> {
     // Work on a copy so the live catalog is mutated only after the backfill and
     // persist both succeed.
     let mut working = catalog.clone();
-    let meta = working.add_index(prefix, collection, index_name, fields, unique)?;
+    let meta = working.add_index(
+        prefix,
+        collection,
+        index_name,
+        fields,
+        unique,
+        expire_after_seconds,
+    )?;
     let collection_id = working
         .collection(prefix, collection)
         .expect("collection ensured by add_index")
@@ -371,6 +388,26 @@ pub fn define_index(
     working.persist(engine)?;
     *catalog = working;
     Ok(())
+}
+
+/// Derive absolute `expires_at` (unix millis) from a TTL index + document.
+/// Missing/non-numeric field → `0` (never expires until the field is present).
+pub fn derive_ttl_expires_at(doc: &Value, idx: &crate::catalog::IndexMeta) -> u64 {
+    let Some(secs) = idx.expire_after_seconds else {
+        return 0;
+    };
+    let Some(field) = idx.fields.first() else {
+        return 0;
+    };
+    let v = encoding::extract_path(doc, field);
+    let field_ms = match v {
+        Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f as u64)),
+        _ => None,
+    };
+    match field_ms {
+        Some(ms) => ms.saturating_add(secs.saturating_mul(1000)),
+        None => 0,
+    }
 }
 
 /// Scan every existing document in a collection and write the new index's
@@ -409,11 +446,21 @@ fn backfill_index(
             .collect();
         let enc = encoding::encode_fields(&vals);
         let ikey = keys::index_key(prefix, collection_id, idx.id, &enc, &doc_id);
+        let expires_at = derive_ttl_expires_at(&doc, idx);
         pending.push(BatchOp::Put {
             key: ikey,
-            value: doc_id,
-            expires_at: 0,
+            value: doc_id.clone(),
+            expires_at,
         });
+        // When creating a TTL index, stamp body expiry so existing docs become
+        // invisible under lazy expiry without waiting for a later rewrite.
+        if idx.expire_after_seconds.is_some() && expires_at != 0 {
+            pending.push(BatchOp::Put {
+                key: doc_key.clone(),
+                value: stored.clone(),
+                expires_at,
+            });
+        }
         if pending.len() >= MAX_BATCH_KEYS {
             let chunk = std::mem::take(&mut pending);
             engine.write_batch(chunk)?;

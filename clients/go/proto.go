@@ -157,14 +157,20 @@ func boolByte(v bool) byte {
 	return 0
 }
 
-// EncodeDocPut builds a DocPut payload: [collection][doc_id][body][flags].
+// EncodeDocPut builds a DocPut payload: [collection][doc_id][body][flags][optional expires_at].
 // body is the already-serialized JSON document (the codec treats it as opaque).
-func EncodeDocPut(collection string, docID, body []byte, relaxed bool) []byte {
+// expiresAt is absolute unix millis; 0 omits the trailer (never expires).
+func EncodeDocPut(collection string, docID, body []byte, relaxed bool, expiresAt uint64) []byte {
 	var buf bytes.Buffer
 	putLP(&buf, []byte(collection))
 	putLP(&buf, docID)
 	putLP(&buf, body)
 	buf.WriteByte(relaxedByte(relaxed))
+	if expiresAt != 0 {
+		var e [8]byte
+		binary.BigEndian.PutUint64(e[:], expiresAt)
+		buf.Write(e[:])
+	}
 	return buf.Bytes()
 }
 
@@ -206,8 +212,9 @@ func EncodeKey(key []byte) []byte {
 }
 
 // EncodeIndexDef builds an IndexDef payload:
-// [collection][index_name][unique u8][field_count u32]{[field]}.
-func EncodeIndexDef(collection, index string, fields []string, unique bool) []byte {
+// [collection][index_name][unique u8][field_count u32]{[field]}[optional expire_after_seconds u64].
+// expireAfterSeconds 0 omits the trailer (not a TTL index).
+func EncodeIndexDef(collection, index string, fields []string, unique bool, expireAfterSeconds uint64) []byte {
 	var buf bytes.Buffer
 	putLP(&buf, []byte(collection))
 	putLP(&buf, []byte(index))
@@ -215,6 +222,11 @@ func EncodeIndexDef(collection, index string, fields []string, unique bool) []by
 	putU32(&buf, uint32(len(fields)))
 	for _, f := range fields {
 		putLP(&buf, []byte(f))
+	}
+	if expireAfterSeconds != 0 {
+		var e [8]byte
+		binary.BigEndian.PutUint64(e[:], expireAfterSeconds)
+		buf.Write(e[:])
 	}
 	return buf.Bytes()
 }

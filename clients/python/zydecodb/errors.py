@@ -53,6 +53,14 @@ class ServerBusyError(ServerError):
     """The server is shedding load (rate limit / engine busy, status 0x07)."""
 
 
+class PolicyError(ServerError):
+    """A write/admission policy rejection (quota, status 0x09)."""
+
+
+class UnsupportedFormatError(ServerError):
+    """On-disk format the server cannot read (status 0x0A)."""
+
+
 _STATUS_TO_EXC = {
     proto.STATUS_CONFLICT: ConflictError,
     proto.STATUS_UNAUTHORIZED: AuthError,
@@ -61,6 +69,8 @@ _STATUS_TO_EXC = {
     proto.STATUS_PROTOCOL_ERROR: InvalidRequestError,
     proto.STATUS_INVALID_KEY: InvalidRequestError,
     proto.STATUS_INVALID_VALUE: InvalidRequestError,
+    proto.STATUS_POLICY_REJECTED: PolicyError,
+    proto.STATUS_UNSUPPORTED_FORMAT: UnsupportedFormatError,
 }
 
 

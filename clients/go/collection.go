@@ -23,19 +23,21 @@ type Collection struct {
 func (c *Collection) Name() string { return c.name }
 
 // CreateIndex creates a secondary index over one or more dotted field paths.
-// It returns false if the index already existed.
-func (c *Collection) CreateIndex(ctx context.Context, fields []string, unique bool) (bool, error) {
+// It returns false if the index already existed. expireAfterSeconds marks a TTL
+// index (field = unix millis); 0 means not a TTL index.
+func (c *Collection) CreateIndex(ctx context.Context, fields []string, unique bool, expireAfterSeconds uint64) (bool, error) {
 	parts := make([]string, len(fields))
 	for i, f := range fields {
 		parts[i] = strings.ReplaceAll(f, ".", "_")
 	}
 	name := "by_" + strings.Join(parts, "_")
-	return c.client.DefineIndex(ctx, c.name, name, fields, unique, true)
+	return c.client.DefineIndex(ctx, c.name, name, fields, unique, true, expireAfterSeconds)
 }
 
 // InsertOne inserts a document, generating "_id" if absent, and returns the id.
 // It returns an error (see IsConflict) if a unique index would be violated.
-func (c *Collection) InsertOne(ctx context.Context, doc Document, relaxed bool) (string, error) {
+// expiresAt is absolute unix millis; 0 means never expires.
+func (c *Collection) InsertOne(ctx context.Context, doc Document, relaxed bool, expiresAt uint64) (string, error) {
 	id, _ := doc["_id"].(string)
 	if id == "" {
 		id = GenerateID()
@@ -49,7 +51,7 @@ func (c *Collection) InsertOne(ctx context.Context, doc Document, relaxed bool) 
 	if err != nil {
 		return "", fmt.Errorf("zydecodb: marshal document: %w", err)
 	}
-	if _, err := c.client.PutDocument(ctx, c.name, id, body, relaxed); err != nil {
+	if _, err := c.client.PutDocument(ctx, c.name, id, body, relaxed, expiresAt); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -59,7 +61,7 @@ func (c *Collection) InsertOne(ctx context.Context, doc Document, relaxed bool) 
 func (c *Collection) InsertMany(ctx context.Context, docs []Document) ([]string, error) {
 	ids := make([]string, 0, len(docs))
 	for _, d := range docs {
-		id, err := c.InsertOne(ctx, d, false)
+		id, err := c.InsertOne(ctx, d, false, 0)
 		if err != nil {
 			return ids, err
 		}
@@ -69,7 +71,8 @@ func (c *Collection) InsertMany(ctx context.Context, docs []Document) ([]string,
 }
 
 // ReplaceOne inserts or fully replaces the document at docID.
-func (c *Collection) ReplaceOne(ctx context.Context, docID string, doc Document, relaxed bool) (uint64, error) {
+// expiresAt is absolute unix millis; 0 means never expires.
+func (c *Collection) ReplaceOne(ctx context.Context, docID string, doc Document, relaxed bool, expiresAt uint64) (uint64, error) {
 	cp := make(Document, len(doc)+1)
 	for k, v := range doc {
 		cp[k] = v
@@ -79,7 +82,7 @@ func (c *Collection) ReplaceOne(ctx context.Context, docID string, doc Document,
 	if err != nil {
 		return 0, fmt.Errorf("zydecodb: marshal document: %w", err)
 	}
-	return c.client.PutDocument(ctx, c.name, docID, body, relaxed)
+	return c.client.PutDocument(ctx, c.name, docID, body, relaxed, expiresAt)
 }
 
 // UpdateResult summarizes an update operation.

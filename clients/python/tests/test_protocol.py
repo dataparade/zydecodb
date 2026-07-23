@@ -8,8 +8,10 @@ from zydecodb import (
     AuthError,
     ConflictError,
     InvalidRequestError,
+    PolicyError,
     ServerBusyError,
     ServerError,
+    UnsupportedFormatError,
 )
 from zydecodb import _protocol as proto
 from zydecodb.collection import _encode_projection
@@ -63,6 +65,8 @@ def test_update_and_delete_trailing_flags():
         (proto.STATUS_ENGINE_BUSY, ServerBusyError),
         (proto.STATUS_PROTOCOL_ERROR, InvalidRequestError),
         (proto.STATUS_INVALID_KEY, InvalidRequestError),
+        (proto.STATUS_POLICY_REJECTED, PolicyError),
+        (proto.STATUS_UNSUPPORTED_FORMAT, UnsupportedFormatError),
         (proto.STATUS_ERROR, ServerError),
     ],
 )

@@ -68,3 +68,17 @@ func IsInvalidRequest(err error) bool {
 	s, ok := serverStatus(err)
 	return ok && (s == StatusProtocolError || s == StatusInvalidKey || s == StatusInvalidValue)
 }
+
+// IsPolicyRejected reports whether the server rejected the request under an
+// admission/write policy (quota, status 0x09).
+func IsPolicyRejected(err error) bool {
+	s, ok := serverStatus(err)
+	return ok && s == StatusPolicyRejected
+}
+
+// IsUnsupportedFormat reports whether the server refused an on-disk artifact
+// whose format version it cannot read (status 0x0A).
+func IsUnsupportedFormat(err error) bool {
+	s, ok := serverStatus(err)
+	return ok && s == StatusUnsupportedFormat
+}

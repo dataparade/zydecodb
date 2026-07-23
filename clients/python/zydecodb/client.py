@@ -160,8 +160,15 @@ class Client:
         *,
         unique: bool = False,
         if_not_exists: bool = True,
+        expire_after_seconds: int = 0,
     ) -> bool:
-        payload = proto.encode_index_def(collection, index, fields, unique=unique)
+        payload = proto.encode_index_def(
+            collection,
+            index,
+            fields,
+            unique=unique,
+            expire_after_seconds=expire_after_seconds,
+        )
         conn = self._pool.acquire()
         try:
             status, body = conn.request(proto.CMD_INDEX_DEF, payload)
@@ -176,11 +183,19 @@ class Client:
         return True
 
     def put_document(
-        self, collection: str, doc_id: str, document: Any, *, relaxed: bool = False
+        self,
+        collection: str,
+        doc_id: str,
+        document: Any,
+        *,
+        relaxed: bool = False,
+        expires_at: int = 0,
     ) -> int:
         body = self._execute(
             proto.CMD_DOC_PUT,
-            proto.encode_doc_put(collection, doc_id, document, relaxed=relaxed),
+            proto.encode_doc_put(
+                collection, doc_id, document, relaxed=relaxed, expires_at=expires_at
+            ),
             "DocPut",
             retryable=True,
         )

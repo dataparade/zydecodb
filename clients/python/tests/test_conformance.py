@@ -46,12 +46,14 @@ def _encode_request(kind: str, inp: dict) -> bytes:
         return proto.encode_doc_put(
             inp["collection"], inp["doc_id"], _json_field(inp["body_json"]),
             relaxed=inp["relaxed"],
+            expires_at=inp.get("expires_at", 0),
         )
     if kind == "DocDel":
         return proto.encode_doc_del(inp["collection"], inp["doc_id"])
     if kind == "IndexDef":
         return proto.encode_index_def(
-            inp["collection"], inp["index_name"], inp["fields"], unique=inp["unique"]
+            inp["collection"], inp["index_name"], inp["fields"], unique=inp["unique"],
+            expire_after_seconds=inp.get("expire_after_seconds", 0),
         )
     if kind == "QueryById":
         return proto.encode_query_by_id(inp["collection"], inp["doc_id"])

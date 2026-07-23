@@ -385,6 +385,7 @@ fn prefix_acl_applies_to_document_collections() {
         index_name: "by_n".into(),
         fields: vec!["n".into()],
         unique: false,
+        expire_after_seconds: 0,
     };
     write_request(
         &mut stream,

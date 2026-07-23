@@ -30,6 +30,7 @@ fn test_filter_complexity_exhaustion() {
         index_name: "idx_a".to_string(),
         fields: vec!["a".to_string()],
         unique: false,
+        expire_after_seconds: 0,
     };
     write_request(
         &mut stream,

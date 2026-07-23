@@ -182,8 +182,9 @@ export class Client {
     fields: string[],
     unique: boolean,
     ifNotExists = true,
+    expireAfterSeconds: number | bigint = 0,
   ): Promise<boolean> {
-    const payload = encodeIndexDef(collection, index, fields, unique);
+    const payload = encodeIndexDef(collection, index, fields, unique, expireAfterSeconds);
     const conn = await this.pool.acquire();
     let res;
     try {
@@ -203,10 +204,11 @@ export class Client {
     docId: string,
     body: Buffer,
     relaxed: boolean,
+    expiresAt: number | bigint = 0,
   ): Promise<bigint> {
     const out = await this.execute(
       Cmd.DocPut,
-      encodeDocPut(collection, Buffer.from(docId, "utf8"), body, relaxed),
+      encodeDocPut(collection, Buffer.from(docId, "utf8"), body, relaxed, expiresAt),
       "DocPut",
       { retryable: true },
     );

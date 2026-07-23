@@ -43,6 +43,12 @@ export class ServerBusyError extends ServerError {}
 /** The server rejected the request as malformed or invalid. */
 export class InvalidRequestError extends ServerError {}
 
+/** A write/admission policy rejection (quota, status 0x09). */
+export class PolicyError extends ServerError {}
+
+/** On-disk format the server cannot read (status 0x0A). */
+export class UnsupportedFormatError extends ServerError {}
+
 /** Build the most specific ServerError for a non-OK response. */
 export function fromStatus(status: number, op: string, payload: Buffer): ServerError {
   const detail = payload.length ? payload.toString("utf8") : "";
@@ -58,6 +64,10 @@ export function fromStatus(status: number, op: string, payload: Buffer): ServerE
     case Status.InvalidKey:
     case Status.InvalidValue:
       return new InvalidRequestError(op, status, detail);
+    case Status.PolicyRejected:
+      return new PolicyError(op, status, detail);
+    case Status.UnsupportedFormat:
+      return new UnsupportedFormatError(op, status, detail);
     default:
       return new ServerError(op, status, detail);
   }

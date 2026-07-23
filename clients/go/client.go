@@ -206,9 +206,10 @@ func (c *Client) Delete(ctx context.Context, key []byte) (bool, error) {
 // --- document layer (raw bytes; Collection adds JSON ergonomics) ---
 
 // DefineIndex creates a secondary index. With ifNotExists, an existing index
-// returns (false, nil) instead of an error.
-func (c *Client) DefineIndex(ctx context.Context, collection, index string, fields []string, unique, ifNotExists bool) (bool, error) {
-	payload := EncodeIndexDef(collection, index, fields, unique)
+// returns (false, nil) instead of an error. expireAfterSeconds marks a TTL
+// index (field = unix millis); 0 means not a TTL index.
+func (c *Client) DefineIndex(ctx context.Context, collection, index string, fields []string, unique, ifNotExists bool, expireAfterSeconds uint64) (bool, error) {
+	payload := EncodeIndexDef(collection, index, fields, unique, expireAfterSeconds)
 	conn, err := c.pool.acquire(ctx)
 	if err != nil {
 		return false, err
@@ -229,9 +230,10 @@ func (c *Client) DefineIndex(ctx context.Context, collection, index string, fiel
 }
 
 // PutDocument inserts or replaces a document by id. body is JSON. It returns the
-// engine sequence number assigned to the write.
-func (c *Client) PutDocument(ctx context.Context, collection, docID string, body []byte, relaxed bool) (uint64, error) {
-	out, err := c.execute(ctx, CmdDocPut, EncodeDocPut(collection, []byte(docID), body, relaxed), "DocPut", execOptions{retryable: true})
+// engine sequence number assigned to the write. expiresAt is absolute unix
+// millis; 0 means never expires.
+func (c *Client) PutDocument(ctx context.Context, collection, docID string, body []byte, relaxed bool, expiresAt uint64) (uint64, error) {
+	out, err := c.execute(ctx, CmdDocPut, EncodeDocPut(collection, []byte(docID), body, relaxed, expiresAt), "DocPut", execOptions{retryable: true})
 	if err != nil {
 		return 0, err
 	}

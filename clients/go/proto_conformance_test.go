@@ -103,9 +103,10 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 			DocID      string `json:"doc_id"`
 			BodyJSON   string `json:"body_json"`
 			Relaxed    bool   `json:"relaxed"`
+			ExpiresAt  uint64 `json:"expires_at"`
 		}
 		mustInput(t, v.Input, &in)
-		return EncodeDocPut(in.Collection, []byte(in.DocID), optBytes(in.BodyJSON), in.Relaxed)
+		return EncodeDocPut(in.Collection, []byte(in.DocID), optBytes(in.BodyJSON), in.Relaxed, in.ExpiresAt)
 	case "DocDel":
 		var in struct {
 			Collection string `json:"collection"`
@@ -115,13 +116,14 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 		return EncodeDocDel(in.Collection, []byte(in.DocID))
 	case "IndexDef":
 		var in struct {
-			Collection string   `json:"collection"`
-			IndexName  string   `json:"index_name"`
-			Fields     []string `json:"fields"`
-			Unique     bool     `json:"unique"`
+			Collection         string   `json:"collection"`
+			IndexName          string   `json:"index_name"`
+			Fields             []string `json:"fields"`
+			Unique             bool     `json:"unique"`
+			ExpireAfterSeconds uint64   `json:"expire_after_seconds"`
 		}
 		mustInput(t, v.Input, &in)
-		return EncodeIndexDef(in.Collection, in.IndexName, in.Fields, in.Unique)
+		return EncodeIndexDef(in.Collection, in.IndexName, in.Fields, in.Unique, in.ExpireAfterSeconds)
 	case "QueryById":
 		var in struct {
 			Collection string `json:"collection"`

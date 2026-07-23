@@ -121,6 +121,10 @@ is queryable whether it is indexed or not.
   a duplicate key returns `Conflict`.
 - **Synchronous backfill**: adding an index to a populated collection indexes the
   existing documents before the call returns.
+- **TTL indexes** (`create_index(..., expire_after_seconds=N)`): at most one per
+  collection; single field whose value is unix millis; body and index-key
+  `expires_at` become `field_ms + N * 1000` on write/update. Missing/invalid
+  field → no expiry. Wire trailer `0`/omitted = not a TTL index.
 - **Order-preserving encoding** (`encoding.rs`): scalar field values encode so
   that lexicographic byte order equals logical order, and encodings are
   prefix-free, so composite keys and the trailing doc-id suffix never disturb
@@ -158,7 +162,7 @@ indexer.
 | `0x24` | `Update` | Implemented (filter-based partial update; `FLAG_UPSERT`) |
 | `0x25` | `Delete` | Implemented (filter-based delete) |
 | `0x26` | `Count` | Implemented (count / distinct) |
-| `0x30` | `IndexDef` | Implemented (index create + backfill) |
+| `0x30` | `IndexDef` | Implemented (index create + backfill; optional TTL `expire_after_seconds` trailer) |
 | `0x40` | `SessionInit` | Implemented (API-key auth handshake) |
 | `0x41` | `SetContext` | Implemented (admin tenant switch) |
 | `0x42` | `AdminDropTenant` | Implemented (live tenant offboard; admin path) |
@@ -172,9 +176,9 @@ indexer.
 `zydecodb-engine::errors` (including `PolicyRejected` / `UnsupportedFormat`) are
 **frozen for 0.9.x** — append-only, no renumbering. Reserved slots and the
 Not-yet list may gain semantics later without changing existing codes. On-disk
-format upgrades follow [`UPGRADE.md`](UPGRADE.md). Official drivers do not yet
-expose every admin opcode or DocPut TTL; freeze is the wire contract, not full
-driver coverage.
+format upgrades follow [`UPGRADE.md`](UPGRADE.md). Official drivers expose DocPut
+`expires_at` and IndexDef `expire_after_seconds` (TTL indexes); other admin
+opcodes may still lag the freeze.
 
 Payload codecs are in `zydecodb-document/src/wire.rs`. The official drivers (Python, Go, TypeScript) are the intended product surface; the binary wire sits behind them.
 
@@ -281,8 +285,8 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 - Aggregation pipeline (`$group` / `$lookup` / `$unwind`)
 - Projection pushdown / covered queries (the body is always fetched)
 - Other upsert edge-case Mongo parity beyond `$setOnInsert`
-- TTL indexes / `expireAfterSeconds` on a date field (per-document `expires_at` on
-  `DocPut` is supported and swept periodically by the server)
+- SST compaction dropping expired values (lazy read expiry + ~30s memtable
+  sweeper ship; expired keys can linger on disk until overwritten)
 - MVCC / multi-document transactions (opcodes `0x10`–`0x12` reserved; `seq` is
   ordering only)
 - Enforced collection schemas (`SchemaDef`, `0x31`, reserved)

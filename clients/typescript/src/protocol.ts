@@ -140,16 +140,25 @@ function utf8(s: string): Buffer {
 }
 
 /**
- * DocPut payload: [collection][doc_id][body][flags]. `body` is already-
- * serialized JSON (the codec treats it as opaque bytes).
+ * DocPut payload: [collection][doc_id][body][flags][optional expires_at u64 BE].
+ * `body` is already-serialized JSON (the codec treats it as opaque bytes).
+ * `expiresAt` is absolute unix millis; 0 omits the trailer (never expires).
  */
 export function encodeDocPut(
   collection: string,
   docId: Buffer,
   body: Buffer,
   relaxed: boolean,
+  expiresAt: number | bigint = 0,
 ): Buffer {
-  return Buffer.concat([lp(utf8(collection)), lp(docId), lp(body), flag(relaxed)]);
+  const parts = [lp(utf8(collection)), lp(docId), lp(body), flag(relaxed)];
+  const exp = BigInt(expiresAt);
+  if (exp !== 0n) {
+    const e = Buffer.allocUnsafe(8);
+    e.writeBigUInt64BE(exp, 0);
+    parts.push(e);
+  }
+  return Buffer.concat(parts);
 }
 
 /** DocDel payload: [collection][doc_id]. */
@@ -157,15 +166,22 @@ export function encodeDocDel(collection: string, docId: Buffer): Buffer {
   return Buffer.concat([lp(utf8(collection)), lp(docId)]);
 }
 
-/** IndexDef payload: [collection][index][unique u8][field_count u32]{[field]}. */
+/** IndexDef payload: [collection][index][unique u8][field_count u32]{[field]}[optional expire_after_seconds u64]. */
 export function encodeIndexDef(
   collection: string,
   index: string,
   fields: string[],
   unique: boolean,
+  expireAfterSeconds: number | bigint = 0,
 ): Buffer {
   const parts = [lp(utf8(collection)), lp(utf8(index)), boolByte(unique), u32(fields.length)];
   for (const f of fields) parts.push(lp(utf8(f)));
+  const exp = BigInt(expireAfterSeconds);
+  if (exp !== 0n) {
+    const e = Buffer.allocUnsafe(8);
+    e.writeBigUInt64BE(exp, 0);
+    parts.push(e);
+  }
   return Buffer.concat(parts);
 }
 

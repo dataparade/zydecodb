@@ -285,6 +285,11 @@ fn index_def(
     let (outcome, slowdown) = {
         let mut cat = catalog.write().unwrap();
         let mut guard = engine.write();
+        let ttl = if p.expire_after_seconds == 0 {
+            None
+        } else {
+            Some(p.expire_after_seconds)
+        };
         let r = store::define_index(
             &mut guard,
             &mut cat,
@@ -293,6 +298,7 @@ fn index_def(
             &p.index_name,
             p.fields,
             p.unique,
+            ttl,
         );
         let seq = guard.last_buffered_seq();
         let s = guard.take_write_slowdown();

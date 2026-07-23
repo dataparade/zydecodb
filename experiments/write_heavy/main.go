@@ -70,10 +70,10 @@ func main() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			
+
 			// Give each worker its own random source
 			r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
-			
+
 			timeout := time.After(*duration)
 			for {
 				select {
@@ -87,12 +87,12 @@ func main() {
 						"timestamp": time.Now().UnixMilli(),
 						"trace_id":  fmt.Sprintf("trace-%d-%d", workerID, r.Intn(1000000)),
 					}
-					
+
 					// 5s timeout per write
 					wCtx, wCancel := context.WithTimeout(ctx, 5*time.Second)
-					_, err := logs.InsertOne(wCtx, doc, *relaxed)
+					_, err := logs.InsertOne(wCtx, doc, *relaxed, 0)
 					wCancel()
-					
+
 					if err != nil {
 						atomic.AddUint64(&totalErrors, 1)
 					} else {
@@ -108,13 +108,13 @@ func main() {
 
 	writes := atomic.LoadUint64(&totalWrites)
 	errs := atomic.LoadUint64(&totalErrors)
-	
+
 	fmt.Printf("\n--- Results ---\n")
 	fmt.Printf("Duration:    %v\n", elapsed)
 	fmt.Printf("Total writes:%d\n", writes)
 	fmt.Printf("Errors:      %d\n", errs)
 	fmt.Printf("Throughput:  %.2f writes/sec\n", float64(writes)/elapsed.Seconds())
-	
+
 	// Check how many actually made it
 	count, err := logs.CountDocuments(ctx, nil)
 	if err != nil {

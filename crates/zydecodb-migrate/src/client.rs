@@ -69,6 +69,7 @@ impl Client {
             index_name: index_name.to_string(),
             fields: fields.to_vec(),
             unique,
+            expire_after_seconds: 0,
         }
         .encode();
         let (status, body) = self.request_retrying(Command::IndexDef, payload)?;

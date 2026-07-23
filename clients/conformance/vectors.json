@@ -92,6 +92,20 @@
       "payload_hex": "0000000575736572730000000275310000000a7b22616765223a33307d01"
     },
     {
+      "command": 33,
+      "envelope_hex": "0121000000260000000575736572730000000275320000000a7b22616765223a34307d000000018bcfe56800",
+      "input": {
+        "body_json": "{\"age\":40}",
+        "collection": "users",
+        "doc_id": "u2",
+        "expires_at": 1700000000000,
+        "relaxed": false
+      },
+      "kind": "DocPut",
+      "name": "doc_put_expires",
+      "payload_hex": "0000000575736572730000000275320000000a7b22616765223a34307d000000018bcfe56800"
+    },
+    {
       "command": 34,
       "envelope_hex": "01220000000f000000057573657273000000027531",
       "input": {
@@ -132,6 +146,22 @@
       "kind": "IndexDef",
       "name": "index_def_unique_multi",
       "payload_hex": "0000000575736572730000000862795f656d61696c010000000200000005656d61696c000000046e616d65"
+    },
+    {
+      "command": 48,
+      "envelope_hex": "01300000002600000004736573730000000662795f6578700000000001000000036578700000000000000e10",
+      "input": {
+        "collection": "sess",
+        "expire_after_seconds": 3600,
+        "fields": [
+          "exp"
+        ],
+        "index_name": "by_exp",
+        "unique": false
+      },
+      "kind": "IndexDef",
+      "name": "index_def_ttl",
+      "payload_hex": "00000004736573730000000662795f6578700000000001000000036578700000000000000e10"
     },
     {
       "command": 32,

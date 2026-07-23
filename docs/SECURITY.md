@@ -235,7 +235,7 @@ Product target: well-behaved tenant **steady-state** p99 delay bounded by **δ �
 
 **Lock domains:** the server shares [`EngineHandle`](../crates/zydecodb-engine/src/engine_handle.rs) — write mutex for memtable/WAL append/SST publish; block cache, fair-share state, and WAL group-commit use separate interior locks so cache inserts and fsync do not take the write mutex. Never `thread::sleep` while holding the write lock.
 
-**Enable under pods:** start from [`config/zydecodb.pods.example.toml`](../config/zydecodb.pods.example.toml) (`[fair] enabled = true`, `legacy_single_tenant = false`, optional `[runtime] profile = "low_footprint"`). Local single-tenant `zydecodb serve` keeps fair **off** by default — do not wire fair into the low-footprint profile.
+**Enable under pods:** follow the one-page runbook [`PODS.md`](PODS.md). Start from [`config/zydecodb.pods.example.toml`](../config/zydecodb.pods.example.toml) (`[fair] enabled = true`, `legacy_single_tenant = false`, optional `[runtime] profile = "low_footprint"`). Local single-tenant `zydecodb serve` keeps fair **off** by default — do not wire fair into the low-footprint profile.
 
 **Prove it (simulated pods — no fleet required):**
 
