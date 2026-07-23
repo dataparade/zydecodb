@@ -344,21 +344,189 @@ fn row_from_stored(
     }
 }
 
-/// True when `payload` is a JSON object that already contains an `_id` key.
-/// Uses a light scan rather than a full DOM build when possible; falls back to
-/// `serde_json` for correctness on unusual whitespace/ordering.
+/// True when `payload` is a JSON object with a top-level `_id` key.
+/// Bounded byte scan only — no serde. Uncertain / nested-only → `false`
+/// (caller re-adds `_id` on the slow path).
 fn raw_json_has_id(payload: &[u8]) -> bool {
-    // Fast reject: must look like an object.
     let trim = trim_ascii(payload);
-    if !trim.starts_with(b"{") {
+    if trim.is_empty() || trim[0] != b'{' {
         return false;
     }
-    // Common driver shape: `{"_id":...` or `{ "_id": ...`.
-    if let Ok(v) = serde_json::from_slice::<Value>(payload) {
-        matches!(v, Value::Object(m) if m.contains_key(crate::planner::ID_FIELD))
-    } else {
-        false
+    scan_top_level_has_key(&trim[1..], crate::planner::ID_FIELD.as_bytes())
+}
+
+/// Walk top-level object keys after the opening `{`. Returns true only when a
+/// top-level key equals `want`. Nested objects/arrays are skipped; parse
+/// failures return false.
+fn scan_top_level_has_key(mut s: &[u8], want: &[u8]) -> bool {
+    loop {
+        s = skip_ws(s);
+        if s.is_empty() {
+            return false;
+        }
+        if s[0] == b'}' {
+            return false;
+        }
+        if s[0] != b'"' {
+            return false;
+        }
+        let Some((key, rest)) = scan_json_string(&s[1..]) else {
+            return false;
+        };
+        s = skip_ws(rest);
+        if s.first() != Some(&b':') {
+            return false;
+        }
+        s = skip_ws(&s[1..]);
+        if key == want {
+            return true;
+        }
+        // Skip the value (any JSON token), then optional comma.
+        let Some(rest) = skip_json_value(s) else {
+            return false;
+        };
+        s = skip_ws(rest);
+        if s.first() == Some(&b',') {
+            s = &s[1..];
+            continue;
+        }
+        // End of object or garbage — either way, key was not found.
+        return false;
     }
+}
+
+fn skip_ws(s: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i < s.len() && s[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    &s[i..]
+}
+
+/// After opening `"`, return (unescaped key bytes as raw slice if no escapes,
+/// or owned-compared via small decode) and rest after closing `"`.
+/// For key matching we only need raw equality without escapes for `_id`; if the
+/// key contains `\`, compare a decoded buffer.
+fn scan_json_string(s: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut escaped = false;
+    while i < s.len() {
+        let c = s[i];
+        if escaped {
+            match c {
+                b'"' | b'\\' | b'/' => out.push(c),
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0c),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'u' => {
+                    // Minimal \uXXXX — four hex digits.
+                    if i + 4 >= s.len() {
+                        return None;
+                    }
+                    let hex = std::str::from_utf8(&s[i + 1..i + 5]).ok()?;
+                    let cp = u16::from_str_radix(hex, 16).ok()?;
+                    out.extend(String::from_utf16_lossy(&[cp]).into_bytes());
+                    i += 4;
+                }
+                _ => return None,
+            }
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' => {
+                escaped = true;
+                i += 1;
+            }
+            b'"' => return Some((out, &s[i + 1..])),
+            c if c < 0x20 => return None,
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+fn skip_json_value(s: &[u8]) -> Option<&[u8]> {
+    let s = skip_ws(s);
+    if s.is_empty() {
+        return None;
+    }
+    match s[0] {
+        b'"' => {
+            let (_, rest) = scan_json_string(&s[1..])?;
+            Some(rest)
+        }
+        b'{' | b'[' => skip_json_container(s),
+        b't' => skip_literal(s, b"true"),
+        b'f' => skip_literal(s, b"false"),
+        b'n' => skip_literal(s, b"null"),
+        b'-' | b'0'..=b'9' => {
+            let mut i = 1;
+            while i < s.len() && matches!(s[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+                i += 1;
+            }
+            Some(&s[i..])
+        }
+        _ => None,
+    }
+}
+
+fn skip_literal<'a>(s: &'a [u8], lit: &[u8]) -> Option<&'a [u8]> {
+    if s.starts_with(lit) {
+        Some(&s[lit.len()..])
+    } else {
+        None
+    }
+}
+
+fn skip_json_container(s: &[u8]) -> Option<&[u8]> {
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    while i < s.len() {
+        let c = s[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_str = true;
+                i += 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(&s[i..]);
+                }
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 fn trim_ascii(s: &[u8]) -> &[u8] {
@@ -748,13 +916,10 @@ fn extract_sort_keys(stored: &[u8], sort: &[(String, bool)]) -> Vec<Vec<u8>> {
 
     let mut keys = Vec::with_capacity(sort.len());
     for (path, _) in sort {
-        if let Some(v) = view.get_path(path) {
-            let mut out = Vec::new();
-            crate::encoding::encode_value(&v.to_value(), &mut out);
-            keys.push(out);
-        } else {
-            keys.push(vec![0x00]); // TAG_NULL
-        }
+        let mut out = Vec::new();
+        let field = view.get_path(path);
+        crate::encoding::encode_view(field.as_ref(), &mut out);
+        keys.push(out);
     }
     keys
 }
@@ -769,7 +934,9 @@ fn buffered_sort_page(
     max_sort_buffer: usize,
 ) -> DocResult<QueryPage> {
     let prefix_len = doc_prefix.len().saturating_sub(1 + 4);
-    let mut all: Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    // Buffer (id, sort_keys) only — page bodies are re-fetched from the same
+    // pinned snapshot after sort + windowing.
+    let mut all: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
     let mut overflow = false;
 
     for_each_match(
@@ -784,7 +951,7 @@ fn buffered_sort_page(
                 return Ok(false);
             }
             let keys = extract_sort_keys(stored, &spec.sort);
-            all.push((doc_id, stored.to_vec(), keys));
+            all.push((doc_id, keys));
             Ok(true)
         },
     )?;
@@ -796,15 +963,19 @@ fn buffered_sort_page(
     }
 
     let sort = spec.sort.clone();
-    all.sort_by(|a, b| compare_sort_keys(&a.2, &b.2, &sort));
+    all.sort_by(|a, b| compare_sort_keys(&a.1, &b.1, &sort));
 
     let total = all.len();
     let end = offset.saturating_add(limit).min(total);
     let slice_start = offset.min(total);
     let mut rows = Vec::with_capacity(end - slice_start);
-    for (doc_id, stored, _) in &all[slice_start..end] {
-        if let Some(row) = row_from_stored(doc_id.clone(), stored, &spec.projection)? {
-            rows.push(row);
+    for (doc_id, _) in &all[slice_start..end] {
+        let mut dk = doc_prefix.to_vec();
+        dk.extend_from_slice(doc_id);
+        if let Some(stored) = snap.get(&dk)? {
+            if let Some(row) = row_from_stored(doc_id.clone(), &stored, &spec.projection)? {
+                rows.push(row);
+            }
         }
     }
     let next_cursor = (end < total).then(|| encode_offset_cursor(snap.seq_upper(), end));
@@ -887,5 +1058,40 @@ fn copy_path(src: &Value, dst: &mut Value, path: &str) {
     }
     if let Value::Object(m) = d {
         m.insert(segs[segs.len() - 1].to_string(), s.clone());
+    }
+}
+
+#[cfg(test)]
+mod raw_json_has_id_tests {
+    use super::raw_json_has_id;
+
+    #[test]
+    fn detects_top_level_id() {
+        assert!(raw_json_has_id(br#"{"_id":1}"#));
+        assert!(raw_json_has_id(br#"{ "_id" : 1 }"#));
+        assert!(raw_json_has_id(br#"{"a":1,"_id":"x"}"#));
+    }
+
+    #[test]
+    fn ignores_nested_id() {
+        assert!(!raw_json_has_id(br#"{"a":{"_id":1}}"#));
+        assert!(!raw_json_has_id(br#"{"items":[{"_id":1}]}"#));
+    }
+
+    #[test]
+    fn rejects_non_objects_and_garbage() {
+        assert!(!raw_json_has_id(br#""_id""#));
+        assert!(!raw_json_has_id(br#"[1,2]"#));
+        assert!(!raw_json_has_id(br#"{"x":1}"#));
+        assert!(!raw_json_has_id(b""));
+        assert!(!raw_json_has_id(br#"{"_id"#)); // torn
+    }
+
+    #[test]
+    fn handles_escaped_quotes_in_keys() {
+        // Key is literally `_id` via escape — still matches.
+        assert!(raw_json_has_id(br#"{"\u005fid":1}"#));
+        // Nested string with `_id` text must not false-positive.
+        assert!(!raw_json_has_id(br#"{"a":"\"_id\":1"}"#));
     }
 }

@@ -344,12 +344,13 @@ pub fn delete_ops(
     }
 
     let mut ops: Vec<BatchOp> = vec![BatchOp::Del { key: doc_key }];
-    let old_val = if stored[0] == VK_ZDOC {
-        Some(crate::binary::ValueView::new(strip_value_kind(&stored)).to_value())
-    } else {
-        serde_json::from_slice::<Value>(strip_value_kind(&stored)).ok()
-    };
-    if let Some(old) = old_val {
+    let payload = strip_value_kind(&stored);
+    if stored[0] == VK_ZDOC {
+        let view = crate::binary::ValueView::new(payload);
+        for k in index_keys_for_view(coll, prefix, doc_id, &view) {
+            ops.push(BatchOp::Del { key: k });
+        }
+    } else if let Ok(old) = serde_json::from_slice::<Value>(payload) {
         for k in index_keys_for(coll, prefix, doc_id, &old) {
             ops.push(BatchOp::Del { key: k });
         }

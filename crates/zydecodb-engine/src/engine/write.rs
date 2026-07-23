@@ -59,16 +59,19 @@ impl Engine {
         }
 
         let seq = self.seq.next();
-        let rec = WalRecord::put(seq, expires_at, key.clone(), value.clone());
-        if self.group_commit {
-            self.append_wal_buffered(&rec)?;
-        } else {
-            self.append_wal(&rec)?;
+        let value_len = value.len();
+        // Encode WAL from borrowed slices; keep one key clone for post-write /
+        // cache invalidate after the key moves into the memtable.
+        let wal_bytes = wal::encode_put(seq, expires_at, &key, &value);
+        self.append_bytes_buffered(&wal_bytes, seq)?;
+        if !self.group_commit {
+            self.sync_wal()?;
         }
+        let policy_key = key.clone();
 
-        let ik = InternalKey::new(key.clone(), seq, EntryKind::Value);
+        let ik = InternalKey::new(key, seq, EntryKind::Value);
         let entry = Entry::value(
-            value.clone(),
+            value,
             if expires_at == 0 {
                 None
             } else {
@@ -79,15 +82,15 @@ impl Engine {
         self.active_mut().insert(ik, entry);
         crate::engine_fail_point!(crate::failpoints::ENGINE_AFTER_MEMTABLE_INSERT);
         if let Some(rc) = &self.result_cache {
-            rc.invalidate(&key);
+            rc.invalidate(&policy_key);
         }
 
         // Post-write bookkeeping (e.g. durable usage counters), on the same
         // commit path so it joins this write's group-commit fsync.
-        policy.post_write(self, &key, value.len(), existing_value_len, false);
+        policy.post_write(self, &policy_key, value_len, existing_value_len, false);
 
         if let Some(m) = &self.metrics {
-            m.user_bytes_written_total.inc_by(value.len() as u64);
+            m.user_bytes_written_total.inc_by(value_len as u64);
         }
 
         // Per-caller operation counts (e.g. labeled by routing context) are
@@ -118,21 +121,21 @@ impl Engine {
         policy.pre_write(self, &key, 0, existing_value_len, true)?;
 
         let seq = self.seq.next();
-        let rec = WalRecord::del(seq, key.clone());
-        if self.group_commit {
-            self.append_wal_buffered(&rec)?;
-        } else {
-            self.append_wal(&rec)?;
+        let wal_bytes = wal::encode_del(seq, &key);
+        self.append_bytes_buffered(&wal_bytes, seq)?;
+        if !self.group_commit {
+            self.sync_wal()?;
         }
+        let policy_key = key.clone();
 
-        let ik = InternalKey::new(key.clone(), seq, EntryKind::Tombstone);
+        let ik = InternalKey::new(key, seq, EntryKind::Tombstone);
         self.active_mut().insert(ik, Entry::tombstone());
         if let Some(rc) = &self.result_cache {
-            rc.invalidate(&key);
+            rc.invalidate(&policy_key);
         }
 
         // Post-write bookkeeping: a policy may release usage for the freed key.
-        policy.post_write(self, &key, 0, existing_value_len, true);
+        policy.post_write(self, &policy_key, 0, existing_value_len, true);
 
         // See `put`: per-caller operation counts are the caller's concern.
         self.maybe_freeze();
@@ -241,44 +244,46 @@ impl Engine {
         }
 
         // Insert every op into the memtable under the shared batch seq.
+        // Consume ops by value so key/value move once (WAL already encoded).
         crate::engine_fail_point!(crate::failpoints::ENGINE_BEFORE_MEMTABLE_INSERT);
-        for op in &ops {
+        let mut total_value_len = 0usize;
+        for (op, existing) in ops.into_iter().zip(existing_lens.into_iter()) {
+            let (key_for_hooks, value_len, is_delete) = match &op {
+                BatchOp::Put { key, value, .. } => (key.clone(), value.len(), false),
+                BatchOp::Del { key } => (key.clone(), 0, true),
+            };
+            total_value_len += value_len;
             let (ik, entry) = match op {
                 BatchOp::Put {
                     key,
                     value,
                     expires_at,
                 } => (
-                    InternalKey::new(key.clone(), seq, EntryKind::Value),
+                    InternalKey::new(key, seq, EntryKind::Value),
                     Entry::value(
-                        value.clone(),
-                        if *expires_at == 0 {
+                        value,
+                        if expires_at == 0 {
                             None
                         } else {
-                            Some(*expires_at)
+                            Some(expires_at)
                         },
                     ),
                 ),
                 BatchOp::Del { key } => (
-                    InternalKey::new(key.clone(), seq, EntryKind::Tombstone),
+                    InternalKey::new(key, seq, EntryKind::Tombstone),
                     Entry::tombstone(),
                 ),
             };
             self.active_mut().insert(ik, entry);
             if let Some(rc) = &self.result_cache {
-                rc.invalidate(op.key());
+                rc.invalidate(&key_for_hooks);
             }
+            policy.post_write(self, &key_for_hooks, value_len, existing, is_delete);
         }
         crate::engine_fail_point!(crate::failpoints::ENGINE_AFTER_MEMTABLE_INSERT);
 
-        // Post-write bookkeeping on the same commit path as the user write.
-        for (op, existing) in ops.iter().zip(existing_lens.iter()) {
-            policy.post_write(self, op.key(), op.value_len(), *existing, op.is_delete());
-        }
-
         if let Some(m) = &self.metrics {
-            let total: usize = ops.iter().map(|op| op.value_len()).sum();
-            m.user_bytes_written_total.inc_by(total as u64);
+            m.user_bytes_written_total.inc_by(total_value_len as u64);
         }
 
         self.maybe_freeze();
@@ -455,7 +460,7 @@ impl Engine {
         }
         let frozen = std::mem::replace(&mut self.active, Arc::new(Memtable::new()));
         self.immutable.push_back(frozen);
-        self.update_gauges();
+        self.refresh_topology_gauges();
         self.try_submit_flush();
     }
 
@@ -468,7 +473,7 @@ impl Engine {
         };
         if mt.is_empty() {
             self.immutable.pop_front();
-            self.update_gauges();
+            self.refresh_topology_gauges();
             return self.try_submit_flush();
         }
         let pairs: Vec<(InternalKey, Entry)> =
@@ -494,7 +499,7 @@ impl Engine {
         );
         if submitted {
             self.immutable.pop_front();
-            self.update_gauges();
+            self.refresh_topology_gauges();
         }
         submitted
     }

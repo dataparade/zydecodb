@@ -83,17 +83,13 @@ impl WalRecord {
 
     /// Serialize to bytes including the trailing CRC32.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ENTRY_FIXED + self.key.len() + self.value.len() + 4);
-        buf.push(self.command);
-        buf.extend_from_slice(&self.seq.to_be_bytes());
-        buf.extend_from_slice(&self.expires_at.to_be_bytes());
-        buf.extend_from_slice(&(self.key.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&(self.value.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&self.key);
-        buf.extend_from_slice(&self.value);
-        let crc = crc32fast::hash(&buf);
-        buf.extend_from_slice(&crc.to_be_bytes());
-        buf
+        encode_record(
+            self.command,
+            self.seq,
+            self.expires_at,
+            &self.key,
+            &self.value,
+        )
     }
 
     /// Try to decode one entry from the front of `buf`. Dispatches on the
@@ -130,6 +126,30 @@ impl WalRecord {
             ),
         }
     }
+}
+
+/// Encode a PUT record from borrowed key/value slices (no intermediate clone).
+pub fn encode_put(seq: u64, expires_at: u64, key: &[u8], value: &[u8]) -> Vec<u8> {
+    encode_record(WAL_PUT, seq, expires_at, key, value)
+}
+
+/// Encode a DEL (tombstone) record from a borrowed key.
+pub fn encode_del(seq: u64, key: &[u8]) -> Vec<u8> {
+    encode_record(WAL_DEL, seq, 0, key, &[])
+}
+
+fn encode_record(command: u8, seq: u64, expires_at: u64, key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(ENTRY_FIXED + key.len() + value.len() + 4);
+    buf.push(command);
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(&expires_at.to_be_bytes());
+    buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(value);
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_be_bytes());
+    buf
 }
 
 /// One operation inside a batch WAL record. `command` is `WAL_PUT` or

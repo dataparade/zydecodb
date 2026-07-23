@@ -98,12 +98,13 @@ fn compaction_reads_bypass_user_cache_counters() {
     }
 
     // Sync block-cache counters into metrics before the baseline snapshot.
-    e.put(uk(b"metrics_sync"), b"z".to_vec(), 0).unwrap();
+    // (Puts no longer refresh topology gauges — that was readdir-per-write waste.)
+    e.refresh_metrics();
     let hits_before = metrics.block_cache_hits_total.get();
     let misses_before = metrics.block_cache_misses_total.get();
 
     e.drain_compaction().unwrap();
-    e.put(uk(b"metrics_touch"), b"z".to_vec(), 0).unwrap();
+    e.refresh_metrics();
 
     assert_eq!(
         metrics.block_cache_hits_total.get(),

@@ -55,11 +55,12 @@ impl Memtable {
     pub fn insert(&mut self, key: InternalKey, entry: Entry) {
         self.min_seq = self.min_seq.min(key.seq);
         self.max_seq = self.max_seq.max(key.seq);
-        let added = entry_footprint(&key, &entry);
-        if let Some(old) = self.map.insert(key.clone(), entry) {
+        let key_len = key.user_key.len();
+        let added = entry_footprint_len(key_len, &entry);
+        if let Some(old) = self.map.insert(key, entry) {
             // Replacing the exact same InternalKey (same user_key+seq+kind);
             // adjust accounting by the delta.
-            let old_fp = entry_footprint(&key, &old);
+            let old_fp = entry_footprint_len(key_len, &old);
             self.size_bytes = self.size_bytes + added - old_fp;
         } else {
             self.size_bytes += added;
@@ -119,10 +120,10 @@ impl Memtable {
     }
 }
 
-fn entry_footprint(key: &InternalKey, entry: &Entry) -> usize {
+fn entry_footprint_len(user_key_len: usize, entry: &Entry) -> usize {
     // user_key bytes + value bytes + fixed overhead (seq 8 + kind 1 + expires 8 +
     // map node overhead estimate 48).
-    key.user_key.len() + entry.value_len() + 8 + 1 + 8 + 48
+    user_key_len + entry.value_len() + 8 + 1 + 8 + 48
 }
 
 #[cfg(test)]

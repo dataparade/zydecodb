@@ -466,7 +466,7 @@ impl Server {
                             if *shutdown.lock().unwrap() {
                                 break;
                             }
-                            let seq = engine.try_write().map(|e| e.current_seq()).unwrap_or(0);
+                            let seq = engine.read().current_seq();
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)

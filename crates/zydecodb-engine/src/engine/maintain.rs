@@ -176,6 +176,7 @@ impl Engine {
         }
         self.try_submit_flush();
         self.update_compaction_gauges();
+        self.refresh_topology_gauges();
         self.maybe_sync_data_dir()?;
         Ok(flushed + applied)
     }
@@ -476,7 +477,7 @@ impl Engine {
 
         self.record_apply_duration(apply_start.elapsed());
         self.process_deferred_unlinks()?;
-        self.update_gauges();
+        self.refresh_topology_gauges();
         if apply.flush_max_seq.is_some() {
             self.request_compaction();
             self.maybe_submit_compaction();

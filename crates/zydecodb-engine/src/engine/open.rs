@@ -249,7 +249,7 @@ impl Engine {
             fair,
         };
         engine.open_new_wal_segment()?;
-        engine.update_gauges();
+        engine.refresh_topology_gauges();
         Ok(engine)
     }
 
@@ -266,7 +266,7 @@ impl Engine {
         self.apply_scheduler.set_metrics(metrics.clone());
         self.wal_sync.set_metrics(Some(metrics.clone()));
         self.metrics = Some(metrics);
-        self.update_gauges();
+        self.refresh_topology_gauges();
         self
     }
 
@@ -528,6 +528,7 @@ impl Engine {
             self.ship_sealed_segment(sealed_id);
             self.active_wal_id += 1;
             self.open_new_wal_segment()?;
+            self.refresh_topology_gauges();
         }
         // The engine lock serializes writers, so a shared `&File` is safe here;
         // only the (concurrent) coordinator reads this fd to fsync, which is

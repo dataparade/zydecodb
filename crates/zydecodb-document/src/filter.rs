@@ -344,15 +344,13 @@ impl FieldPred {
     fn matches(&self, doc: ValueView<'_>, doc_id: Option<&[u8]>) -> bool {
         if self.path == crate::planner::ID_FIELD {
             if let Some(id_bytes) = doc_id {
-                let id_str = String::from_utf8_lossy(id_bytes).into_owned();
-                let id_val = serde_json::Value::String(id_str);
-
-                // We evaluate atoms against this Value
-                // But atoms expect Option<ValueView>, which we can't easily make from an owned String without a ZDocBuilder
-                // Let's just build a tiny ZDoc for the ID
-                let temp_zdoc = crate::binary::ZDocBuilder::from_value(&id_val);
-                let view = crate::binary::ValueView::new(&temp_zdoc);
-                return self.atoms.iter().all(|atom| atom.matches(Some(view)));
+                // Match against the id string directly — no per-candidate ZDoc.
+                // Non-UTF8 ids use the same lossy conversion as before.
+                let id_str = String::from_utf8_lossy(id_bytes);
+                return self
+                    .atoms
+                    .iter()
+                    .all(|atom| atom.matches_str(id_str.as_ref()));
             }
         }
         let field = doc.get_path(&self.path);
@@ -397,6 +395,48 @@ impl Atom {
             },
         }
     }
+
+    /// Match against a string id — same semantics as a TYPE_STRING ValueView.
+    fn matches_str(&self, id: &str) -> bool {
+        match self {
+            Atom::Eq(target) => str_eq(id, target),
+            Atom::Ne(target) => !str_eq(id, target),
+            Atom::Gt(target) => str_ordering(id, target, &[Ordering::Greater]),
+            Atom::Gte(target) => str_ordering(id, target, &[Ordering::Greater, Ordering::Equal]),
+            Atom::Lt(target) => str_ordering(id, target, &[Ordering::Less]),
+            Atom::Lte(target) => str_ordering(id, target, &[Ordering::Less, Ordering::Equal]),
+            Atom::Exists(want) => *want,
+            Atom::In(list) => list.iter().any(|t| str_eq(id, t)),
+            Atom::Nin(list) => !list.iter().any(|t| str_eq(id, t)),
+            Atom::Type(name) => *name == "string",
+            Atom::All(_) | Atom::ElemMatch(_) => false,
+            Atom::Regex { re, .. } => re.is_match(id),
+        }
+    }
+}
+
+/// `$eq` against a string field (id path).
+fn str_eq(id: &str, target: &Value) -> bool {
+    match target {
+        Value::String(s) => s == id,
+        _ => false,
+    }
+}
+
+/// Ordering against a string field; mirrors [`cmp_scalar_view`] type tags
+/// (null=0, bool=1, number=2, string=3).
+fn str_ordering(id: &str, target: &Value, accept: &[Ordering]) -> bool {
+    if !is_scalar(target) {
+        return false;
+    }
+    let ord = match target {
+        Value::Null => Ordering::Greater, // string(3) > null(0)
+        Value::Bool(_) => Ordering::Greater,
+        Value::Number(_) => Ordering::Greater,
+        Value::String(s) => id.cmp(s.as_str()),
+        _ => return false,
+    };
+    accept.contains(&ord)
 }
 
 fn type_match(field: Option<ValueView<'_>>, name: &str) -> bool {
@@ -690,5 +730,33 @@ mod tests {
         // Or-rooted yields nothing usable for a single index.
         let f = parse(json!({"$or": [{"a": 1}, {"b": 2}]}));
         assert!(f.top_level_fields().is_empty());
+    }
+
+    #[test]
+    fn id_field_matches_str_parity() {
+        let body = crate::binary::ZDocBuilder::from_value(&json!({"x": 1}));
+        let view = crate::binary::ValueView::new(&body);
+        let id = b"doc-42";
+
+        let eq = parse(json!({"_id": "doc-42"}));
+        assert!(eq.matches(view, Some(id)));
+        assert!(!parse(json!({"_id": "other"})).matches(view, Some(id)));
+
+        let ne = parse(json!({"_id": {"$ne": "other"}}));
+        assert!(ne.matches(view, Some(id)));
+        assert!(!parse(json!({"_id": {"$ne": "doc-42"}})).matches(view, Some(id)));
+
+        let inn = parse(json!({"_id": {"$in": ["a", "doc-42"]}}));
+        assert!(inn.matches(view, Some(id)));
+        assert!(!parse(json!({"_id": {"$in": ["a", "b"]}})).matches(view, Some(id)));
+
+        let re = parse(json!({"_id": {"$regex": "^doc-"}}));
+        assert!(re.matches(view, Some(id)));
+        assert!(!parse(json!({"_id": {"$regex": "^x"}})).matches(view, Some(id)));
+
+        // Lossy UTF-8: invalid bytes become U+FFFD; match against that string.
+        let bad = b"a\xffb";
+        let lossy = String::from_utf8_lossy(bad).into_owned();
+        assert!(parse(json!({ "_id": lossy })).matches(view, Some(bad)));
     }
 }

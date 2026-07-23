@@ -21,7 +21,7 @@ use crate::block_cache::BlockCache;
 use crate::engine::Engine;
 use crate::tenant_fair::FairShareState;
 use crate::wal_sync::WalSync;
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 /// Shared engine with per-resource lock domains.
 pub struct EngineHandle {
@@ -56,11 +56,13 @@ impl EngineHandle {
         self.write.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Fallible exclusive write lock (preserves poison observability).
+    /// Non-blocking exclusive write lock. Returns `WouldBlock` when another
+    /// writer (or reader) holds the lock — callers must skip or retry later.
+    /// Preserves poison observability via [`TryLockError::Poisoned`].
     pub fn try_write(
         &self,
-    ) -> Result<RwLockWriteGuard<'_, Engine>, PoisonError<RwLockWriteGuard<'_, Engine>>> {
-        self.write.write()
+    ) -> Result<RwLockWriteGuard<'_, Engine>, TryLockError<RwLockWriteGuard<'_, Engine>>> {
+        self.write.try_write()
     }
 
     /// Block cache — safe to use without the write mutex.
