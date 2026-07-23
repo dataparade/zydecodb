@@ -1,0 +1,60 @@
+# Multi-tenant "pods" host: many tenants in one process with δ-fair isolation.
+# Local single-tenant quickstart should keep using `zydecodb serve` (no TOML)
+# or config/zydecodb.dev.toml — fair stays off there by design.
+#
+# Copy and edit paths/keys before use:
+#   cp config/zydecodb.pods.example.toml /etc/zydecodb/config.toml
+#   zydecodb serve --config /etc/zydecodb/config.toml
+#
+# Prove isolation on your box (and on CI ubuntu-latest):
+#   ./scripts/tenant-isolation-soak.sh
+# See docs/SECURITY.md#multi-tenant-sharing-model and docs/SOAK.md.
+
+listen = "127.0.0.1:9470"
+# Optional local control-plane socket (auth still applies):
+# listen_unix = "/var/run/zydecodb/zydecodb.sock"
+
+data_dir = "/var/lib/zydecodb/data"
+wal_dir = "/var/lib/zydecodb/wal"
+block_cache_mb = 256
+max_open_readers = 128
+poll_compaction_ms = 50
+durability = "sync"
+fsync_interval_ms = 100
+
+# Trim RSS for dense multi-instance boxes. Does NOT enable fair by itself.
+[runtime]
+profile = "low_footprint"
+
+[security]
+require_auth = "true"
+keys_file = "/etc/zydecodb/keys.toml"
+allow_unauthenticated_ping = true
+# Required for real multi-tenant key prefixing.
+legacy_single_tenant = false
+max_connections = 256
+rate_limit_rps = 1000
+auth_burst_limit = 10
+idle_timeout_secs = 300
+max_sort_buffer = 10000
+
+[security.audit]
+enabled = true
+log_client_key = false
+
+[security.quotas]
+# 0 = unlimited; prefer per-tenant [[tenant]] caps in the keys file.
+max_bytes_per_tenant = 0
+
+# δ-fair memtable/cache/stall isolation — on for pods hosts.
+[fair]
+enabled = true
+tenant_count = 8
+delta_steady_ms = 50
+delta_buffer_ms = 350
+# fork_b_l0_domains = false
+
+[tls]
+enabled = false
+# cert = "/etc/zydecodb/tls.crt"
+# key  = "/etc/zydecodb/tls.key"

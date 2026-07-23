@@ -293,10 +293,12 @@ func TestCommandAndStatusCodes(t *testing.T) {
 		}
 	}
 	statusChecks := map[string]byte{
-		"Ok":           StatusOK,
-		"EngineBusy":   StatusEngineBusy,
-		"Unauthorized": StatusUnauthorized,
-		"Forbidden":    StatusForbidden,
+		"Ok":                StatusOK,
+		"EngineBusy":        StatusEngineBusy,
+		"PolicyRejected":    StatusPolicyRejected,
+		"UnsupportedFormat": StatusUnsupportedFormat,
+		"Unauthorized":      StatusUnauthorized,
+		"Forbidden":         StatusForbidden,
 	}
 	for name, want := range statusChecks {
 		if vf.Statuses[name] != want {

@@ -70,7 +70,11 @@ of scope here. Fields suffixed `_hex` (`cursor_hex`) carry raw bytes as hex.
 
 `input` shapes by `kind`:
 
-- **DocPut** — `collection`, `doc_id` (UTF-8 → bytes), `body_json`, `relaxed`
+- **DocPut** — `collection`, `doc_id` (UTF-8 → bytes), `body_json`, `relaxed`.
+  Optional wire trailer (not yet in all driver APIs): after the flags byte, an
+  8-byte big-endian `expires_at` (unix millis) when non-zero. Vectors today
+  cover `relaxed` only; server encode/decode of `expires_at` is in
+  `DocPutPayload`.
 - **DocDel** — `collection`, `doc_id`
 - **IndexDef** — `collection`, `index_name`, `fields` (string[]), `unique`
 - **QueryById** — `collection`, `doc_id`
@@ -79,7 +83,8 @@ of scope here. Fields suffixed `_hex` (`cursor_hex`) carry raw bytes as hex.
 - **Find** — `collection`, `filter_json`, `sort` (`[field, ascending][]`),
   `projection` (`{mode: none|include|exclude, fields: string[]}`), `skip`,
   `limit`, `cursor_hex`
-- **Update** — `collection`, `filter_json`, `update_json`, `multi`, `relaxed`
+- **Update** — `collection`, `filter_json`, `update_json`, `multi`, `relaxed`,
+  `upsert` (bool; sets `FLAG_UPSERT=0x02` on the trailing flags byte)
 - **Delete** — `collection`, `filter_json`, `multi`, `relaxed`
 - **Count** — `collection`, `filter_json`
 - **Distinct** — `collection`, `filter_json`, `field`

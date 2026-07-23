@@ -133,5 +133,7 @@ def test_status_codes_match_vectors():
     st = VECTORS["statuses"]
     assert proto.STATUS_OK == st["Ok"]
     assert proto.STATUS_ENGINE_BUSY == st["EngineBusy"]
+    assert proto.STATUS_POLICY_REJECTED == st["PolicyRejected"]
+    assert proto.STATUS_UNSUPPORTED_FORMAT == st["UnsupportedFormat"]
     assert proto.STATUS_UNAUTHORIZED == st["Unauthorized"]
     assert proto.STATUS_FORBIDDEN == st["Forbidden"]

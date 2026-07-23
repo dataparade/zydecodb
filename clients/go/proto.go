@@ -62,17 +62,19 @@ const (
 
 // Status codes (response envelope byte 1).
 const (
-	StatusOK            byte = 0x00
-	StatusNotFound      byte = 0x01
-	StatusError         byte = 0x02
-	StatusConflict      byte = 0x03
-	StatusIOError       byte = 0x04
-	StatusInvalidKey    byte = 0x05
-	StatusInvalidValue  byte = 0x06
-	StatusEngineBusy    byte = 0x07
-	StatusProtocolError byte = 0x08
-	StatusUnauthorized  byte = 0x0B
-	StatusForbidden     byte = 0x0C
+	StatusOK                byte = 0x00
+	StatusNotFound          byte = 0x01
+	StatusError             byte = 0x02
+	StatusConflict          byte = 0x03
+	StatusIOError           byte = 0x04
+	StatusInvalidKey        byte = 0x05
+	StatusInvalidValue      byte = 0x06
+	StatusEngineBusy        byte = 0x07
+	StatusProtocolError     byte = 0x08
+	StatusPolicyRejected    byte = 0x09
+	StatusUnsupportedFormat byte = 0x0A
+	StatusUnauthorized      byte = 0x0B
+	StatusForbidden         byte = 0x0C
 )
 
 func statusName(status byte) string {
@@ -95,6 +97,10 @@ func statusName(status byte) string {
 		return "EngineBusy"
 	case StatusProtocolError:
 		return "ProtocolError"
+	case StatusPolicyRejected:
+		return "PolicyRejected"
+	case StatusUnsupportedFormat:
+		return "UnsupportedFormat"
 	case StatusUnauthorized:
 		return "Unauthorized"
 	case StatusForbidden:

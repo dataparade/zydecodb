@@ -1,5 +1,6 @@
 {
   "commands": {
+    "AdminDropTenant": 66,
     "Count": 38,
     "Del": 3,
     "Delete": 37,
@@ -12,6 +13,7 @@
     "Put": 1,
     "Query": 32,
     "SessionInit": 64,
+    "SetContext": 65,
     "Stats": 241,
     "Update": 36
   },
@@ -409,7 +411,9 @@
     "IoError": 4,
     "NotFound": 1,
     "Ok": 0,
+    "PolicyRejected": 9,
     "ProtocolError": 8,
-    "Unauthorized": 11
+    "Unauthorized": 11,
+    "UnsupportedFormat": 10
   }
 }

@@ -77,3 +77,25 @@ memtable_total_mb = 1
         .put(tenant_key(1, 0), vec![0u8; 1024], 0)
         .expect("victim must still admit under pods fair config");
 }
+
+#[test]
+fn pods_example_toml_parses_with_fair_enabled() {
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("data");
+    let wal = tmp.path().join("wal");
+    let keys = tmp.path().join("keys.toml");
+    std::fs::write(&keys, "").unwrap();
+    let config_path = tmp.path().join("pods.toml");
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/zydecodb.pods.example.toml");
+    let mut body = std::fs::read_to_string(&example).expect("read pods example.toml");
+    body = body
+        .replace("/var/lib/zydecodb/data", data.to_str().unwrap())
+        .replace("/var/lib/zydecodb/wal", wal.to_str().unwrap())
+        .replace("/etc/zydecodb/keys.toml", keys.to_str().unwrap());
+    std::fs::write(&config_path, body).unwrap();
+    let cfg = Config::from_file(&config_path).expect("pods example.toml must parse");
+    assert!(cfg.fair.enabled);
+    assert!(!cfg.security.legacy_single_tenant);
+    assert_eq!(cfg.fair.tenant_count, 8);
+}

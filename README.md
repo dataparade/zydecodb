@@ -4,7 +4,7 @@ Source-available database written in Rust (BSL 1.1). Runs as a standalone server
 
 Two layers, one engine:
 
-- **Document store** — collections of JSON documents with a filter/query layer: `$`-operators, sort/projection/pagination, partial updates (`$set`/`$inc`/`$unset`/`$push`), `count`/`distinct`, and secondary indexes the server keeps in sync automatically. Any field is queryable, indexed or not.
+- **Document store** — collections of JSON documents with a filter/query layer: `$`-operators, sort/projection/pagination, partial updates (`$set`/`$inc`/`$unset`/`$push`/`$setOnInsert`), `count`/`distinct`, and secondary indexes the server keeps in sync automatically. Any field is queryable, indexed or not.
 - **Key-value core** — the LSM storage engine underneath: ordered keys, atomic multi-key batches, snapshots, and WAL crash recovery.
 
 **License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07)
@@ -95,7 +95,7 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 - JSON document collections with auto-generated time-ordered `_id`
 - Filters: `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists`, implicit-AND, `$and/$or/$not`, dotted paths
 - `find` with sort, projection, skip/limit, and cursor pagination; `find_one`, `count_documents`, `distinct`
-- Partial updates (`$set/$inc/$unset/$push`), `update_one/many`, `delete_one/many`
+- Partial updates (`$set/$inc/$unset/$push/$setOnInsert`), filter upsert, `update_one/many`, `delete_one/many`
 - A query planner that uses an index (or `_id` lookup) when one fits and falls back to a collection scan otherwise — so any field is queryable
 - Secondary indexes maintained automatically and atomically on every write; synchronous backfill when added to an existing collection
 - **Unique indexes** enforced server-side (`create_index(..., unique=True)` → `Conflict` on duplicates)
@@ -125,17 +125,17 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 - Optional Unix-domain-socket listener (`listen_unix`) for local control-plane traffic without a per-instance TCP port
 - A `[runtime] profile = "low_footprint"` that trims cache, open readers, and idle wakeups for dense multi-instance boxes
 
-**Multi-tenant sharing model (read this):** tenants get **namespace isolation** (key prefix, ACLs, byte/RPS quotas, drop-tenant). Write/catalog mutations still serialize on the engine write lock; block cache, fair-share accounting, and WAL fsync are separate domains. δ-fair memtable/cache/stall isolation is implemented but **off by default** (`EngineConfig::fair`) — until you enable and tune it, do not assume one tenant’s write storm cannot affect another’s latency. See [`docs/SECURITY.md`](docs/SECURITY.md#multi-tenant-sharing-model).
+**Multi-tenant sharing model (read this):** tenants get **namespace isolation** (key prefix, ACLs, byte/RPS quotas, drop-tenant). Write/catalog mutations still serialize on the engine write lock; block cache, fair-share accounting, and WAL fsync are separate domains. δ-fair memtable/cache/stall isolation is **off by default** for local/single-tenant; pods hosts should start from [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) (`[fair] enabled = true`). Until fair is on and soak-proven, do not assume one tenant’s write storm cannot affect another’s latency. See [`docs/SECURITY.md`](docs/SECURITY.md#multi-tenant-sharing-model).
 
 ## Beta scope
 
 **Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). Filters, sort, projection, pagination, partial updates, `count`/`distinct`, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits.
 
-**Not yet:** aggregation pipeline (`$group`/`$lookup`/`$unwind`), `$setOnInsert`, TTL *indexes* / expireAfterSeconds (per-document `expires_at` on insert is supported), MVCC/multi-document transactions, and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). δ-fair multi-tenant isolation clears the simulated pods soak ship bar (steady victim put p99 δ ≤ 50 ms with `[fair]` on) and the FairDB-style ramp-up reclaim gate (≤ 350 ms) but stays **off by default** — enable and prove on your hardware via `scripts/tenant-isolation-soak.sh` (`MODE=rampup` for reclaim). See [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) for the gap list and roadmap.
+**Not yet:** aggregation pipeline (`$group`/`$lookup`/`$unwind`), TTL *indexes* / expireAfterSeconds (per-document `expires_at` on insert is supported), MVCC/multi-document transactions, and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). δ-fair multi-tenant isolation clears the simulated pods soak ship bar (steady victim put p99 δ ≤ 50 ms with `[fair]` on) and the FairDB-style ramp-up reclaim gate (≤ 350 ms) but stays **off by default** — enable via [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) and prove on your hardware via `scripts/tenant-isolation-soak.sh` (`MODE=rampup` for reclaim). See [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) for the gap list and roadmap.
 
 ## Expectations, gotchas, advice
 
-- **Beta** (`0.9.0-beta.1`). API, wire protocol, and on-disk format may change before 1.0.
+- **Beta** (`0.9.0-beta.6`). Implemented opcodes, write flags, and status bytes are **frozen for 0.9.x** (append-only; see [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md#wire-protocol)). Reserved opcodes and listed Not-yet features may gain semantics without renumbering. On-disk format changes follow [`docs/UPGRADE.md`](docs/UPGRADE.md).
 - **BSL license.** Self-hosting (including in production) is free; you may not offer ZydecoDB to third parties as a competing hosted/managed service. Converts to Apache 2.0 on the change date — see [LICENSE](LICENSE).
 - **Security:** run behind your API on localhost or a private network. See [`docs/SECURITY.md`](docs/SECURITY.md). Do not expose `:9470` to the internet without auth.
 - **Keys on the wire** are opaque bytes; the server stores them under the user keyspace (`KS_USER` prefix).

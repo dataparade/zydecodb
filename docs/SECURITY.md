@@ -235,7 +235,7 @@ Product target: well-behaved tenant **steady-state** p99 delay bounded by **δ �
 
 **Lock domains:** the server shares [`EngineHandle`](../crates/zydecodb-engine/src/engine_handle.rs) — write mutex for memtable/WAL append/SST publish; block cache, fair-share state, and WAL group-commit use separate interior locks so cache inserts and fsync do not take the write mutex. Never `thread::sleep` while holding the write lock.
 
-**Enable under pods:** set `[fair] enabled = true` in the server TOML (see `config/zydecodb.example.toml`), typically with `legacy_single_tenant = false`. Off by default until you prove the soak on your box.
+**Enable under pods:** start from [`config/zydecodb.pods.example.toml`](../config/zydecodb.pods.example.toml) (`[fair] enabled = true`, `legacy_single_tenant = false`, optional `[runtime] profile = "low_footprint"`). Local single-tenant `zydecodb serve` keeps fair **off** by default — do not wire fair into the low-footprint profile.
 
 **Prove it (simulated pods — no fleet required):**
 
@@ -245,7 +245,7 @@ MODE=steady ./scripts/tenant-isolation-soak.sh     # ship bar only
 MODE=rampup ./scripts/tenant-isolation-soak.sh     # FairDB idle→reclaim hard case
 ```
 
-Harness: `tenant-isolation-soak` — steady V solo / V\|N fair=off / V\|N fair=on, plus ramp-up (N floods while V idle, then V reclaim burst ≈ fair-share bytes). Steady δ ≤ 50 ms and ramp-up δ ≤ 350 ms are **separate** claims. Re-run on your hardware before claiming numbers. Driver notes: [`SOAK.md`](SOAK.md).
+Harness: `tenant-isolation-soak` — steady V solo / V\|N fair=off / V\|N fair=on, plus ramp-up (N floods while V idle, then V reclaim burst ≈ fair-share bytes). Steady δ ≤ 50 ms and ramp-up δ ≤ 350 ms are **separate** claims. CI gates these thresholds on `ubuntu-latest` (nightly / `workflow_dispatch` — see `.github/workflows/tenant-isolation-soak.yml`); re-prove on your hardware before claiming numbers. Driver notes: [`SOAK.md`](SOAK.md).
 
 ### Per-tenant limits
 

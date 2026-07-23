@@ -185,6 +185,8 @@ test("command and status codes match vectors", () => {
   assert.equal(vectors.commands["SessionInit"], Cmd.SessionInit);
   assert.equal(vectors.statuses["Ok"], Status.Ok);
   assert.equal(vectors.statuses["EngineBusy"], Status.EngineBusy);
+  assert.equal(vectors.statuses["PolicyRejected"], Status.PolicyRejected);
+  assert.equal(vectors.statuses["UnsupportedFormat"], Status.UnsupportedFormat);
   assert.equal(vectors.statuses["Unauthorized"], Status.Unauthorized);
   assert.equal(vectors.statuses["Forbidden"], Status.Forbidden);
 });

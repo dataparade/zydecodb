@@ -1,4 +1,5 @@
 # Production-style paths. For local dev, use config/zydecodb.dev.toml instead.
+# Multi-tenant pods host (fair on): see config/zydecodb.pods.example.toml.
 # LAN: listen = "0.0.0.0:9470" and require_auth = true (or "auto").
 listen = "127.0.0.1:9470"
 data_dir = "/var/lib/zydecodb/data"
@@ -73,8 +74,14 @@ log_client_key = false
 # 0 = unlimited
 max_bytes_per_tenant = 0
 
-# δ-fair pods isolation (off by default). See docs/SECURITY.md#multi-tenant-sharing-model.
-# Prove with: ./scripts/tenant-isolation-soak.sh
+# Dense multi-instance boxes: shrink cache / open readers / compaction poll when
+# still at stock defaults. Does not enable [fair].
+# [runtime]
+# profile = "low_footprint"
+
+# δ-fair pods isolation (off by default for single-tenant). See
+# docs/SECURITY.md#multi-tenant-sharing-model and config/zydecodb.pods.example.toml.
+# Prove with: ./scripts/tenant-isolation-soak.sh (also gated in CI nightly).
 [fair]
 enabled = false
 # tenant_count = 8

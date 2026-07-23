@@ -1,0 +1,33 @@
+# δ-fair pods soak: steady δ ≤ 50ms + ramp-up reclaim δ ≤ 350ms.
+# Heavy (release build + multi-phase timing) — not on every PR.
+# Fast PR gate: crates/zydecodb/tests/fair_pods_config.rs
+name: Tenant isolation soak
+
+on:
+  schedule:
+    # 06:15 UTC daily
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run tenant-isolation-soak (MODE=both)
+        env:
+          MODE: both
+          RELEASE: "1"
+          DATA_ROOT: ${{ runner.temp }}/zydeco-tenant-soak
+          JSON_OUT: ${{ runner.temp }}/zydeco-tenant-soak/summary.json
+        run: ./scripts/tenant-isolation-soak.sh
+      - name: Upload soak summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenant-isolation-soak-summary
+          path: ${{ runner.temp }}/zydeco-tenant-soak/summary.json
+          if-no-files-found: ignore

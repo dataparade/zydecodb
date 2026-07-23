@@ -54,6 +54,8 @@ export const Status = {
   InvalidValue: 0x06,
   EngineBusy: 0x07,
   ProtocolError: 0x08,
+  PolicyRejected: 0x09,
+  UnsupportedFormat: 0x0a,
   Unauthorized: 0x0b,
   Forbidden: 0x0c,
 } as const;
@@ -68,6 +70,8 @@ const STATUS_NAMES: Record<number, string> = {
   [Status.InvalidValue]: "InvalidValue",
   [Status.EngineBusy]: "EngineBusy",
   [Status.ProtocolError]: "ProtocolError",
+  [Status.PolicyRejected]: "PolicyRejected",
+  [Status.UnsupportedFormat]: "UnsupportedFormat",
   [Status.Unauthorized]: "Unauthorized",
   [Status.Forbidden]: "Forbidden",
 };

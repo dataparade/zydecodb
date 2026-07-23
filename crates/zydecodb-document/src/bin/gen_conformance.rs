@@ -464,6 +464,8 @@ fn response_vectors() -> Vec<Value> {
 }
 
 fn commands_map() -> Value {
+    // Implemented 0.9 opcodes (frozen). Reserved Begin/Commit/Rollback/SchemaDef
+    // are intentionally omitted from this map.
     json!({
         "Put": Command::Put.as_u8(),
         "Get": Command::Get.as_u8(),
@@ -477,12 +479,15 @@ fn commands_map() -> Value {
         "Count": Command::Count.as_u8(),
         "IndexDef": Command::IndexDef.as_u8(),
         "SessionInit": Command::SessionInit.as_u8(),
+        "SetContext": Command::SetContext.as_u8(),
+        "AdminDropTenant": Command::AdminDropTenant.as_u8(),
         "Ping": Command::Ping.as_u8(),
         "Stats": Command::Stats.as_u8(),
     })
 }
 
 fn statuses_map() -> Value {
+    // Append-only wire statuses (see zydecodb_engine::errors).
     json!({
         "Ok": Status::Ok as u8,
         "NotFound": Status::NotFound as u8,
@@ -493,6 +498,8 @@ fn statuses_map() -> Value {
         "InvalidValue": Status::InvalidValue as u8,
         "EngineBusy": Status::EngineBusy as u8,
         "ProtocolError": Status::ProtocolError as u8,
+        "PolicyRejected": Status::PolicyRejected as u8,
+        "UnsupportedFormat": Status::UnsupportedFormat as u8,
         "Unauthorized": Status::Unauthorized as u8,
         "Forbidden": Status::Forbidden as u8,
     })

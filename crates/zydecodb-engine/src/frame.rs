@@ -7,20 +7,19 @@
 //! [N] payload
 //! ```
 //!
-//! The engine defines only the byte layout and the verbs needed by the storage
-//! core (PUT/GET/DEL/PING/STATS plus reserved bytes for future work). Anything
-//! a front end layers on top — session establishment, routing context — uses
-//! the two reserved command bytes `SessionInit` (0x40) and `SetContext` (0x41),
-//! which the engine parses but never interprets. Their semantics belong to the
-//! caller.
+//! The engine owns the envelope byte layout and the command/status enumerations.
+//! Document opcodes (`0x20`–`0x26`, `0x30`) are interpreted by the server document
+//! layer; session/admin opcodes (`0x40`–`0x42`) by the server security/admin path.
+//! Reserved slots (`Begin`/`Commit`/`Rollback`, `SchemaDef`) parse but reject with
+//! `ProtocolError` until a future minor line assigns semantics.
 
 use crate::errors::{EngineError, Status};
 
 pub const PROTO_VERSION: u8 = 0x01;
 pub const ENVELOPE_HEADER_LEN: usize = 6;
 
-/// Command codes. Only PUT/GET/DEL/PING/STATS are implemented in v1; the rest
-/// are reserved so the wire never breaks when later sprints add them.
+/// Command codes for the 0.9 wire. Implemented opcodes and this numbering are
+/// frozen for 0.9.x; reserved slots may gain semantics later without renumbering.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {

@@ -93,16 +93,19 @@ is queryable whether it is indexed or not.
 
 ### Writes (`update.rs`, `store.rs`)
 
-- Update operators: `$set`, `$inc`, `$unset`, `$push`. Bare (non-`$`) update
-  documents are rejected.
+- Update operators: `$set`, `$inc`, `$unset`, `$push`, `$setOnInsert`. Bare
+  (non-`$`) update documents are rejected. `$setOnInsert` applies only when an
+  upsert inserts; normal updates ignore it. On insert, `$setOnInsert` runs
+  before regular ops so `$set`/`$inc`/`$unset`/`$push` win on path conflicts.
 - `update_one` / `update_many`, `delete_one` / `delete_many`: candidate ids come
   from a lock-free snapshot, then **each matched document is rewritten in one
   atomic `write_batch`** (body + all of its index keys). Per-document writes are
   atomic; a multi-document update is **not** globally atomic.
 - Filter upsert (`FLAG_UPSERT` on Update): when no document survives the
   under-lock filter recheck, insert at most one document built from top-level
-  equality fields in the filter plus the operator update. Response includes
-  `upserted_id` on insert; omit it on a normal update. No `$setOnInsert` yet.
+  equality fields in the filter plus the operator update (including
+  `$setOnInsert`). Response includes `upserted_id` on insert; omit it on a
+  normal update.
 
 ---
 
@@ -149,19 +152,29 @@ indexer.
 | `0x02` | `Get` | Implemented (raw KV) |
 | `0x03` | `Del` | Implemented (raw KV) |
 | `0x20` | `Query` | Implemented (document layer) |
-| `0x21` | `DocPut` | Implemented (document upsert) |
+| `0x21` | `DocPut` | Implemented (document upsert; optional `expires_at` trailer) |
 | `0x22` | `DocDel` | Implemented (document delete) |
 | `0x23` | `Find` | Implemented (filter + sort/projection/pagination) |
-| `0x24` | `Update` | Implemented (filter-based partial update) |
+| `0x24` | `Update` | Implemented (filter-based partial update; `FLAG_UPSERT`) |
 | `0x25` | `Delete` | Implemented (filter-based delete) |
 | `0x26` | `Count` | Implemented (count / distinct) |
 | `0x30` | `IndexDef` | Implemented (index create + backfill) |
 | `0x40` | `SessionInit` | Implemented (API-key auth handshake) |
 | `0x41` | `SetContext` | Implemented (admin tenant switch) |
+| `0x42` | `AdminDropTenant` | Implemented (live tenant offboard; admin path) |
 | `0xF0` | `Ping` | Implemented |
 | `0xF1` | `Stats` | Implemented |
-| `0x10`–`0x12` | `Begin`/`Commit`/`Rollback` | Reserved (no multi-doc transactions) |
-| `0x31` | `SchemaDef` | Reserved (no enforced schemas) |
+| `0x10`–`0x12` | `Begin`/`Commit`/`Rollback` | Reserved (parseable; `ProtocolError` until transactions) |
+| `0x31` | `SchemaDef` | Reserved (parseable; `ProtocolError` until schemas) |
+
+**0.9 freeze:** implemented opcodes above, write flags (`FLAG_RELAXED=0x01`,
+`FLAG_UPSERT=0x02`; unused flag bits must be zero), and status bytes in
+`zydecodb-engine::errors` (including `PolicyRejected` / `UnsupportedFormat`) are
+**frozen for 0.9.x** — append-only, no renumbering. Reserved slots and the
+Not-yet list may gain semantics later without changing existing codes. On-disk
+format upgrades follow [`UPGRADE.md`](UPGRADE.md). Official drivers do not yet
+expose every admin opcode or DocPut TTL; freeze is the wire contract, not full
+driver coverage.
 
 Payload codecs are in `zydecodb-document/src/wire.rs`. The official drivers (Python, Go, TypeScript) are the intended product surface; the binary wire sits behind them.
 
@@ -267,15 +280,17 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 
 - Aggregation pipeline (`$group` / `$lookup` / `$unwind`)
 - Projection pushdown / covered queries (the body is always fetched)
-- `$setOnInsert` and other upsert edge-case Mongo parity
+- Other upsert edge-case Mongo parity beyond `$setOnInsert`
 - TTL indexes / `expireAfterSeconds` on a date field (per-document `expires_at` on
   `DocPut` is supported and swept periodically by the server)
 - MVCC / multi-document transactions (opcodes `0x10`–`0x12` reserved; `seq` is
   ordering only)
 - Enforced collection schemas (`SchemaDef`, `0x31`, reserved)
-- Marketed multi-tenant p99 SLA (simulated soak ship bar δ≤50 ms clears with
-  `[fair]` on; still off by default — prove with `scripts/tenant-isolation-soak.sh`;
-  see [`SECURITY.md`](SECURITY.md#multi-tenant-sharing-model))
+- Marketed multi-tenant p99 SLA as a universal default (simulated soak ship bar
+  δ≤50 ms clears with `[fair]` on; CI gates on ubuntu-latest via
+  `tenant-isolation-soak.yml`; still off by default for single-tenant — enable via
+  `config/zydecodb.pods.example.toml`; see [`SECURITY.md`](SECURITY.md#multi-tenant-sharing-model))
+- ZDoc-to-client wire (not part of the 0.9 freeze)
 
 ---
 

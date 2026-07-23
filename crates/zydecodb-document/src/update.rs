@@ -1,8 +1,9 @@
 //! Partial-update operators and the update/delete write paths.
 //!
-//! An update document must use operators (`$set $inc $unset $push`); a bare
-//! (non-`$`) document is rejected rather than silently replacing the whole
-//! document.
+//! An update document must use operators (`$set $inc $unset $push $setOnInsert`);
+//! a bare (non-`$`) document is rejected rather than silently replacing the
+//! whole document. `$setOnInsert` applies only on upsert insert (see
+//! [`materialize_upsert`]); normal updates ignore it.
 //!
 //! Each write reuses the atomic [`crate::store::upsert`]/[`crate::store::delete`]
 //! path, so the body and every secondary index move together in one WAL record.
@@ -30,6 +31,8 @@ enum UpdateOp {
     Unset(String),
     Inc(String, f64),
     Push(String, Value),
+    /// Insert-only; applied by [`UpdateDoc::apply_on_insert`], skipped by [`UpdateDoc::apply`].
+    SetOnInsert(String, Value),
 }
 
 impl UpdateDoc {
@@ -65,7 +68,7 @@ impl UpdateDoc {
         UpdateDoc::parse(&v)
     }
 
-    /// Apply all operators to `doc` in order.
+    /// Apply operators that run on an existing document. `$setOnInsert` is skipped.
     pub fn apply(&self, doc: &mut Value) -> DocResult<()> {
         if !doc.is_object() {
             return Err(DocError::BadUpdate(
@@ -73,6 +76,31 @@ impl UpdateDoc {
             ));
         }
         for op in &self.ops {
+            if matches!(op, UpdateOp::SetOnInsert(_, _)) {
+                continue;
+            }
+            op.apply(doc)?;
+        }
+        Ok(())
+    }
+
+    /// Apply operators for an upsert insert: `$setOnInsert` first, then regular
+    /// ops so `$set`/`$inc`/`$unset`/`$push` win on path conflicts.
+    pub fn apply_on_insert(&self, doc: &mut Value) -> DocResult<()> {
+        if !doc.is_object() {
+            return Err(DocError::BadUpdate(
+                "target document is not an object".into(),
+            ));
+        }
+        for op in &self.ops {
+            if let UpdateOp::SetOnInsert(path, v) = op {
+                set_path(doc, path, v.clone())?;
+            }
+        }
+        for op in &self.ops {
+            if matches!(op, UpdateOp::SetOnInsert(_, _)) {
+                continue;
+            }
             op.apply(doc)?;
         }
         Ok(())
@@ -90,6 +118,7 @@ fn parse_op(op: &str, path: &str, operand: &Value) -> DocResult<UpdateOp> {
             UpdateOp::Inc(path.to_string(), n)
         }
         "$push" => UpdateOp::Push(path.to_string(), operand.clone()),
+        "$setOnInsert" => UpdateOp::SetOnInsert(path.to_string(), operand.clone()),
         other => {
             return Err(DocError::BadUpdate(format!(
                 "unsupported update operator '{other}'"
@@ -101,7 +130,9 @@ fn parse_op(op: &str, path: &str, operand: &Value) -> DocResult<UpdateOp> {
 impl UpdateOp {
     fn apply(&self, doc: &mut Value) -> DocResult<()> {
         match self {
-            UpdateOp::Set(path, v) => set_path(doc, path, v.clone()),
+            UpdateOp::Set(path, v) | UpdateOp::SetOnInsert(path, v) => {
+                set_path(doc, path, v.clone())
+            }
             UpdateOp::Unset(path) => {
                 unset_path(doc, path);
                 Ok(())
@@ -285,7 +316,8 @@ pub fn apply_to_ids(
 }
 
 /// Build the document that an upsert would insert: equality fields from `filter`
-/// as the base, then apply `update`. Returns `(doc_id_bytes, zdoc_body)`.
+/// as the base, then apply `update` via [`UpdateDoc::apply_on_insert`] (so
+/// `$setOnInsert` runs). Returns `(doc_id_bytes, zdoc_body)`.
 ///
 /// The filter must be equality-extractable (top-level `Atom::Eq` only). `_id`
 /// must be a string equality when present; otherwise a UUIDv7-style hex id is
@@ -299,7 +331,7 @@ pub fn materialize_upsert(filter: &Filter, update: &UpdateDoc) -> DocResult<(Vec
             Value::String(id.clone()),
         );
     }
-    update.apply(&mut base)?;
+    update.apply_on_insert(&mut base)?;
     let body = crate::binary::ZDocBuilder::from_value(&base);
     Ok((id.into_bytes(), body))
 }
@@ -476,5 +508,45 @@ mod tests {
         assert_eq!(v["_id"], json!("x"));
         assert_eq!(v["email"], json!("a@b.c"));
         assert_eq!(v["n"], json!(1));
+    }
+
+    #[test]
+    fn set_on_insert_applies_on_materialize() {
+        let f = Filter::parse(&json!({"_id": "x", "email": "a@b.c"})).unwrap();
+        let u = UpdateDoc::parse(&json!({
+            "$set": {"n": 1},
+            "$setOnInsert": {"created": true, "n": 99}
+        }))
+        .unwrap();
+        let (_, body) = materialize_upsert(&f, &u).unwrap();
+        let v = crate::binary::ValueView::new(&body).to_value();
+        assert_eq!(v["created"], json!(true));
+        // Regular $set wins over $setOnInsert on the same path.
+        assert_eq!(v["n"], json!(1));
+    }
+
+    #[test]
+    fn set_on_insert_ignored_on_normal_apply() {
+        let mut doc = json!({"_id": "x", "n": 1});
+        let u = UpdateDoc::parse(&json!({
+            "$set": {"n": 2},
+            "$setOnInsert": {"created": true}
+        }))
+        .unwrap();
+        u.apply(&mut doc).unwrap();
+        assert_eq!(doc["n"], json!(2));
+        assert!(doc.get("created").is_none());
+    }
+
+    #[test]
+    fn set_on_insert_only_is_valid() {
+        let u = UpdateDoc::parse(&json!({"$setOnInsert": {"created": true}})).unwrap();
+        let mut doc = json!({"_id": "x"});
+        u.apply(&mut doc).unwrap();
+        assert!(doc.get("created").is_none());
+        let f = Filter::parse(&json!({"_id": "x"})).unwrap();
+        let (_, body) = materialize_upsert(&f, &u).unwrap();
+        let v = crate::binary::ValueView::new(&body).to_value();
+        assert_eq!(v["created"], json!(true));
     }
 }

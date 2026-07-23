@@ -23,6 +23,8 @@ Binary: `crates/zydecodb-engine/src/bin/tenant-isolation-soak.rs`.
 - **Steady:** V solo → V|N fair=off → V|N fair=on. Ship gate: fair-on e2e put p99 δ ≤ 50 ms, success ≥ 85%.
 - **Ramp-up:** N floods while V is idle, then V bursts to reclaim ~one fair share of the write buffer. Gate: fair-on reclaim p99 δ ≤ 350 ms (paper-like buffer δ). This is the honest hard case — do not confuse it with steady ship.
 
+CI: `.github/workflows/tenant-isolation-soak.yml` runs `MODE=both` on a nightly schedule and `workflow_dispatch` (not every PR). Fast PR coverage for TOML→engine enablement remains `crates/zydecodb/tests/fair_pods_config.rs`.
+
 ## Quick commands
 
 ```bash

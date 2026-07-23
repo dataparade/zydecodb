@@ -477,6 +477,36 @@ fn filter_upsert_inserts_or_updates() {
     assert!(res["upserted_id"].as_str().is_some());
     assert_eq!(count(&mut s, "accounts", r#"{"tag":"solo"}"#), 1);
 
+    // $setOnInsert applies on miss; ignored on hit.
+    let res = update_opts(
+        &mut s,
+        "accounts",
+        r#"{"email":"soi@example.com"}"#,
+        r#"{"$set":{"email":"soi@example.com","n":1},"$setOnInsert":{"created":true}}"#,
+        false,
+        true,
+    );
+    assert_eq!(res["matched"], serde_json::json!(0));
+    let docs = find(&mut s, "accounts", r#"{"email":"soi@example.com"}"#);
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["created"], serde_json::json!(true));
+    assert_eq!(docs[0]["n"], serde_json::json!(1));
+
+    let res = update_opts(
+        &mut s,
+        "accounts",
+        r#"{"email":"soi@example.com"}"#,
+        r#"{"$set":{"n":2},"$setOnInsert":{"created":false,"extra":1}}"#,
+        false,
+        true,
+    );
+    assert_eq!(res["matched"], serde_json::json!(1));
+    assert_eq!(res["modified"], serde_json::json!(1));
+    let docs = find(&mut s, "accounts", r#"{"email":"soi@example.com"}"#);
+    assert_eq!(docs[0]["n"], serde_json::json!(2));
+    assert_eq!(docs[0]["created"], serde_json::json!(true)); // unchanged
+    assert!(docs[0].get("extra").is_none());
+
     drop(s);
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();
