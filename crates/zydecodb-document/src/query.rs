@@ -12,7 +12,7 @@
 //! observe writes newer than the first page (see `snapshot_at` for the exact
 //! retention guarantee).
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, CollectionMeta};
 use crate::error::{DocError, DocResult};
 use crate::filter::Filter;
 use crate::planner::{self, AccessPath};
@@ -308,12 +308,69 @@ fn parse_doc(stored: &[u8], doc_id: &[u8]) -> Option<serde_json::Value> {
 }
 
 fn make_row(doc_id: Vec<u8>, body: &Value, proj: &Option<Projection>) -> DocResult<QueryRow> {
-    let shaped = apply_projection(body, proj);
-    let bytes = serde_json::to_vec(&shaped).map_err(|e| DocError::InvalidJson(e.to_string()))?;
+    // No projection: serialize in place — avoid apply_projection's full clone.
+    let bytes = if proj.is_none() {
+        serde_json::to_vec(body).map_err(|e| DocError::InvalidJson(e.to_string()))?
+    } else {
+        let shaped = apply_projection(body, proj);
+        serde_json::to_vec(&shaped).map_err(|e| DocError::InvalidJson(e.to_string()))?
+    };
     Ok(QueryRow {
         doc_id,
         body: Some(bytes),
     })
+}
+
+/// Build a result row from a stored body. No-projection path returns raw JSON
+/// bytes when `_id` is already present (skips Value rebuild + re-serialize).
+fn row_from_stored(
+    doc_id: Vec<u8>,
+    stored: &[u8],
+    proj: &Option<Projection>,
+) -> DocResult<Option<QueryRow>> {
+    if proj.is_none() && !stored.is_empty() && stored[0] == crate::store::VK_RAW {
+        let payload = crate::store::strip_value_kind(stored);
+        // Cheap check: if the raw JSON already has `"_id"`, return the bytes.
+        if raw_json_has_id(payload) {
+            return Ok(Some(QueryRow {
+                doc_id,
+                body: Some(payload.to_vec()),
+            }));
+        }
+    }
+    match parse_doc(stored, &doc_id) {
+        Some(v) => Ok(Some(make_row(doc_id, &v, proj)?)),
+        None => Ok(None),
+    }
+}
+
+/// True when `payload` is a JSON object that already contains an `_id` key.
+/// Uses a light scan rather than a full DOM build when possible; falls back to
+/// `serde_json` for correctness on unusual whitespace/ordering.
+fn raw_json_has_id(payload: &[u8]) -> bool {
+    // Fast reject: must look like an object.
+    let trim = trim_ascii(payload);
+    if !trim.starts_with(b"{") {
+        return false;
+    }
+    // Common driver shape: `{"_id":...` or `{ "_id": ...`.
+    if let Ok(v) = serde_json::from_slice::<Value>(payload) {
+        matches!(v, Value::Object(m) if m.contains_key(crate::planner::ID_FIELD))
+    } else {
+        false
+    }
+}
+
+fn trim_ascii(s: &[u8]) -> &[u8] {
+    let mut a = 0;
+    let mut b = s.len();
+    while a < b && s[a].is_ascii_whitespace() {
+        a += 1;
+    }
+    while b > a && s[b - 1].is_ascii_whitespace() {
+        b -= 1;
+    }
+    &s[a..b]
 }
 
 /// Execute a filtered find. The planner narrows candidates; the FULL filter is
@@ -330,6 +387,18 @@ pub fn execute_find(
     let coll = catalog
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
+    execute_find_coll(snap, prefix, coll, spec, max_sort_buffer)
+}
+
+/// Like [`execute_find`], but takes an already-resolved [`CollectionMeta`] so
+/// callers can drop the catalog read lock before a long scan.
+pub fn execute_find_coll(
+    snap: &SnapshotHandle,
+    prefix: &[u8],
+    coll: &CollectionMeta,
+    spec: &FindSpec,
+    max_sort_buffer: usize,
+) -> DocResult<QueryPage> {
     let path = planner::plan(&spec.filter, prefix, coll);
     let doc_prefix = keys::doc_prefix(prefix, coll.id);
     let limit = spec.limit.max(1);
@@ -341,8 +410,8 @@ pub fn execute_find(
             if let Some(stored) = snap.get(&dk)? {
                 if check_filter(&stored, &spec.filter, id) {
                     if spec.skip == 0 {
-                        if let Some(v) = parse_doc(&stored, id) {
-                            rows.push(make_row(id.clone(), &v, &spec.projection)?);
+                        if let Some(row) = row_from_stored(id.clone(), &stored, &spec.projection)? {
+                            rows.push(row);
                         }
                     }
                 }
@@ -403,8 +472,8 @@ fn key_mode_page(
                     next_cursor = last_match_key.map(|k| encode_key_cursor(snap.seq_upper(), &k));
                     break;
                 }
-                if let Some(v) = parse_doc(&stored, &doc_id) {
-                    rows.push(make_row(doc_id, &v, &spec.projection)?);
+                if let Some(row) = row_from_stored(doc_id, &stored, &spec.projection)? {
+                    rows.push(row);
                     last_match_key = Some(ikey);
                 }
             }
@@ -653,8 +722,8 @@ fn stream_offset_page(
                 has_more = true;
                 return Ok(false);
             }
-            if let Some(v) = parse_doc(stored, &doc_id) {
-                rows.push(make_row(doc_id, &v, &spec.projection)?);
+            if let Some(row) = row_from_stored(doc_id, stored, &spec.projection)? {
+                rows.push(row);
             }
             Ok(true)
         },
@@ -734,8 +803,8 @@ fn buffered_sort_page(
     let slice_start = offset.min(total);
     let mut rows = Vec::with_capacity(end - slice_start);
     for (doc_id, stored, _) in &all[slice_start..end] {
-        if let Some(v) = parse_doc(stored, doc_id) {
-            rows.push(make_row(doc_id.clone(), &v, &spec.projection)?);
+        if let Some(row) = row_from_stored(doc_id.clone(), stored, &spec.projection)? {
+            rows.push(row);
         }
     }
     let next_cursor = (end < total).then(|| encode_offset_cursor(snap.seq_upper(), end));

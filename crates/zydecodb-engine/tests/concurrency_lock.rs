@@ -109,7 +109,7 @@ fn snapshot_capture_proceeds_during_in_flight_fsync() {
 
     let start = Instant::now();
     let value = {
-        let snap = engine.write().snapshot_owned();
+        let snap = engine.read().snapshot_owned();
         snap.get(&uk(b"a")).unwrap()
     };
     let elapsed = start.elapsed();

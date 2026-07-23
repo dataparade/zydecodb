@@ -109,8 +109,8 @@ fn handle_request_inner(
                 Command::Get => handle_get(engine, req, session, security),
                 Command::Del => handle_del(engine, req, session, security),
                 Command::Stats => {
-                    // Brief lock: stats are in-memory counters, no disk I/O.
-                    let json = engine.write().stats().to_json();
+                    // Brief shared lock: stats are in-memory counters, no disk I/O.
+                    let json = engine.read().stats().to_json();
                     InnerOutcome {
                         response: ResponseEnvelope::ok(json),
                         session,
@@ -265,9 +265,9 @@ fn handle_get(
             }
             let key = storage_key(&session, &p.key, security.legacy_single_tenant);
             // Mirror the document read path: capture an owned snapshot under a
-            // brief lock, release the engine mutex, then read off the snapshot
+            // brief shared read lock, release it, then read off the snapshot
             // lock-free so a slow SSTable block read never serializes writers.
-            let snapshot = engine.write().snapshot_owned();
+            let snapshot = engine.read().snapshot_owned();
             match snapshot.get(&key) {
                 Ok(Some(value)) => InnerOutcome {
                     response: ResponseEnvelope::ok(value),

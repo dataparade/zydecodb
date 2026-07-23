@@ -43,9 +43,14 @@ impl Engine {
 
         // Policy gate: reject before any WAL/memtable mutation. The policy is
         // cloned out so it can borrow `self` mutably (read/write the system
-        // keyspace) without aliasing the field.
-        let existing_value_len = self.get(&key)?.map(|v| v.len());
+        // keyspace) without aliasing the field. Skip the full LSM get when the
+        // policy does not need existing lengths (noop / non-quota).
         let policy = Arc::clone(&self.policy);
+        let existing_value_len = if policy.needs_existing_len() {
+            self.get(&key)?.map(|v| v.len())
+        } else {
+            None
+        };
         policy.pre_write(self, &key, value.len(), existing_value_len, false)?;
 
         // FairDB memtable admit (reserved + global pools). No WAL reservation.
@@ -101,6 +106,9 @@ impl Engine {
         keys::validate_user_key(&key)?;
         self.check_backpressure_for_key(&key)?;
 
+        // Del always point-gets: the wire response reports whether the key
+        // existed, and quota policies need the freed length. (Unlike put, there
+        // is no "skip get" win without changing the Del response contract.)
         let existing_value_len = self.get(&key)?.map(|v| v.len());
         let existed = existing_value_len.is_some();
 
@@ -176,11 +184,17 @@ impl Engine {
 
         // Policy gate: consult the policy for every op BEFORE any mutation. Any
         // rejection aborts the whole batch with nothing persisted. Existing
-        // value lengths are captured here for the matching post_write calls.
+        // value lengths are captured here for the matching post_write calls —
+        // skipped entirely when the policy does not need them.
         let policy = Arc::clone(&self.policy);
+        let need_len = policy.needs_existing_len();
         let mut existing_lens: Vec<Option<usize>> = Vec::with_capacity(ops.len());
         for op in &ops {
-            let existing = self.get(op.key())?.map(|v| v.len());
+            let existing = if need_len {
+                self.get(op.key())?.map(|v| v.len())
+            } else {
+                None
+            };
             existing_lens.push(existing);
             policy.pre_write(self, op.key(), op.value_len(), existing, op.is_delete())?;
         }

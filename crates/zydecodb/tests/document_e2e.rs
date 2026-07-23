@@ -220,6 +220,7 @@ fn docput_query_by_id_and_index_range_with_pagination() {
                 hi: Vec::new(),
                 cursor: cursor.clone(),
                 limit: 2,
+                include_bodies: true,
             },
         );
         assert_eq!(resp.status, Status::Ok);
@@ -252,6 +253,7 @@ fn docput_query_by_id_and_index_range_with_pagination() {
             hi: b"[36]".to_vec(),
             cursor: Vec::new(),
             limit: 10,
+            include_bodies: true,
         },
     );
     let (rows, _) = wire::decode_query_page(&resp.payload).unwrap();
@@ -300,6 +302,7 @@ fn docput_implicitly_creates_collection() {
             hi: Vec::new(),
             cursor: Vec::new(),
             limit: 10,
+            include_bodies: true,
         },
     );
     assert_eq!(resp.status, Status::Ok);
@@ -645,6 +648,7 @@ fn concurrent_connection_progresses_during_queries() {
                     hi: Vec::new(),
                     cursor: Vec::new(),
                     limit: 100,
+                    include_bodies: true,
                 },
             );
             assert_eq!(resp.status, Status::Ok);

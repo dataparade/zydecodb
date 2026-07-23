@@ -38,6 +38,22 @@ fn index_keys_for(
         .collect()
 }
 
+/// Like [`index_keys_for`] but walks a ZDoc [`ValueView`] — no full JSON tree.
+fn index_keys_for_view(
+    coll: &CollectionMeta,
+    prefix: &[u8],
+    doc_id: &[u8],
+    view: &crate::binary::ValueView<'_>,
+) -> Vec<Vec<u8>> {
+    coll.indexes
+        .iter()
+        .map(|idx| {
+            let enc = encoding::encode_fields_from_view(view, &idx.fields);
+            keys::index_key(prefix, coll.id, idx.id, &enc, doc_id)
+        })
+        .collect()
+}
+
 /// Drop the leading `value_kind` byte, yielding the raw body payload.
 pub fn strip_value_kind(stored: &[u8]) -> &[u8] {
     stored.get(1..).unwrap_or(&[])
@@ -60,24 +76,19 @@ pub fn stored_to_json_vec(stored: &[u8]) -> Vec<u8> {
 /// Reject a write that would place two different documents at the same value of
 /// a unique index. The server holds the engine mutex across the whole write, so
 /// this check-then-write is race-free against other writers (no TOCTOU).
-fn enforce_unique(
+fn enforce_unique_enc(
     engine: &mut Engine,
     coll: &CollectionMeta,
     prefix: &[u8],
     doc_id: &[u8],
-    new_doc: &Value,
+    encoded_fields: impl Fn(&IndexMeta) -> Vec<u8>,
 ) -> DocResult<()> {
     if !coll.indexes.iter().any(|i| i.unique) {
         return Ok(());
     }
     let snap = engine.snapshot_owned();
     for idx in coll.indexes.iter().filter(|i| i.unique) {
-        let vals: Vec<Value> = idx
-            .fields
-            .iter()
-            .map(|f| encoding::extract_path(new_doc, f))
-            .collect();
-        let enc = encoding::encode_fields(&vals);
+        let enc = encoded_fields(idx);
         // Range covering every index entry whose encoded fields equal `enc`. The
         // order-preserving field encoding is prefix-free, so only `doc_id`
         // suffixes follow `enc` inside this range.
@@ -98,10 +109,44 @@ fn enforce_unique(
     Ok(())
 }
 
+fn enforce_unique(
+    engine: &mut Engine,
+    coll: &CollectionMeta,
+    prefix: &[u8],
+    doc_id: &[u8],
+    new_doc: &Value,
+) -> DocResult<()> {
+    enforce_unique_enc(engine, coll, prefix, doc_id, |idx| {
+        let vals: Vec<Value> = idx
+            .fields
+            .iter()
+            .map(|f| encoding::extract_path(new_doc, f))
+            .collect();
+        encoding::encode_fields(&vals)
+    })
+}
+
+fn enforce_unique_view(
+    engine: &mut Engine,
+    coll: &CollectionMeta,
+    prefix: &[u8],
+    doc_id: &[u8],
+    view: &crate::binary::ValueView<'_>,
+) -> DocResult<()> {
+    enforce_unique_enc(engine, coll, prefix, doc_id, |idx| {
+        encoding::encode_fields_from_view(view, &idx.fields)
+    })
+}
+
 /// Build (but do not write) the batch that upserts `json` for `doc_id`: the body
 /// put plus the index-key diff against the prior version. Enforces unique-index
 /// constraints against the committed state. Returned ops never exceed
 /// `MAX_BATCH_KEYS`.
+///
+/// `old_doc`, when `Some`, is the already-decoded prior body — callers that have
+/// just read it (e.g. Update) pass it so this path skips a second LSM get +
+/// decode. `None` means look up the prior body from the engine (DocPut /
+/// replace / insert).
 pub fn upsert_ops(
     engine: &mut Engine,
     catalog: &Catalog,
@@ -112,55 +157,71 @@ pub fn upsert_ops(
     is_zdoc: bool,
     expires_at: u64,
 ) -> DocResult<Vec<BatchOp>> {
+    upsert_ops_with_old(
+        engine, catalog, prefix, collection, doc_id, payload, is_zdoc, expires_at, None,
+    )
+}
+
+/// Like [`upsert_ops`], with an optional pre-loaded prior document.
+pub fn upsert_ops_with_old(
+    engine: &mut Engine,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+    payload: &[u8],
+    is_zdoc: bool,
+    expires_at: u64,
+    old_doc: Option<&Value>,
+) -> DocResult<Vec<BatchOp>> {
     let coll = catalog
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
-    let new_doc: Value = if is_zdoc {
-        crate::binary::ValueView::new(payload).to_value()
-    } else {
-        serde_json::from_slice(payload).map_err(|e| DocError::InvalidJson(e.to_string()))?
-    };
-
-    // Reject unique-index violations before mutating anything.
-    enforce_unique(engine, coll, prefix, doc_id, &new_doc)?;
-
-    // TTL index derives body expiry from the date field; otherwise use the
-    // caller-supplied absolute expires_at (DocPut trailer).
-    let expires_at = if let Some(ttl) = coll.ttl_index() {
-        derive_ttl_expires_at(&new_doc, ttl)
-    } else {
-        expires_at
-    };
 
     let doc_key = keys::doc_key(prefix, coll.id, doc_id);
 
-    // Old index footprint (empty for an insert; best-effort if the old body is
-    // unparseable, in which case its index entries are simply not cleaned up).
-    let old_keys: BTreeSet<Vec<u8>> = match engine.get(&doc_key)? {
-        Some(stored) => {
-            if stored.is_empty() {
-                BTreeSet::new()
-            } else {
-                let old_kind = stored[0];
-                let old_payload = &stored[1..];
-                let old_val = if old_kind == VK_ZDOC {
-                    Some(crate::binary::ValueView::new(old_payload).to_value())
-                } else {
-                    serde_json::from_slice::<Value>(old_payload).ok()
-                };
-                match old_val {
-                    Some(old) => index_keys_for(coll, prefix, doc_id, &old)
-                        .into_iter()
-                        .collect(),
-                    None => BTreeSet::new(),
-                }
-            }
-        }
-        None => BTreeSet::new(),
+    // ZDoc path: index/TTL/unique use ValueView path extraction — never build a
+    // full serde_json tree for the new body under the engine lock.
+    let (expires_at, old_keys, new_keys) = if is_zdoc {
+        let view = crate::binary::ValueView::new(payload);
+        enforce_unique_view(engine, coll, prefix, doc_id, &view)?;
+        let expires_at = if let Some(ttl) = coll.ttl_index() {
+            derive_ttl_expires_at_view(&view, ttl)
+        } else {
+            expires_at
+        };
+        let old_keys: BTreeSet<Vec<u8>> = if let Some(old) = old_doc {
+            index_keys_for(coll, prefix, doc_id, old)
+                .into_iter()
+                .collect()
+        } else {
+            old_index_keys(engine, coll, prefix, doc_id, &doc_key)?
+        };
+        let new_keys: BTreeSet<Vec<u8>> = index_keys_for_view(coll, prefix, doc_id, &view)
+            .into_iter()
+            .collect();
+        (expires_at, old_keys, new_keys)
+    } else {
+        let new_doc: Value =
+            serde_json::from_slice(payload).map_err(|e| DocError::InvalidJson(e.to_string()))?;
+        enforce_unique(engine, coll, prefix, doc_id, &new_doc)?;
+        let expires_at = if let Some(ttl) = coll.ttl_index() {
+            derive_ttl_expires_at(&new_doc, ttl)
+        } else {
+            expires_at
+        };
+        let old_keys: BTreeSet<Vec<u8>> = if let Some(old) = old_doc {
+            index_keys_for(coll, prefix, doc_id, old)
+                .into_iter()
+                .collect()
+        } else {
+            old_index_keys(engine, coll, prefix, doc_id, &doc_key)?
+        };
+        let new_keys: BTreeSet<Vec<u8>> = index_keys_for(coll, prefix, doc_id, &new_doc)
+            .into_iter()
+            .collect();
+        (expires_at, old_keys, new_keys)
     };
-    let new_keys: BTreeSet<Vec<u8>> = index_keys_for(coll, prefix, doc_id, &new_doc)
-        .into_iter()
-        .collect();
 
     let mut ops: Vec<BatchOp> = Vec::with_capacity(1 + old_keys.len() + new_keys.len());
     let mut value = Vec::with_capacity(1 + payload.len());
@@ -190,6 +251,37 @@ pub fn upsert_ops(
         return Err(DocError::BatchTooLarge(ops.len()));
     }
     Ok(ops)
+}
+
+/// Prior index footprint for `doc_id`. ZDoc bodies use view extraction (no
+/// full-tree materialization); JSON bodies decode as usual.
+fn old_index_keys(
+    engine: &mut Engine,
+    coll: &CollectionMeta,
+    prefix: &[u8],
+    doc_id: &[u8],
+    doc_key: &[u8],
+) -> DocResult<BTreeSet<Vec<u8>>> {
+    Ok(match engine.get(doc_key)? {
+        Some(stored) if !stored.is_empty() => {
+            let old_kind = stored[0];
+            let old_payload = &stored[1..];
+            if old_kind == VK_ZDOC {
+                let view = crate::binary::ValueView::new(old_payload);
+                index_keys_for_view(coll, prefix, doc_id, &view)
+                    .into_iter()
+                    .collect()
+            } else {
+                match serde_json::from_slice::<Value>(old_payload) {
+                    Ok(old) => index_keys_for(coll, prefix, doc_id, &old)
+                        .into_iter()
+                        .collect(),
+                    Err(_) => BTreeSet::new(),
+                }
+            }
+        }
+        _ => BTreeSet::new(),
+    })
 }
 
 /// Insert or replace a document (no TTL). See [`upsert_with_expiry`].
@@ -410,6 +502,30 @@ pub fn derive_ttl_expires_at(doc: &Value, idx: &crate::catalog::IndexMeta) -> u6
     }
 }
 
+/// Like [`derive_ttl_expires_at`] for a ZDoc [`ValueView`].
+pub fn derive_ttl_expires_at_view(
+    view: &crate::binary::ValueView<'_>,
+    idx: &crate::catalog::IndexMeta,
+) -> u64 {
+    let Some(secs) = idx.expire_after_seconds else {
+        return 0;
+    };
+    let Some(field) = idx.fields.first() else {
+        return 0;
+    };
+    let Some(v) = view.get_path(field) else {
+        return 0;
+    };
+    let field_ms = v
+        .as_f64()
+        .map(|f| f as u64)
+        .or_else(|| v.as_i64().map(|i| i as u64));
+    match field_ms {
+        Some(ms) => ms.saturating_add(secs.saturating_mul(1000)),
+        None => 0,
+    }
+}
+
 /// Scan every existing document in a collection and write the new index's
 /// entries in chunks that respect `MAX_BATCH_KEYS`.
 fn backfill_index(
@@ -431,22 +547,28 @@ fn backfill_index(
     for item in rows.by_ref() {
         let (doc_key, stored) = item?;
         let doc_id = keys::doc_id_from_doc_key(prefix_len, &doc_key);
-        let doc: Value = if stored[0] == VK_ZDOC {
-            crate::binary::ValueView::new(strip_value_kind(&stored)).to_value()
+        let (enc, expires_at) = if stored[0] == VK_ZDOC {
+            let view = crate::binary::ValueView::new(strip_value_kind(&stored));
+            (
+                encoding::encode_fields_from_view(&view, &idx.fields),
+                derive_ttl_expires_at_view(&view, idx),
+            )
         } else {
-            match serde_json::from_slice(strip_value_kind(&stored)) {
+            let doc: Value = match serde_json::from_slice(strip_value_kind(&stored)) {
                 Ok(d) => d,
                 Err(_) => continue, // skip unparseable bodies
-            }
+            };
+            let vals: Vec<Value> = idx
+                .fields
+                .iter()
+                .map(|f| encoding::extract_path(&doc, f))
+                .collect();
+            (
+                encoding::encode_fields(&vals),
+                derive_ttl_expires_at(&doc, idx),
+            )
         };
-        let vals: Vec<Value> = idx
-            .fields
-            .iter()
-            .map(|f| encoding::extract_path(&doc, f))
-            .collect();
-        let enc = encoding::encode_fields(&vals);
         let ikey = keys::index_key(prefix, collection_id, idx.id, &enc, &doc_id);
-        let expires_at = derive_ttl_expires_at(&doc, idx);
         pending.push(BatchOp::Put {
             key: ikey,
             value: doc_id.clone(),

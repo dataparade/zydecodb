@@ -44,6 +44,11 @@ impl TenantQuotaPolicy {
 }
 
 impl WritePolicy for TenantQuotaPolicy {
+    fn needs_existing_len(&self) -> bool {
+        // Overwrites/deletes must credit the previous value's bytes.
+        true
+    }
+
     fn pre_write(
         &self,
         _engine: &mut Engine,

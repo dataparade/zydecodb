@@ -105,7 +105,7 @@ fn ensure_collection_exists(
 /// cursor, re-pin the same sequence ceiling the first page used (repeatable-read
 /// pagination) via `snapshot_at`; otherwise capture the latest committed state.
 fn read_snapshot(engine: &SharedEngine, cursor: Option<&[u8]>) -> zydecodb_engine::SnapshotHandle {
-    let guard = engine.write();
+    let guard = engine.read();
     match query::cursor_snapshot_seq(cursor) {
         Some(seq) => guard.snapshot_at(seq),
         None => guard.snapshot_owned(),
@@ -327,9 +327,9 @@ fn query_cmd(
     };
     match q {
         wire::QueryPayload::ById { collection, doc_id } => {
-            // Phase 1: capture a snapshot under the engine lock, then release.
+            // Phase 1: capture a snapshot under a shared read lock, then release.
             let snap = {
-                let guard = engine.write();
+                let guard = engine.read();
                 guard.snapshot_owned()
             };
             let cat = catalog.read().unwrap();
@@ -346,9 +346,10 @@ fn query_cmd(
             hi,
             cursor,
             limit,
+            include_bodies,
         } => {
             // Phase 1: resolve the scan spec (catalog only) and capture a
-            // snapshot (engine lock held only for snapshot_owned).
+            // snapshot (shared read lock held only for snapshot_owned).
             let spec = {
                 let cat = catalog.read().unwrap();
                 query::build_index_scan_spec(
@@ -360,7 +361,7 @@ fn query_cmd(
                     opt(&hi),
                     opt(&cursor),
                     limit as usize,
-                    true,
+                    include_bodies,
                 )
             };
             let spec = match spec {
@@ -402,8 +403,16 @@ fn find_cmd(
         cursor: opt(&p.cursor).map(|c| c.to_vec()),
     };
     let snap = read_snapshot(engine, spec.cursor.as_deref());
-    let cat = catalog.read().unwrap();
-    let page = query::execute_find(&snap, &cat, prefix, &p.collection, &spec, max_sort_buffer)?;
+    // Clone the small CollectionMeta under the catalog read lock so a long
+    // find scan does not block DDL for its entire duration.
+    let coll = {
+        let cat = catalog.read().unwrap();
+        cat.collection(prefix, &p.collection).cloned()
+    };
+    let Some(coll) = coll else {
+        return Err(DocError::CollectionNotFound(p.collection));
+    };
+    let page = query::execute_find_coll(&snap, prefix, &coll, &spec, max_sort_buffer)?;
     Ok(ResponseEnvelope::ok(wire::encode_query_page(&page)))
 }
 
@@ -533,7 +542,7 @@ fn select_candidates(
     max_sort_buffer: usize,
 ) -> DocResult<Vec<Vec<u8>>> {
     let snap = {
-        let guard = engine.write();
+        let guard = engine.read();
         guard.snapshot_owned()
     };
     let cat = catalog.read().unwrap();
@@ -557,7 +566,7 @@ fn count_cmd(
 ) -> DocResult<ResponseEnvelope> {
     let p = wire::CountPayload::decode(payload)?;
     let snap = {
-        let guard = engine.write();
+        let guard = engine.read();
         guard.snapshot_owned()
     };
     let cat = catalog.read().unwrap();

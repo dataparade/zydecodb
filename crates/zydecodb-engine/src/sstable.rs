@@ -334,7 +334,12 @@ pub fn parse_footer(file_tail: &[u8]) -> EngineResult<Footer> {
 /// path so existing tests don't need a tempdir to exercise the reader.
 enum Source {
     File {
+        /// Retained for diagnostics / error context; I/O uses `file`.
+        #[allow(dead_code)]
         path: PathBuf,
+        /// Kept open for the reader lifetime so block-cache misses are
+        /// `pread` only — not `open`+`pread`+`close` per miss.
+        file: Arc<File>,
         cache: Arc<BlockCache>,
         sstable_id: u64,
         /// On-disk format version; gates per-block CRC verification.
@@ -354,19 +359,18 @@ enum Source {
 
 /// A reader for a single SSTable.
 ///
-/// File-backed readers keep only a path and footer; index, bloom, and data
-/// blocks are charged to the shared [`BlockCache`] (RocksDB-style
+/// File-backed readers keep an open fd plus footer metadata; index, bloom, and
+/// data blocks are charged to the shared [`BlockCache`] (RocksDB-style
 /// `cache_index_and_filter_blocks`). In-memory readers (unit tests) pin
 /// decoded metadata locally.
 pub struct SstableReader {
     source: Source,
 }
 
-fn read_file_range(path: &Path, offset: u64, len: usize) -> EngineResult<Vec<u8>> {
+fn read_file_range(file: &File, offset: u64, len: usize) -> EngineResult<Vec<u8>> {
     use std::os::unix::fs::FileExt;
-    let f = File::open(path)?;
     let mut buf = vec![0u8; len];
-    f.read_exact_at(&mut buf, offset)?;
+    file.read_exact_at(&mut buf, offset)?;
     Ok(buf)
 }
 
@@ -405,7 +409,8 @@ impl SstableReader {
     }
 
     /// File-backed reader. Index and bloom are decoded once at open and pinned
-    /// on the reader; only data blocks use the shared block cache.
+    /// on the reader; only data blocks use the shared block cache. The file
+    /// descriptor stays open for subsequent `pread`s.
     pub fn open_from_path(
         path: &Path,
         sstable_id: u64,
@@ -425,7 +430,7 @@ impl SstableReader {
         if footer.index_offset + footer.index_length > file_len {
             return Err(EngineError::Io("sstable: index out of bounds".into()));
         }
-        let idx_buf = read_file_range(path, footer.index_offset, footer.index_length as usize)?;
+        let idx_buf = read_file_range(&f, footer.index_offset, footer.index_length as usize)?;
         let idx_body = verify_block_crc(footer.version, &idx_buf, "index")?;
         let index = Arc::new(decode_index(&idx_body)?);
 
@@ -433,8 +438,7 @@ impl SstableReader {
             if footer.bloom_offset + footer.bloom_length > file_len {
                 return Err(EngineError::Io("sstable: bloom out of bounds".into()));
             }
-            let bloom_buf =
-                read_file_range(path, footer.bloom_offset, footer.bloom_length as usize)?;
+            let bloom_buf = read_file_range(&f, footer.bloom_offset, footer.bloom_length as usize)?;
             let bloom_body = verify_block_crc(footer.version, &bloom_buf, "bloom")?;
             BloomFilter::decode(&bloom_body).map(Arc::new)
         } else {
@@ -444,6 +448,7 @@ impl SstableReader {
         Ok(SstableReader {
             source: Source::File {
                 path: path.to_path_buf(),
+                file: Arc::new(f),
                 cache,
                 sstable_id,
                 version: footer.version,
@@ -506,7 +511,7 @@ impl SstableReader {
                 Ok(BlockBytes::Borrowed(body))
             }
             Source::File {
-                path,
+                file,
                 cache,
                 sstable_id,
                 version,
@@ -523,9 +528,8 @@ impl SstableReader {
                 // Compaction uses populate_cache=false (RocksDB fill_cache=false):
                 // read directly without touching user-facing cache stats.
                 use std::os::unix::fs::FileExt;
-                let f = File::open(path)?;
                 let mut buf = vec![0u8; idx.length as usize];
-                f.read_exact_at(&mut buf, idx.offset)?;
+                file.read_exact_at(&mut buf, idx.offset)?;
                 // Verify (and strip the CRC trailer) BEFORE caching so a
                 // corrupt block can never be served or persisted in the cache.
                 let body = verify_block_crc(*version, &buf, "data")?;

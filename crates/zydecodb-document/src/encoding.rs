@@ -11,6 +11,10 @@
 //! Cross-type order is fixed by the leading tag byte: null < bool < number <
 //! string. This is an arbitrary-but-stable total order for mixed-type indexes.
 
+use crate::binary::{
+    ValueView, TYPE_ARRAY, TYPE_BOOL_FALSE, TYPE_BOOL_TRUE, TYPE_F64, TYPE_I64, TYPE_NULL,
+    TYPE_OBJECT, TYPE_STRING,
+};
 use serde_json::Value;
 
 const TAG_NULL: u8 = 0x00;
@@ -44,6 +48,46 @@ pub fn encode_fields(values: &[Value]) -> Vec<u8> {
     let mut out = Vec::new();
     for v in values {
         encode_value(v, &mut out);
+    }
+    out
+}
+
+/// Encode one ZDoc scalar into `out` without materializing a `serde_json::Value`.
+/// Missing paths (caller passes `None`) and non-scalars sort as null.
+pub fn encode_view(v: Option<&ValueView<'_>>, out: &mut Vec<u8>) {
+    let Some(view) = v else {
+        out.push(TAG_NULL);
+        return;
+    };
+    match view.type_byte() {
+        TYPE_NULL => out.push(TAG_NULL),
+        TYPE_BOOL_FALSE => {
+            out.push(TAG_BOOL);
+            out.push(0);
+        }
+        TYPE_BOOL_TRUE => {
+            out.push(TAG_BOOL);
+            out.push(1);
+        }
+        TYPE_I64 | TYPE_F64 => {
+            out.push(TAG_NUM);
+            let f = view.as_f64().unwrap_or(0.0);
+            out.extend_from_slice(&encode_f64_total_order(f));
+        }
+        TYPE_STRING => {
+            out.push(TAG_STR);
+            encode_str(view.as_str().unwrap_or(""), out);
+        }
+        TYPE_ARRAY | TYPE_OBJECT => out.push(TAG_NULL),
+        _ => out.push(TAG_NULL),
+    }
+}
+
+/// Encode dotted paths from a ZDoc root into one composite key fragment.
+pub fn encode_fields_from_view(root: &ValueView<'_>, fields: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in fields {
+        encode_view(root.get_path(f).as_ref(), &mut out);
     }
     out
 }

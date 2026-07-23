@@ -30,10 +30,19 @@ use crate::errors::EngineResult;
 /// `Send + Sync` so the policy can be held in an `Arc` shared across the
 /// executor alongside the engine handle.
 pub trait WritePolicy: Send + Sync {
+    /// When `true`, the engine performs a full LSM point-get before each write
+    /// so `existing_value_len` is accurate. Default `false` (noop policies and
+    /// single-tenant embeds skip the get). Quota policies that credit freed
+    /// bytes on overwrite/delete must return `true`.
+    fn needs_existing_len(&self) -> bool {
+        false
+    }
+
     /// Called before a user PUT/DEL is persisted. `key` is the fully composed
     /// stored key. `value_len` is the new value length (0 for a delete).
     /// `existing_value_len` is `Some(len)` when the key already exists (an
-    /// overwrite/delete of a live key) or `None` for a brand-new key.
+    /// overwrite/delete of a live key) or `None` for a brand-new key — or
+    /// always `None` when [`WritePolicy::needs_existing_len`] is `false`.
     ///
     /// Return `Ok(())` to allow the write, or an error to reject it before any
     /// mutation. Conventionally [`crate::errors::EngineError::PolicyRejected`].

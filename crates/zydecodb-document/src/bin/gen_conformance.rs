@@ -224,6 +224,7 @@ fn payload_vectors() -> Vec<Value> {
         hi: b"[65]".to_vec(),
         cursor: vec![],
         limit: 50,
+        include_bodies: true,
     };
     v.push(req(
         "query_index_range_bounded",
@@ -239,6 +240,7 @@ fn payload_vectors() -> Vec<Value> {
         hi: vec![],
         cursor: vec![0xab, 0xcd],
         limit: 100,
+        include_bodies: true,
     };
     v.push(req(
         "query_index_range_unbounded_with_cursor",

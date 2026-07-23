@@ -232,6 +232,10 @@ pub enum QueryPayload {
         /// Opaque cursor from a prior page (empty = first page).
         cursor: Vec<u8>,
         limit: u32,
+        /// When `false`, return doc ids only (skip body point-gets). Encoded as
+        /// an optional trailing u8 (`0` = false, `1`/omitted = true) so older
+        /// clients keep receiving bodies.
+        include_bodies: bool,
     },
 }
 
@@ -251,6 +255,7 @@ impl QueryPayload {
                 hi,
                 cursor,
                 limit,
+                include_bodies,
             } => {
                 out.push(MODE_INDEX_RANGE);
                 put_lp(&mut out, collection.as_bytes());
@@ -259,6 +264,10 @@ impl QueryPayload {
                 put_lp(&mut out, lo);
                 put_lp(&mut out, hi);
                 put_lp(&mut out, cursor);
+                // Append-only trailer: omit when true so legacy vectors match.
+                if !*include_bodies {
+                    out.push(0);
+                }
             }
         }
         out
@@ -282,6 +291,11 @@ impl QueryPayload {
                 let lo = r.lp()?.to_vec();
                 let hi = r.lp()?.to_vec();
                 let cursor = r.lp()?.to_vec();
+                // Optional trailing u8: 0 = ids only; absent/nonzero = bodies.
+                let include_bodies = match r.remaining() {
+                    0 => true,
+                    _ => r.u8()? != 0,
+                };
                 Ok(QueryPayload::IndexRange {
                     collection,
                     index_name,
@@ -289,6 +303,7 @@ impl QueryPayload {
                     hi,
                     cursor,
                     limit,
+                    include_bodies,
                 })
             }
             m => Err(DocError::Protocol(format!("unknown query mode 0x{m:02x}"))),
@@ -648,8 +663,19 @@ mod tests {
             hi: b"[65]".to_vec(),
             cursor: vec![],
             limit: 50,
+            include_bodies: true,
         };
         assert_eq!(QueryPayload::decode(&p.encode()).unwrap(), p);
+        let ids_only = QueryPayload::IndexRange {
+            collection: "users".into(),
+            index_name: "by_age".into(),
+            lo: vec![],
+            hi: vec![],
+            cursor: vec![],
+            limit: 10,
+            include_bodies: false,
+        };
+        assert_eq!(QueryPayload::decode(&ids_only.encode()).unwrap(), ids_only);
 
         let by_id = QueryPayload::ById {
             collection: "users".into(),

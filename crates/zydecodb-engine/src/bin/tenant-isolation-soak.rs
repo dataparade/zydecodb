@@ -313,7 +313,7 @@ fn run_maintainer(handle: Arc<EngineHandle>, stop: Arc<AtomicBool>) {
 
 /// Point get: brief write lock for snapshot capture, then I/O off-lock.
 fn snapshot_get(handle: &EngineHandle, key: &[u8]) -> bool {
-    let snap = handle.write().snapshot_owned();
+    let snap = handle.read().snapshot_owned();
     snap.get(key).is_ok()
 }
 

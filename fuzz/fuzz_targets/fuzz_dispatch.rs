@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
 
         // Fuzz the document dispatch
         let catalog = {
-            let guard = ctx.engine.write();
+            let guard = ctx.engine.read();
             std::sync::Arc::new(std::sync::RwLock::new(
                 zydecodb_document::catalog::Catalog::load(&*guard).unwrap(),
             ))
