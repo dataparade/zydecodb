@@ -67,18 +67,24 @@ say "Installing ZydecoDB ${tag} (${target})"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# taiki-e/upload-rust-binary-action names checksums as
+#   zydecodb-${tag}-${target}.sha256
+# (not ${archive}.sha256 / *.tar.gz.sha256).
+checksum="zydecodb-${tag}-${target}.sha256"
+checksum_url="${DOWNLOAD_BASE}/${tag}/${checksum}"
+
 say "Downloading ${url}"
 curl -fSL --progress-bar -o "${tmp}/${archive}" "$url" \
     || fail "download failed — no ${target} build for ${tag}?"
-curl -fsSL -o "${tmp}/${archive}.sha256" "${url}.sha256" \
-    || fail "checksum sidecar missing for ${archive}"
+curl -fsSL -o "${tmp}/${checksum}" "$checksum_url" \
+    || fail "checksum sidecar missing for ${checksum}"
 
 (
     cd "$tmp"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -c "${archive}.sha256" >/dev/null
+        sha256sum -c "${checksum}" >/dev/null
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 -c "${archive}.sha256" >/dev/null
+        shasum -a 256 -c "${checksum}" >/dev/null
     else
         fail "neither sha256sum nor shasum found — cannot verify download"
     fi
