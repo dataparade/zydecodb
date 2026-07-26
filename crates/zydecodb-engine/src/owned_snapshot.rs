@@ -108,12 +108,18 @@ impl SnapshotHandle {
     }
 
     pub fn get(&self, key: &[u8]) -> EngineResult<Option<Vec<u8>>> {
+        Ok(self.get_with_seq(key)?.map(|(v, _)| v))
+    }
+
+    /// Point lookup returning `(value, seq)` of the visible entry. The seq is
+    /// the opaque document revision for optimistic concurrency.
+    pub fn get_with_seq(&self, key: &[u8]) -> EngineResult<Option<(Vec<u8>, u64)>> {
         let now = now_ms();
-        if let Some(v) = get_from_memtable(&self.active, key, self.seq_upper, now)? {
+        if let Some(v) = get_from_memtable_with_seq(&self.active, key, self.seq_upper, now)? {
             return Ok(Some(v));
         }
         for mt in self.immutables.iter().rev() {
-            if let Some(v) = get_from_memtable(mt, key, self.seq_upper, now)? {
+            if let Some(v) = get_from_memtable_with_seq(mt, key, self.seq_upper, now)? {
                 return Ok(Some(v));
             }
         }
@@ -127,7 +133,7 @@ impl SnapshotHandle {
             }
             if let Some((ik, entry)) = sst.get_latest(key)? {
                 if ik.seq <= self.seq_upper {
-                    return Ok(resolve(&entry, now));
+                    return Ok(resolve_with_seq(&ik, &entry, now));
                 }
             }
         }
@@ -199,15 +205,15 @@ impl<'a> Iterator for OwnedRangeIter<'a> {
     }
 }
 
-fn get_from_memtable(
+fn get_from_memtable_with_seq(
     mt: &Memtable,
     user_key: &[u8],
     seq_upper: u64,
     now: u64,
-) -> EngineResult<Option<Vec<u8>>> {
+) -> EngineResult<Option<(Vec<u8>, u64)>> {
     if seq_upper == u64::MAX {
-        if let Some((_ik, entry)) = mt.get_latest(user_key) {
-            return Ok(resolve(entry, now));
+        if let Some((ik, entry)) = mt.get_latest(user_key) {
+            return Ok(resolve_with_seq(ik, entry, now));
         }
         return Ok(None);
     }
@@ -221,17 +227,17 @@ fn get_from_memtable(
             return Ok(None);
         }
         if k.seq <= seq_upper {
-            return Ok(resolve(e, now));
+            return Ok(resolve_with_seq(k, e, now));
         }
     }
     Ok(None)
 }
 
-fn resolve(entry: &Entry, now: u64) -> Option<Vec<u8>> {
+fn resolve_with_seq(ik: &InternalKey, entry: &Entry, now: u64) -> Option<(Vec<u8>, u64)> {
     if entry.is_tombstone() || entry.is_expired(now) {
         return None;
     }
-    entry.value.clone()
+    entry.value.clone().map(|v| (v, ik.seq))
 }
 
 fn key_in_range(key: &[u8], meta: &SstableMeta) -> bool {

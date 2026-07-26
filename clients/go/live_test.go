@@ -264,3 +264,40 @@ func TestLiveUpsertSetOnInsert(t *testing.T) {
 		t.Fatalf("extra must not appear on hit: %#v", doc)
 	}
 }
+
+func TestLiveOptimisticConcurrency(t *testing.T) {
+	c := liveClient(t)
+	defer c.Close()
+	ctx := context.Background()
+	coll := c.Collection(uniqueCollection())
+
+	id, err := coll.InsertOne(ctx, Document{"n": 1.0}, false, 0)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	got, err := coll.GetWithRevision(ctx, id)
+	if err != nil || got.Doc == nil {
+		t.Fatalf("get with revision: %v %#v", err, got)
+	}
+	if got.Revision == 0 {
+		t.Fatal("expected non-zero revision")
+	}
+	newRev, err := coll.ReplaceOneIfMatch(ctx, id, Document{"n": 2.0}, false, got.Revision, 0)
+	if err != nil {
+		t.Fatalf("replace if match: %v", err)
+	}
+	if newRev <= got.Revision {
+		t.Fatalf("expected newer revision, got %d after %d", newRev, got.Revision)
+	}
+	_, err = coll.ReplaceOneIfMatch(ctx, id, Document{"n": 3.0}, false, got.Revision, 0)
+	if !IsConflict(err) {
+		t.Fatalf("expected conflict on stale replace, got %v", err)
+	}
+	after, err := coll.UpdateByIDIfMatch(ctx, id, Document{"$inc": Document{"n": 1.0}}, false, newRev)
+	if err != nil {
+		t.Fatalf("update if match: %v", err)
+	}
+	if after <= newRev {
+		t.Fatalf("expected newer revision after update, got %d", after)
+	}
+}

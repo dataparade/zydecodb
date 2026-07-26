@@ -160,3 +160,25 @@ test("upsert setOnInsert", { skip }, async () => {
     db.close();
   }
 });
+
+test("optimistic concurrency", { skip }, async () => {
+  const db = newClient();
+  const coll = db.collection(uniqueCollection());
+  try {
+    const id = await coll.insertOne({ n: 1 });
+    const got = await coll.getWithRevision(id);
+    assert.ok(got);
+    assert.equal(got!.doc.n, 1);
+    assert.ok(got!.revision > 0n);
+    const newRev = await coll.replaceOneIfMatch(id, { n: 2 }, got!.revision);
+    assert.ok(newRev > got!.revision);
+    await assert.rejects(
+      () => coll.replaceOneIfMatch(id, { n: 3 }, got!.revision),
+      ConflictError,
+    );
+    const after = await coll.updateByIdIfMatch(id, { $inc: { n: 1 } }, newRev);
+    assert.ok(after > newRev);
+  } finally {
+    db.close();
+  }
+});

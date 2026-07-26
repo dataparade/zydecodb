@@ -127,7 +127,13 @@ pub fn handle_document(
     }
     let is_write = matches!(
         req.command,
-        Command::DocPut | Command::DocDel | Command::IndexDef | Command::Update | Command::Delete
+        Command::DocPut
+            | Command::DocDel
+            | Command::IndexDef
+            | Command::Update
+            | Command::Delete
+            | Command::DocPutIfMatch
+            | Command::DocUpdateIfMatch
     );
     if is_write && session.role == Some(KeyRole::ReadOnly) {
         return ResponseEnvelope::error(Status::Forbidden, "read-only key");
@@ -167,6 +173,22 @@ pub fn handle_document(
             sort_cap,
         )),
         Command::Count => result(count_cmd(engine, catalog, &prefix, &req.payload)),
+        Command::DocGetRev => doc_get_rev(engine, catalog, &prefix, &req.payload),
+        Command::FindRev => result(find_rev_cmd(
+            engine,
+            catalog,
+            &prefix,
+            &req.payload,
+            sort_cap,
+        )),
+        Command::DocPutIfMatch => doc_put_if_match(engine, catalog, commit, &prefix, &req.payload),
+        Command::DocUpdateIfMatch => result(doc_update_if_match(
+            engine,
+            catalog,
+            commit,
+            &prefix,
+            &req.payload,
+        )),
         _ => ResponseEnvelope::error(Status::ProtocolError, "unimplemented"),
     }
 }
@@ -177,10 +199,12 @@ fn collection_for_acl(cmd: Command, payload: &[u8]) -> DocResult<String> {
         Command::DocPut => Ok(wire::DocPutPayload::decode(payload)?.collection),
         Command::DocDel => Ok(wire::DocDelPayload::decode(payload)?.collection),
         Command::IndexDef => Ok(wire::IndexDefPayload::decode(payload)?.collection),
-        Command::Find => Ok(wire::FindPayload::decode(payload)?.collection),
+        Command::Find | Command::FindRev => Ok(wire::FindPayload::decode(payload)?.collection),
         Command::Update => Ok(wire::UpdatePayload::decode(payload)?.collection),
         Command::Delete => Ok(wire::DeletePayload::decode(payload)?.collection),
-        Command::Query => match wire::QueryPayload::decode(payload)? {
+        Command::DocPutIfMatch => Ok(wire::DocPutIfMatchPayload::decode(payload)?.collection),
+        Command::DocUpdateIfMatch => Ok(wire::DocUpdateIfMatchPayload::decode(payload)?.collection),
+        Command::Query | Command::DocGetRev => match wire::QueryPayload::decode(payload)? {
             wire::QueryPayload::ById { collection, .. }
             | wire::QueryPayload::IndexRange { collection, .. } => Ok(collection),
         },
@@ -239,6 +263,130 @@ fn doc_put(
         }
         Err(e) => err_response(&e),
     }
+}
+
+fn doc_put_if_match(
+    engine: &SharedEngine,
+    catalog: &SharedCatalog,
+    commit: &CommitCoordinator,
+    prefix: &[u8],
+    payload: &[u8],
+) -> ResponseEnvelope {
+    let p = match wire::DocPutIfMatchPayload::decode(payload) {
+        Ok(p) => p,
+        Err(e) => return err_response(&e),
+    };
+    let json_val: serde_json::Value = match serde_json::from_slice(&p.body) {
+        Ok(v) => v,
+        Err(e) => return err_response(&DocError::InvalidJson(e.to_string())),
+    };
+    let zdoc_bytes = zydecodb_document::binary::ZDocBuilder::from_value(&json_val);
+
+    let outcome = with_catalog_engine_write(engine, catalog, |cat, guard| {
+        store::check_if_match(guard, cat, prefix, &p.collection, &p.doc_id, p.if_match)?;
+        store::upsert_with_expiry(
+            guard,
+            cat,
+            prefix,
+            &p.collection,
+            &p.doc_id,
+            &zdoc_bytes,
+            true,
+            p.expires_at,
+        )
+    });
+    match outcome {
+        Ok(seq) => {
+            commit.commit(seq, p.relaxed);
+            ResponseEnvelope::ok(seq.to_be_bytes().to_vec())
+        }
+        Err(e) => err_response(&e),
+    }
+}
+
+fn doc_update_if_match(
+    engine: &SharedEngine,
+    catalog: &SharedCatalog,
+    commit: &CommitCoordinator,
+    prefix: &[u8],
+    payload: &[u8],
+) -> DocResult<ResponseEnvelope> {
+    let p = wire::DocUpdateIfMatchPayload::decode(payload)?;
+    let upd = UpdateDoc::parse_bytes(&p.update)?;
+    let outcome = with_catalog_engine_write(engine, catalog, |cat, guard| {
+        update::apply_to_id_if_match(
+            guard,
+            cat,
+            prefix,
+            &p.collection,
+            &p.doc_id,
+            &upd,
+            p.if_match,
+        )
+    });
+    let seq = outcome?;
+    commit.commit(seq, p.relaxed);
+    Ok(ResponseEnvelope::ok(seq.to_be_bytes().to_vec()))
+}
+
+fn doc_get_rev(
+    engine: &SharedEngine,
+    catalog: &SharedCatalog,
+    prefix: &[u8],
+    payload: &[u8],
+) -> ResponseEnvelope {
+    let (collection, doc_id) = match wire::decode_doc_get_rev(payload) {
+        Ok(v) => v,
+        Err(e) => return err_response(&e),
+    };
+    let snap = {
+        let guard = engine.read();
+        guard.snapshot_owned()
+    };
+    let cat = catalog.read().unwrap();
+    match query::get_by_id_with_revision(&snap, &cat, prefix, &collection, &doc_id) {
+        Ok(Some((body, rev))) => {
+            ResponseEnvelope::ok(wire::encode_doc_get_rev_response(&body, rev))
+        }
+        Ok(None) => ResponseEnvelope::not_found(),
+        Err(e) => err_response(&e),
+    }
+}
+
+fn find_rev_cmd(
+    engine: &SharedEngine,
+    catalog: &SharedCatalog,
+    prefix: &[u8],
+    payload: &[u8],
+    max_sort_buffer: usize,
+) -> DocResult<ResponseEnvelope> {
+    let p = wire::FindPayload::decode(payload)?;
+    let projection = match p.projection {
+        wire::WireProjection::None => None,
+        wire::WireProjection::Include(f) => Some(Projection::Include(f)),
+        wire::WireProjection::Exclude(f) => Some(Projection::Exclude(f)),
+    };
+    let spec = FindSpec {
+        filter: Filter::parse_bytes(&p.filter)?,
+        sort: p.sort,
+        projection,
+        skip: p.skip as usize,
+        limit: (p.limit as usize).max(1),
+        cursor: opt(&p.cursor).map(|c| c.to_vec()),
+    };
+    let snap = read_snapshot(engine, spec.cursor.as_deref());
+    let coll = {
+        let cat = catalog.read().unwrap();
+        cat.collection(prefix, &p.collection).cloned()
+    };
+    let Some(coll) = coll else {
+        return Err(DocError::CollectionNotFound(p.collection));
+    };
+    let mut page = query::execute_find_coll(&snap, prefix, &coll, &spec, max_sort_buffer)?;
+    query::attach_revisions(&snap, prefix, &coll, &mut page)?;
+    Ok(ResponseEnvelope::ok(wire::encode_query_page_with_revision(
+        &page,
+    )))
 }
 
 fn doc_del(

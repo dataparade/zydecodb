@@ -8,7 +8,7 @@
 //! ```
 //!
 //! The engine owns the envelope byte layout and the command/status enumerations.
-//! Document opcodes (`0x20`–`0x26`, `0x30`) are interpreted by the server document
+//! Document opcodes (`0x20`–`0x2A`, `0x30`) are interpreted by the server document
 //! layer; session/admin opcodes (`0x40`–`0x42`) by the server security/admin path.
 //! Reserved slots (`Begin`/`Commit`/`Rollback`, `SchemaDef`) parse but reject with
 //! `ProtocolError` until a future minor line assigns semantics.
@@ -43,6 +43,14 @@ pub enum Command {
     Delete = 0x25,
     /// Filter-based count / distinct (document layer).
     Count = 0x26,
+    /// Point get by document id that returns the opaque revision.
+    DocGetRev = 0x27,
+    /// Filter find whose page rows each include an opaque revision.
+    FindRev = 0x28,
+    /// Conditional document replace (`ifMatch` revision required).
+    DocPutIfMatch = 0x29,
+    /// Conditional by-id partial update (`ifMatch` revision required).
+    DocUpdateIfMatch = 0x2A,
     IndexDef = 0x30,
     SchemaDef = 0x31,
     /// Reserved byte for caller-defined session establishment. The engine parses
@@ -77,6 +85,10 @@ impl Command {
             0x24 => Command::Update,
             0x25 => Command::Delete,
             0x26 => Command::Count,
+            0x27 => Command::DocGetRev,
+            0x28 => Command::FindRev,
+            0x29 => Command::DocPutIfMatch,
+            0x2A => Command::DocUpdateIfMatch,
             0x30 => Command::IndexDef,
             0x31 => Command::SchemaDef,
             0x40 => Command::SessionInit,
@@ -115,6 +127,10 @@ impl Command {
                 | Command::Update
                 | Command::Delete
                 | Command::Count
+                | Command::DocGetRev
+                | Command::FindRev
+                | Command::DocPutIfMatch
+                | Command::DocUpdateIfMatch
                 | Command::IndexDef
         )
     }
@@ -323,8 +339,8 @@ mod tests {
     #[test]
     fn command_round_trips() {
         for b in [
-            0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x30,
-            0x31, 0x40, 0x41, 0xF0, 0xF1,
+            0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+            0x28, 0x29, 0x2A, 0x30, 0x31, 0x40, 0x41, 0xF0, 0xF1,
         ] {
             let c = Command::from_u8(b).unwrap();
             assert_eq!(c.as_u8(), b);

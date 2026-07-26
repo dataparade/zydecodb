@@ -85,6 +85,45 @@ export class Collection {
     return this.client.putDocument(this.name, docId, jsonBytes(doc), relaxed, expiresAt);
   }
 
+  /**
+   * Replace only when `ifMatch` equals the current revision. Stale/missing →
+   * Conflict. Against older servers this fails with ProtocolError rather than
+   * becoming an unconditional write.
+   */
+  replaceOneIfMatch(
+    docId: string,
+    document: Document,
+    ifMatch: bigint | number,
+    relaxed = false,
+    expiresAt: number | bigint = 0,
+  ): Promise<bigint> {
+    const doc = { ...document, _id: docId };
+    return this.client.putDocumentIfMatch(
+      this.name,
+      docId,
+      jsonBytes(doc),
+      relaxed,
+      ifMatch,
+      expiresAt,
+    );
+  }
+
+  /** Partial update by id when `ifMatch` equals the current revision. */
+  updateByIdIfMatch(
+    docId: string,
+    update: Document,
+    ifMatch: bigint | number,
+    relaxed = false,
+  ): Promise<bigint> {
+    return this.client.updateDocumentIfMatch(
+      this.name,
+      docId,
+      jsonBytes(update),
+      relaxed,
+      ifMatch,
+    );
+  }
+
   updateOne(
     filter: Document,
     update: Document,
@@ -147,6 +186,36 @@ export class Collection {
   async get(docId: string): Promise<Document | null> {
     const body = await this.client.getDocument(this.name, docId);
     return body === null ? null : (JSON.parse(body.toString("utf8")) as Document);
+  }
+
+  /** Fetch one document and its opaque revision, or null if absent. */
+  async getWithRevision(
+    docId: string,
+  ): Promise<{ doc: Document; revision: bigint } | null> {
+    const got = await this.client.getDocumentWithRevision(this.name, docId);
+    if (got === null) return null;
+    return {
+      doc: JSON.parse(got.body.toString("utf8")) as Document,
+      revision: got.revision,
+    };
+  }
+
+  /** Like find, but each result includes its opaque revision. */
+  async findWithRevision(
+    filter: Document | null,
+    opts: QueryOptions = {},
+  ): Promise<{ doc: Document; revision: bigint }[]> {
+    const rows = await this.client.findWithRevision(this.name, filterBytes(filter), {
+      sort: opts.sort,
+      projection: projection(opts),
+      skip: opts.skip,
+      limit: opts.limit,
+      pageSize: opts.pageSize,
+    });
+    return rows.map((r) => ({
+      doc: r.body.length ? (JSON.parse(r.body.toString("utf8")) as Document) : {},
+      revision: r.revision,
+    }));
   }
 
   countDocuments(filter: Document | null = null): Promise<number> {

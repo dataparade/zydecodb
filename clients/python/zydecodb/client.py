@@ -220,6 +220,66 @@ class Client:
         )
         return None if body is None else json.loads(body.decode("utf-8"))
 
+    def get_document_with_revision(
+        self, collection: str, doc_id: str
+    ) -> Optional[Tuple[Any, int]]:
+        """Return ``(document, revision)`` or ``None`` if absent."""
+        body = self._execute(
+            proto.CMD_DOC_GET_REV,
+            proto.encode_query_by_id(collection, doc_id),
+            "DocGetRev",
+            retryable=True,
+            not_found_none=True,
+        )
+        if body is None:
+            return None
+        raw, revision = proto.decode_doc_get_rev_response(body)
+        return json.loads(raw.decode("utf-8")), revision
+
+    def put_document_if_match(
+        self,
+        collection: str,
+        doc_id: str,
+        document: Any,
+        *,
+        if_match: int,
+        relaxed: bool = False,
+        expires_at: int = 0,
+    ) -> int:
+        body = self._execute(
+            proto.CMD_DOC_PUT_IF_MATCH,
+            proto.encode_doc_put_if_match(
+                collection,
+                doc_id,
+                document,
+                relaxed=relaxed,
+                if_match=if_match,
+                expires_at=expires_at,
+            ),
+            "DocPutIfMatch",
+            retryable=False,
+        )
+        return _u64(body, "DocPutIfMatch")
+
+    def update_document_if_match(
+        self,
+        collection: str,
+        doc_id: str,
+        update_doc: dict,
+        *,
+        if_match: int,
+        relaxed: bool = False,
+    ) -> int:
+        body = self._execute(
+            proto.CMD_DOC_UPDATE_IF_MATCH,
+            proto.encode_doc_update_if_match(
+                collection, doc_id, update_doc, relaxed=relaxed, if_match=if_match
+            ),
+            "DocUpdateIfMatch",
+            retryable=False,
+        )
+        return _u64(body, "DocUpdateIfMatch")
+
     def find(
         self,
         collection: str,
@@ -231,8 +291,57 @@ class Client:
         limit: int = 0,
         page_size: int = 100,
     ) -> Iterator[dict]:
+        for doc, _rev in self._find_rows(
+            collection,
+            filt,
+            sort=sort,
+            projection=projection,
+            skip=skip,
+            limit=limit,
+            page_size=page_size,
+            with_revision=False,
+        ):
+            yield doc
+
+    def find_with_revision(
+        self,
+        collection: str,
+        filt: Optional[dict] = None,
+        *,
+        sort: Optional[List[Tuple[str, bool]]] = None,
+        projection: Optional[Tuple[int, List[str]]] = None,
+        skip: int = 0,
+        limit: int = 0,
+        page_size: int = 100,
+    ) -> Iterator[Tuple[dict, int]]:
+        """Yield ``(document, revision)`` pairs via FindRev."""
+        yield from self._find_rows(
+            collection,
+            filt,
+            sort=sort,
+            projection=projection,
+            skip=skip,
+            limit=limit,
+            page_size=page_size,
+            with_revision=True,
+        )
+
+    def _find_rows(
+        self,
+        collection: str,
+        filt: Optional[dict] = None,
+        *,
+        sort: Optional[List[Tuple[str, bool]]] = None,
+        projection: Optional[Tuple[int, List[str]]] = None,
+        skip: int = 0,
+        limit: int = 0,
+        page_size: int = 100,
+        with_revision: bool = False,
+    ) -> Iterator[Tuple[dict, Optional[int]]]:
         cursor = b""
         yielded = 0
+        cmd = proto.CMD_FIND_REV if with_revision else proto.CMD_FIND
+        op = "FindRev" if with_revision else "Find"
         while True:
             want = page_size if limit == 0 else min(page_size, limit - yielded)
             if want <= 0:
@@ -240,11 +349,16 @@ class Client:
             payload = proto.encode_find(
                 collection, filt, sort, projection, skip, want, cursor
             )
-            body = self._execute(proto.CMD_FIND, payload, "Find", retryable=True)
-            rows, cursor = proto.decode_page(body)
+            body = self._execute(cmd, payload, op, retryable=True)
+            if with_revision:
+                rows, cursor = proto.decode_page_with_revision(body, with_revision=True)
+            else:
+                plain, cursor = proto.decode_page(body)
+                rows = [(doc_id, raw, None) for doc_id, raw in plain]
             skip = 0  # applied on the first page; the cursor carries it onward
-            for _doc_id, raw in rows:
-                yield json.loads(raw.decode("utf-8")) if raw else {}
+            for _doc_id, raw, rev in rows:
+                doc = json.loads(raw.decode("utf-8")) if raw else {}
+                yield doc, rev
                 yielded += 1
                 if limit and yielded >= limit:
                     return

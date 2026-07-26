@@ -20,6 +20,10 @@ export const Cmd = {
   Update: 0x24,
   Delete: 0x25,
   Count: 0x26,
+  DocGetRev: 0x27,
+  FindRev: 0x28,
+  DocPutIfMatch: 0x29,
+  DocUpdateIfMatch: 0x2a,
   IndexDef: 0x30,
   SessionInit: 0x40,
   Ping: 0xf0,
@@ -161,6 +165,40 @@ export function encodeDocPut(
   return Buffer.concat(parts);
 }
 
+/** Conditional replace: [collection][doc_id][body][flags][if_match u64][optional expires_at]. */
+export function encodeDocPutIfMatch(
+  collection: string,
+  docId: Buffer,
+  body: Buffer,
+  relaxed: boolean,
+  ifMatch: bigint | number,
+  expiresAt: number | bigint = 0,
+): Buffer {
+  const m = Buffer.allocUnsafe(8);
+  m.writeBigUInt64BE(BigInt(ifMatch), 0);
+  const parts = [lp(utf8(collection)), lp(docId), lp(body), flag(relaxed), m];
+  const exp = BigInt(expiresAt);
+  if (exp !== 0n) {
+    const e = Buffer.allocUnsafe(8);
+    e.writeBigUInt64BE(exp, 0);
+    parts.push(e);
+  }
+  return Buffer.concat(parts);
+}
+
+/** Conditional by-id update: [collection][doc_id][update][flags][if_match u64]. */
+export function encodeDocUpdateIfMatch(
+  collection: string,
+  docId: Buffer,
+  update: Buffer,
+  relaxed: boolean,
+  ifMatch: bigint | number,
+): Buffer {
+  const m = Buffer.allocUnsafe(8);
+  m.writeBigUInt64BE(BigInt(ifMatch), 0);
+  return Buffer.concat([lp(utf8(collection)), lp(docId), lp(update), flag(relaxed), m]);
+}
+
 /** DocDel payload: [collection][doc_id]. */
 export function encodeDocDel(collection: string, docId: Buffer): Buffer {
   return Buffer.concat([lp(utf8(collection)), lp(docId)]);
@@ -297,6 +335,8 @@ export function encodeDistinct(collection: string, filter: Buffer, field: string
 export interface Row {
   docId: Buffer;
   body: Buffer;
+  /** Present only when decoded via {@link decodePageWithRevision}. */
+  revision?: bigint;
 }
 
 /** A decoded response page. `cursor` is null when there are no more pages. */
@@ -307,6 +347,15 @@ export interface Page {
 
 /** Decode a response page: [row_count u32]{[doc_id][body]}[cursor]. */
 export function decodePage(buf: Buffer): Page {
+  return decodePageInner(buf, false);
+}
+
+/** Decode a FindRev page (each row appends an 8-byte revision). */
+export function decodePageWithRevision(buf: Buffer): Page {
+  return decodePageInner(buf, true);
+}
+
+function decodePageInner(buf: Buffer, withRevision: boolean): Page {
   let off = 0;
   const need = (n: number): void => {
     if (off + n > buf.length) throw new Error("zydecodb: payload truncated");
@@ -328,7 +377,13 @@ export function decodePage(buf: Buffer): Page {
     need(blen);
     const body = buf.subarray(off, off + blen);
     off += blen;
-    rows.push({ docId, body });
+    let revision: bigint | undefined;
+    if (withRevision) {
+      need(8);
+      revision = buf.readBigUInt64BE(off);
+      off += 8;
+    }
+    rows.push({ docId, body, revision });
   }
   need(4);
   const clen = buf.readUInt32BE(off);
@@ -336,4 +391,14 @@ export function decodePage(buf: Buffer): Page {
   need(clen);
   const cursorBytes = buf.subarray(off, off + clen);
   return { rows, cursor: cursorBytes.length === 0 ? null : cursorBytes };
+}
+
+/** Decode a DocGetRev response: [body lp][revision u64 BE]. */
+export function decodeDocGetRevResponse(buf: Buffer): { body: Buffer; revision: bigint } {
+  if (buf.length < 4) throw new Error("zydecodb: payload truncated");
+  const blen = buf.readUInt32BE(0);
+  if (buf.length < 4 + blen + 8) throw new Error("zydecodb: payload truncated");
+  const body = buf.subarray(4, 4 + blen);
+  const revision = buf.readBigUInt64BE(4 + blen);
+  return { body, revision };
 }

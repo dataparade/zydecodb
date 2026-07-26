@@ -254,6 +254,41 @@ func (c *Client) GetDocument(ctx context.Context, collection, docID string) ([]b
 	return c.execute(ctx, CmdQuery, EncodeQueryByID(collection, []byte(docID)), "Query", execOptions{retryable: true, notFoundNil: true})
 }
 
+// GetDocumentWithRevision fetches one document by id and its opaque revision.
+// It returns (nil, 0, nil) if not found.
+func (c *Client) GetDocumentWithRevision(ctx context.Context, collection, docID string) ([]byte, uint64, error) {
+	out, err := c.execute(ctx, CmdDocGetRev, EncodeQueryByID(collection, []byte(docID)), "DocGetRev", execOptions{retryable: true, notFoundNil: true})
+	if err != nil || out == nil {
+		return nil, 0, err
+	}
+	body, rev, err := DecodeDocGetRevResponse(out)
+	if err != nil {
+		return nil, 0, err
+	}
+	return body, rev, nil
+}
+
+// PutDocumentIfMatch replaces a document only when ifMatch equals the current
+// revision. A stale or missing document returns a Conflict error. The new
+// revision is returned on success.
+func (c *Client) PutDocumentIfMatch(ctx context.Context, collection, docID string, body []byte, relaxed bool, ifMatch, expiresAt uint64) (uint64, error) {
+	out, err := c.execute(ctx, CmdDocPutIfMatch, EncodeDocPutIfMatch(collection, []byte(docID), body, relaxed, ifMatch, expiresAt), "DocPutIfMatch", execOptions{retryable: false})
+	if err != nil {
+		return 0, err
+	}
+	return decodeU64(out, "DocPutIfMatch")
+}
+
+// UpdateDocumentIfMatch applies a partial update by id only when ifMatch equals
+// the current revision. Returns the new revision on success.
+func (c *Client) UpdateDocumentIfMatch(ctx context.Context, collection, docID string, update []byte, relaxed bool, ifMatch uint64) (uint64, error) {
+	out, err := c.execute(ctx, CmdDocUpdateIfMatch, EncodeDocUpdateIfMatch(collection, []byte(docID), update, relaxed, ifMatch), "DocUpdateIfMatch", execOptions{retryable: false})
+	if err != nil {
+		return 0, err
+	}
+	return decodeU64(out, "DocUpdateIfMatch")
+}
+
 // FindOptions tunes a Find query.
 type FindOptions struct {
 	Sort       []SortKey
@@ -267,12 +302,49 @@ type FindOptions struct {
 // the limit is reached or results are exhausted. filter is opaque JSON bytes
 // (nil/empty = match all).
 func (c *Client) Find(ctx context.Context, collection string, filter []byte, opts FindOptions) ([][]byte, error) {
+	rows, err := c.findRows(ctx, collection, filter, opts, false)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]byte, len(rows))
+	for i, r := range rows {
+		out[i] = r.Body
+	}
+	return out, nil
+}
+
+// DocumentRevision is one FindRev row: raw JSON body plus opaque revision.
+type DocumentRevision struct {
+	Body     []byte
+	Revision uint64
+}
+
+// FindWithRevision is like Find but uses FindRev and returns revisions.
+func (c *Client) FindWithRevision(ctx context.Context, collection string, filter []byte, opts FindOptions) ([]DocumentRevision, error) {
+	rows, err := c.findRows(ctx, collection, filter, opts, true)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DocumentRevision, len(rows))
+	for i, r := range rows {
+		out[i] = DocumentRevision{Body: r.Body, Revision: r.Revision}
+	}
+	return out, nil
+}
+
+func (c *Client) findRows(ctx context.Context, collection string, filter []byte, opts FindOptions, withRev bool) ([]Row, error) {
 	pageSize := opts.PageSize
 	if pageSize == 0 {
 		pageSize = 100
 	}
+	cmd := CmdFind
+	op := "Find"
+	if withRev {
+		cmd = CmdFindRev
+		op = "FindRev"
+	}
 	var (
-		results [][]byte
+		results []Row
 		cursor  []byte
 		skip    = opts.Skip
 		yielded uint32
@@ -289,17 +361,23 @@ func (c *Client) Find(ctx context.Context, collection string, filter []byte, opt
 			}
 		}
 		payload := EncodeFind(collection, filter, opts.Sort, opts.Projection, skip, want, cursor)
-		body, err := c.execute(ctx, CmdFind, payload, "Find", execOptions{retryable: true})
+		body, err := c.execute(ctx, cmd, payload, op, execOptions{retryable: true})
 		if err != nil {
 			return nil, err
 		}
-		rows, next, err := DecodePage(body)
+		var rows []Row
+		var next []byte
+		if withRev {
+			rows, next, err = DecodePageWithRevision(body)
+		} else {
+			rows, next, err = DecodePage(body)
+		}
 		if err != nil {
 			return nil, err
 		}
 		skip = 0 // applied on the first page; the cursor carries it onward
 		for _, row := range rows {
-			results = append(results, row.Body)
+			results = append(results, row)
 			yielded++
 			if opts.Limit != 0 && yielded >= opts.Limit {
 				return results, nil

@@ -10,6 +10,16 @@ impl Engine {
         self.snapshot_get(u64::MAX, key)
     }
 
+    /// GET the latest value and the `InternalKey.seq` that wrote it.
+    ///
+    /// The sequence is an opaque document revision for optimistic concurrency:
+    /// clients compare it for equality only. Missing, tombstoned, and expired
+    /// keys return `None`. Bypasses the result cache so the seq is never lost.
+    pub fn get_with_seq(&self, key: &[u8]) -> EngineResult<Option<(Vec<u8>, u64)>> {
+        keys::validate_user_key(key)?;
+        self.snapshot_get_with_seq(u64::MAX, key)
+    }
+
     /// Number of live SSTables at each level, for tests and operational
     /// inspection. Returns a `Vec<(level, count)>` in ascending-level order.
     pub fn live_sstable_levels(&self) -> Vec<(u8, usize)> {
@@ -120,24 +130,47 @@ impl Engine {
     /// SSTables (newest first), returning the first entry whose seq is at
     /// or below `seq_upper`. Tombstones suppress; expired entries suppress.
     pub fn snapshot_get(&self, seq_upper: u64, key: &[u8]) -> EngineResult<Option<Vec<u8>>> {
+        Ok(self
+            .snapshot_get_inner(seq_upper, key, true)?
+            .map(|(v, _)| v))
+    }
+
+    /// Like [`Engine::snapshot_get`], but also returns the visible entry's seq.
+    /// Skips the value-only result cache so the seq is never fabricated.
+    pub fn snapshot_get_with_seq(
+        &self,
+        seq_upper: u64,
+        key: &[u8],
+    ) -> EngineResult<Option<(Vec<u8>, u64)>> {
+        self.snapshot_get_inner(seq_upper, key, false)
+    }
+
+    fn snapshot_get_inner(
+        &self,
+        seq_upper: u64,
+        key: &[u8],
+        use_result_cache: bool,
+    ) -> EngineResult<Option<(Vec<u8>, u64)>> {
         keys::validate_user_key(key).or_else(|_| keys::validate_system_key(key))?;
         let now = Self::now_ms();
 
         if let Some((ik, entry)) = self.first_visible_in_memtable(&self.active, key, seq_upper) {
-            return Ok(self.resolve(&ik, &entry, now));
+            return Ok(self.resolve_with_seq(&ik, &entry, now));
         }
         for mt in self.immutable.iter().rev() {
             if let Some((ik, entry)) = self.first_visible_in_memtable(mt, key, seq_upper) {
-                return Ok(self.resolve(&ik, &entry, now));
+                return Ok(self.resolve_with_seq(&ik, &entry, now));
             }
         }
-        if seq_upper == u64::MAX {
+        if use_result_cache && seq_upper == u64::MAX {
             if let Some(rc) = &self.result_cache {
                 if let Some(hit) = rc.get(key) {
                     if let Some(m) = &self.metrics {
                         m.result_cache_hits_total.inc();
                     }
-                    return Ok(Some(hit));
+                    // Cached value has no seq; callers that need seq set
+                    // use_result_cache=false and never reach here.
+                    return Ok(Some((hit, 0)));
                 }
                 if let Some(m) = &self.metrics {
                     m.result_cache_misses_total.inc();
@@ -171,9 +204,11 @@ impl Engine {
                         m.sstable_get_duration_seconds
                             .observe(start.elapsed().as_secs_f64());
                     }
-                    let resolved = self.resolve(&ik, &entry, now);
-                    if let (Some(rc), Some(v)) = (&self.result_cache, &resolved) {
-                        rc.insert(key.to_vec(), v.clone());
+                    let resolved = self.resolve_with_seq(&ik, &entry, now);
+                    if let (Some(rc), Some((v, _))) = (&self.result_cache, &resolved) {
+                        if seq_upper == u64::MAX {
+                            rc.insert(key.to_vec(), v.clone());
+                        }
                     }
                     return Ok(resolved);
                 }
@@ -293,13 +328,16 @@ impl Engine {
         out
     }
 
-    /// Resolve an entry to a value: None for tombstone or expired.
-    /// (Not-found accounting is the caller's concern so it can be labeled
-    /// and so internal `sys_*` calls don't inflate user-facing counters.)
-    pub(crate) fn resolve(&self, _ik: &InternalKey, entry: &Entry, now: u64) -> Option<Vec<u8>> {
+    /// Resolve an entry to `(value, seq)`, or None for tombstone/expired.
+    pub(crate) fn resolve_with_seq(
+        &self,
+        ik: &InternalKey,
+        entry: &Entry,
+        now: u64,
+    ) -> Option<(Vec<u8>, u64)> {
         if entry.is_tombstone() || entry.is_expired(now) {
             return None;
         }
-        entry.value.clone()
+        entry.value.clone().map(|v| (v, ik.seq))
     }
 }

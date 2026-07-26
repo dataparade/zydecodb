@@ -157,6 +157,8 @@ cargo test --workspace
 - [`clients/conformance/README.md`](clients/conformance/README.md) — shared wire conformance vectors that keep every driver byte-compatible with the server
 - [`examples/README.md`](examples/README.md) — client and user-backend walkthroughs
 - [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) — document layer architecture, gaps, and roadmap
+- [`docs/RELEASES.md`](docs/RELEASES.md) — versioning, dual Go tags (`clients/go/vX.Y.Z`), and pinning
+- [`CHANGELOG.md`](CHANGELOG.md) — server and driver release notes
 - [`docs/SECURITY.md`](docs/SECURITY.md) — auth, TLS, tenants, δ-fair / pods sharing model
 - [`docs/PODS.md`](docs/PODS.md) — multi-tenant host runbook (fair on, soak prove, offboard)
 - [`docs/SOAK.md`](docs/SOAK.md) — engine soak + multi-tenant isolation soak

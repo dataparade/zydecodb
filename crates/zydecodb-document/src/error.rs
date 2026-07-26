@@ -14,6 +14,8 @@ pub enum DocError {
     AlreadyExists(String),
     /// A write would violate a unique index constraint.
     DuplicateKey(String),
+    /// An optimistic concurrency check failed (stale or missing revision).
+    StaleRevision,
     /// The document body (or a query bound) was not valid JSON.
     InvalidJson(String),
     /// A single document touched more index keys than one atomic batch allows.
@@ -43,7 +45,9 @@ impl DocError {
     pub fn status(&self) -> Status {
         match self {
             DocError::CollectionNotFound(_) | DocError::IndexNotFound(_) => Status::NotFound,
-            DocError::AlreadyExists(_) | DocError::DuplicateKey(_) => Status::Conflict,
+            DocError::AlreadyExists(_) | DocError::DuplicateKey(_) | DocError::StaleRevision => {
+                Status::Conflict
+            }
             DocError::InvalidJson(_) | DocError::Protocol(_) => Status::ProtocolError,
             DocError::BadFilter(_) | DocError::BadUpdate(_) => Status::InvalidValue,
             DocError::BatchTooLarge(_) => Status::InvalidValue,
@@ -60,6 +64,7 @@ impl fmt::Display for DocError {
             DocError::IndexNotFound(i) => write!(f, "index not found: {i}"),
             DocError::AlreadyExists(x) => write!(f, "already exists: {x}"),
             DocError::DuplicateKey(x) => write!(f, "duplicate key: {x}"),
+            DocError::StaleRevision => write!(f, "stale document revision"),
             DocError::InvalidJson(e) => write!(f, "invalid json: {e}"),
             DocError::BatchTooLarge(n) => {
                 write!(

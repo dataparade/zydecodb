@@ -85,6 +85,33 @@ func (c *Collection) ReplaceOne(ctx context.Context, docID string, doc Document,
 	return c.client.PutDocument(ctx, c.name, docID, body, relaxed, expiresAt)
 }
 
+// ReplaceOneIfMatch replaces the document only when ifMatch equals the current
+// revision. Stale or missing documents return a Conflict error. Returns the new
+// revision. Against older servers this fails with ProtocolError rather than
+// silently becoming an unconditional write.
+func (c *Collection) ReplaceOneIfMatch(ctx context.Context, docID string, doc Document, relaxed bool, ifMatch, expiresAt uint64) (uint64, error) {
+	cp := make(Document, len(doc)+1)
+	for k, v := range doc {
+		cp[k] = v
+	}
+	cp["_id"] = docID
+	body, err := json.Marshal(cp)
+	if err != nil {
+		return 0, fmt.Errorf("zydecodb: marshal document: %w", err)
+	}
+	return c.client.PutDocumentIfMatch(ctx, c.name, docID, body, relaxed, ifMatch, expiresAt)
+}
+
+// UpdateByIDIfMatch applies a partial update to one document by id when ifMatch
+// equals the current revision. Returns the new revision on success.
+func (c *Collection) UpdateByIDIfMatch(ctx context.Context, docID string, update Document, relaxed bool, ifMatch uint64) (uint64, error) {
+	ub, err := json.Marshal(update)
+	if err != nil {
+		return 0, fmt.Errorf("zydecodb: marshal update: %w", err)
+	}
+	return c.client.UpdateDocumentIfMatch(ctx, c.name, docID, ub, relaxed, ifMatch)
+}
+
 // UpdateResult summarizes an update operation.
 type UpdateResult struct {
 	Matched    int64  `json:"matched"`
@@ -217,6 +244,61 @@ func (c *Collection) Get(ctx context.Context, docID string) (Document, error) {
 		return nil, fmt.Errorf("zydecodb: decode document: %w", err)
 	}
 	return doc, nil
+}
+
+// VersionedDocument is a document plus its opaque revision for optimistic concurrency.
+type VersionedDocument struct {
+	Doc      Document
+	Revision uint64
+}
+
+// GetWithRevision fetches one document and its opaque revision, or (zero, nil) if absent.
+func (c *Collection) GetWithRevision(ctx context.Context, docID string) (VersionedDocument, error) {
+	var out VersionedDocument
+	body, rev, err := c.client.GetDocumentWithRevision(ctx, c.name, docID)
+	if err != nil || body == nil {
+		return out, err
+	}
+	doc := Document{}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return out, fmt.Errorf("zydecodb: decode document: %w", err)
+	}
+	out.Doc = doc
+	out.Revision = rev
+	return out, nil
+}
+
+// FindWithRevision is like Find but each result includes its opaque revision.
+func (c *Collection) FindWithRevision(ctx context.Context, filter Document, opts QueryOptions) ([]VersionedDocument, error) {
+	fb, err := marshalFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	proj, err := opts.projection()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := c.client.FindWithRevision(ctx, c.name, fb, FindOptions{
+		Sort:       opts.Sort,
+		Projection: proj,
+		Skip:       opts.Skip,
+		Limit:      opts.Limit,
+		PageSize:   opts.PageSize,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]VersionedDocument, 0, len(rows))
+	for _, r := range rows {
+		doc := Document{}
+		if len(r.Body) > 0 {
+			if err := json.Unmarshal(r.Body, &doc); err != nil {
+				return nil, fmt.Errorf("zydecodb: decode document: %w", err)
+			}
+		}
+		out = append(out, VersionedDocument{Doc: doc, Revision: r.Revision})
+	}
+	return out, nil
 }
 
 // CountDocuments returns the number of documents matching filter (nil = all).

@@ -71,6 +71,7 @@ tls.key
 !/scripts/tenant-isolation-soak.sh
 
 # Internal / Archived Docs
+/ROADMAP.md
 /docs/archive/
 /docs/soak-baselines/
 .cargo-home/

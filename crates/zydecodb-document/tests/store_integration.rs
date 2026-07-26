@@ -197,6 +197,49 @@ fn filtered_write_recheck_skips_stale_candidates() {
 }
 
 #[test]
+fn if_match_succeeds_when_revision_current() {
+    use zydecodb_document::update::{self, UpdateDoc};
+
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    cat.ensure_collection(PREFIX, "users");
+    cat.persist(&mut e).unwrap();
+    let seq = store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"n":1}"#, false).unwrap();
+    assert!(seq > 0);
+    let rev = store::doc_revision(&e, &cat, PREFIX, "users", b"u1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rev, seq);
+
+    store::check_if_match(&e, &cat, PREFIX, "users", b"u1", rev).unwrap();
+    let new_seq =
+        store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"n":2}"#, false).unwrap();
+    assert!(new_seq > rev);
+
+    assert!(matches!(
+        store::check_if_match(&e, &cat, PREFIX, "users", b"u1", rev),
+        Err(zydecodb_document::error::DocError::StaleRevision)
+    ));
+
+    let upd = UpdateDoc::parse_bytes(br#"{"$inc":{"n":1}}"#).unwrap();
+    let cur = store::doc_revision(&e, &cat, PREFIX, "users", b"u1")
+        .unwrap()
+        .unwrap();
+    let after =
+        update::apply_to_id_if_match(&mut e, &cat, PREFIX, "users", b"u1", &upd, cur).unwrap();
+    assert!(after > cur);
+    assert!(matches!(
+        update::apply_to_id_if_match(&mut e, &cat, PREFIX, "users", b"u1", &upd, cur),
+        Err(zydecodb_document::error::DocError::StaleRevision)
+    ));
+    assert!(matches!(
+        store::check_if_match(&e, &cat, PREFIX, "users", b"missing", 1),
+        Err(zydecodb_document::error::DocError::StaleRevision)
+    ));
+}
+
+#[test]
 fn unique_index_rejects_duplicate_value() {
     let dir = TempDir::new().unwrap();
     let mut e = open(&dir);

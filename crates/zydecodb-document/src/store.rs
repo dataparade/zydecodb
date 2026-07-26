@@ -73,6 +73,38 @@ pub fn stored_to_json_vec(stored: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Current opaque revision (`InternalKey.seq`) for a document, if it exists.
+pub fn doc_revision(
+    engine: &Engine,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+) -> DocResult<Option<u64>> {
+    let coll = catalog
+        .collection(prefix, collection)
+        .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
+    let dk = keys::doc_key(prefix, coll.id, doc_id);
+    Ok(engine.get_with_seq(&dk)?.map(|(_, rev)| rev))
+}
+
+/// Compare-and-swap gate: require `expected` to equal the current document
+/// revision. Missing/tombstoned/expired documents and mismatched revisions all
+/// return [`DocError::StaleRevision`]. Must be called under the engine write lock.
+pub fn check_if_match(
+    engine: &Engine,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+    expected: u64,
+) -> DocResult<()> {
+    match doc_revision(engine, catalog, prefix, collection, doc_id)? {
+        Some(rev) if rev == expected => Ok(()),
+        _ => Err(DocError::StaleRevision),
+    }
+}
+
 /// Reject a write that would place two different documents at the same value of
 /// a unique index. The server holds the engine mutex across the whole write, so
 /// this check-then-write is race-free against other writers (no TOCTOU).

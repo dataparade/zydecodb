@@ -79,6 +79,45 @@ class Collection:
             self._name, str(doc_id), doc, relaxed=relaxed, expires_at=expires_at
         )
 
+    def replace_one_if_match(
+        self,
+        doc_id: str,
+        document: dict,
+        *,
+        if_match: int,
+        relaxed: bool = False,
+        expires_at: int = 0,
+    ) -> int:
+        """Replace only when ``if_match`` equals the current revision.
+
+        Stale or missing documents raise ``ConflictError``. Against older
+        servers this fails with ``ProtocolError`` rather than becoming an
+        unconditional write. Returns the new revision.
+        """
+        doc = dict(document)
+        doc["_id"] = str(doc_id)
+        return self._c.put_document_if_match(
+            self._name,
+            str(doc_id),
+            doc,
+            if_match=if_match,
+            relaxed=relaxed,
+            expires_at=expires_at,
+        )
+
+    def update_by_id_if_match(
+        self,
+        doc_id: str,
+        update: dict,
+        *,
+        if_match: int,
+        relaxed: bool = False,
+    ) -> int:
+        """Partial update by id when ``if_match`` equals the current revision."""
+        return self._c.update_document_if_match(
+            self._name, str(doc_id), update, if_match=if_match, relaxed=relaxed
+        )
+
     def update_one(
         self, filt: dict, update: dict, *, relaxed: bool = False, upsert: bool = False
     ) -> dict:
@@ -132,6 +171,31 @@ class Collection:
     def get(self, doc_id: str) -> Optional[dict]:
         """Fetch one document directly by id (fast path)."""
         return self._c.get_document(self._name, str(doc_id))
+
+    def get_with_revision(self, doc_id: str) -> Optional[Tuple[dict, int]]:
+        """Return ``(document, revision)`` or ``None`` if absent."""
+        return self._c.get_document_with_revision(self._name, str(doc_id))
+
+    def find_with_revision(
+        self,
+        filt: Optional[dict] = None,
+        *,
+        sort: Optional[List[Tuple[str, bool]]] = None,
+        projection: Optional[Dict[str, int]] = None,
+        skip: int = 0,
+        limit: int = 0,
+        page_size: int = 100,
+    ) -> Iterator[Tuple[dict, int]]:
+        """Iterate ``(document, revision)`` pairs (auto-paginating via FindRev)."""
+        return self._c.find_with_revision(
+            self._name,
+            filt,
+            sort=sort,
+            projection=_encode_projection(projection),
+            skip=skip,
+            limit=limit,
+            page_size=page_size,
+        )
 
     def count_documents(self, filt: Optional[dict] = None) -> int:
         return self._c.count(self._name, filt)

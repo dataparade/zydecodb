@@ -25,6 +25,10 @@ CMD_FIND = 0x23
 CMD_UPDATE = 0x24
 CMD_DELETE = 0x25
 CMD_COUNT = 0x26
+CMD_DOC_GET_REV = 0x27
+CMD_FIND_REV = 0x28
+CMD_DOC_PUT_IF_MATCH = 0x29
+CMD_DOC_UPDATE_IF_MATCH = 0x2A
 CMD_INDEX_DEF = 0x30
 CMD_SESSION_INIT = 0x40
 CMD_PING = 0xF0
@@ -156,6 +160,42 @@ def encode_doc_put(
     return out
 
 
+def encode_doc_put_if_match(
+    collection: str,
+    doc_id: str,
+    document: Any,
+    *,
+    relaxed: bool,
+    if_match: int,
+    expires_at: int = 0,
+) -> bytes:
+    """Conditional replace: [collection][doc_id][body][flags][if_match][optional expires_at]."""
+    out = _lp(collection.encode()) + _lp(doc_id.encode()) + _lp(_json_bytes(document))
+    out += bytes([FLAG_RELAXED if relaxed else 0])
+    out += struct.pack(">Q", int(if_match))
+    if expires_at:
+        out += struct.pack(">Q", int(expires_at))
+    return out
+
+
+def encode_doc_update_if_match(
+    collection: str,
+    doc_id: str,
+    update_doc: Any,
+    *,
+    relaxed: bool,
+    if_match: int,
+) -> bytes:
+    """Conditional by-id update: [collection][doc_id][update][flags][if_match]."""
+    return (
+        _lp(collection.encode())
+        + _lp(doc_id.encode())
+        + _lp(_json_bytes(update_doc))
+        + bytes([FLAG_RELAXED if relaxed else 0])
+        + struct.pack(">Q", int(if_match))
+    )
+
+
 def encode_doc_del(collection: str, doc_id: str) -> bytes:
     return _lp(collection.encode()) + _lp(doc_id.encode())
 
@@ -267,10 +307,21 @@ def decode_page(buf: bytes) -> Tuple[List[Tuple[bytes, bytes]], bytes]:
 
     Each row is `(doc_id, body)`; an empty `next_cursor` means no more pages.
     """
+    rows, cursor = decode_page_with_revision(buf, with_revision=False)
+    return [(doc_id, body) for doc_id, body, _rev in rows], cursor
+
+
+def decode_page_with_revision(
+    buf: bytes, *, with_revision: bool = True
+) -> Tuple[List[Tuple[bytes, bytes, Optional[int]]], bytes]:
+    """Decode a FindRev page into `((doc_id, body, revision), next_cursor)`.
+
+    When ``with_revision`` is False, ``revision`` is always ``None``.
+    """
     off = 0
     (count,) = struct.unpack_from(">I", buf, off)
     off += 4
-    rows: List[Tuple[bytes, bytes]] = []
+    rows: List[Tuple[bytes, bytes, Optional[int]]] = []
     for _ in range(count):
         (klen,) = struct.unpack_from(">I", buf, off)
         off += 4
@@ -280,11 +331,23 @@ def decode_page(buf: bytes) -> Tuple[List[Tuple[bytes, bytes]], bytes]:
         off += 4
         body = buf[off : off + blen]
         off += blen
-        rows.append((doc_id, body))
+        revision: Optional[int] = None
+        if with_revision:
+            (revision,) = struct.unpack_from(">Q", buf, off)
+            off += 8
+        rows.append((doc_id, body, revision))
     (clen,) = struct.unpack_from(">I", buf, off)
     off += 4
     cursor = buf[off : off + clen]
     return rows, cursor
+
+
+def decode_doc_get_rev_response(buf: bytes) -> Tuple[bytes, int]:
+    """Decode a DocGetRev response: `(body, revision)`."""
+    (blen,) = struct.unpack_from(">I", buf, 0)
+    body = buf[4 : 4 + blen]
+    (revision,) = struct.unpack_from(">Q", buf, 4 + blen)
+    return body, revision
 
 
 def status_name(status: int) -> str:

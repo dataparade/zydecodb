@@ -106,6 +106,13 @@ is queryable whether it is indexed or not.
   equality fields in the filter plus the operator update (including
   `$setOnInsert`). Response includes `upserted_id` on insert; omit it on a
   normal update.
+- **Optimistic concurrency:** each document's revision is the engine
+  `InternalKey.seq` of its latest body write (opaque `u64`). `DocGetRev` /
+  `FindRev` return it; `DocPutIfMatch` / `DocUpdateIfMatch` require an
+  `ifMatch` revision checked under the write lock. Stale or missing documents
+  return `Conflict`. Unconditional `DocPut` / `Update` are unchanged. Admin TTL
+  backfill may advance a revision without a client-visible field change (safe
+  false conflict, never a lost write).
 
 ---
 
@@ -162,6 +169,10 @@ indexer.
 | `0x24` | `Update` | Implemented (filter-based partial update; `FLAG_UPSERT`) |
 | `0x25` | `Delete` | Implemented (filter-based delete) |
 | `0x26` | `Count` | Implemented (count / distinct) |
+| `0x27` | `DocGetRev` | Implemented (by-id get returning opaque revision) |
+| `0x28` | `FindRev` | Implemented (find page rows include opaque revision) |
+| `0x29` | `DocPutIfMatch` | Implemented (conditional replace; stale/missing → `Conflict`) |
+| `0x2A` | `DocUpdateIfMatch` | Implemented (conditional by-id update; stale/missing → `Conflict`) |
 | `0x30` | `IndexDef` | Implemented (index create + backfill; optional TTL `expire_after_seconds` trailer) |
 | `0x40` | `SessionInit` | Implemented (API-key auth handshake) |
 | `0x41` | `SetContext` | Implemented (admin tenant switch) |
@@ -178,7 +189,9 @@ indexer.
 Not-yet list may gain semantics later without changing existing codes. On-disk
 format upgrades follow [`UPGRADE.md`](UPGRADE.md). Official drivers expose DocPut
 `expires_at` and IndexDef `expire_after_seconds` (TTL indexes); other admin
-opcodes may still lag the freeze.
+opcodes may still lag the freeze. Driver and server version pinning (including
+the nested Go module tag `clients/go/vX.Y.Z`) is documented in
+[`RELEASES.md`](RELEASES.md).
 
 Payload codecs are in `zydecodb-document/src/wire.rs`. The official drivers (Python, Go, TypeScript) are the intended product surface; the binary wire sits behind them.
 

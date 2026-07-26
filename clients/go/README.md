@@ -5,11 +5,23 @@ third-party dependencies.
 
 ## Install
 
+Pin an explicit module version (do not use `@latest` — that can resolve to a
+pseudo-version when the nested Go tag is missing):
+
 ```bash
-go get github.com/dataparade/zydecodb/clients/go@latest
+go get github.com/dataparade/zydecodb/clients/go@v0.9.0
 ```
 
-Requires Go 1.23+.
+Requires Go 1.23+. The Go module is tagged as `clients/go/vX.Y.Z` at the same
+commit as the server release `vX.Y.Z`. See
+[`docs/RELEASES.md`](../../docs/RELEASES.md) and the root
+[`CHANGELOG.md`](../../CHANGELOG.md).
+
+### Compatibility
+
+| Server | Go driver tag | Wire |
+|--------|---------------|------|
+| `0.9.x` | `clients/go/v0.9.x*` | `proto_version = 1` |
 
 ## Quick start
 
@@ -73,6 +85,24 @@ func main() {
   Pagination is repeatable-read across pages.
 - **Raw KV with TTL.** Side-channel `Put` (with `expiresAt`), `Get`, and `Delete` methods on `Client` for session data that needs a time-to-live.
 - **TLS.** `WithTLS(nil)` uses system roots and infers SNI from the dial address; pass a custom `*tls.Config` when you need private CAs or other settings.
+
+## Optimistic concurrency
+
+Use revision-aware reads and conditional writes to avoid silent last-write-wins:
+
+```go
+got, err := users.GetWithRevision(ctx, id)
+// ... mutate got.Doc ...
+_, err = users.ReplaceOneIfMatch(ctx, id, got.Doc, false, got.Revision, 0)
+if zydecodb.IsConflict(err) {
+	// re-read and retry, or merge
+}
+```
+
+Also available: `FindWithRevision`, `UpdateByIDIfMatch`. Revisions are opaque
+`uint64` values (engine sequence numbers). Stale or missing documents return
+`Conflict`. Against an older server these methods fail with `ProtocolError`
+instead of silently becoming unconditional writes.
 
 ## Durability
 

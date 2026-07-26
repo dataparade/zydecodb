@@ -11,12 +11,16 @@ import { test } from "node:test";
 
 import {
   Cmd,
+  decodeDocGetRevResponse,
   decodePage,
+  decodePageWithRevision,
   encodeCount,
   encodeDelete,
   encodeDistinct,
   encodeDocDel,
   encodeDocPut,
+  encodeDocPutIfMatch,
+  encodeDocUpdateIfMatch,
   encodeFind,
   encodeHeader,
   encodeIndexDef,
@@ -46,8 +50,10 @@ interface RespVector {
   kind: string;
   bytes_hex: string;
   decoded: {
-    rows: { doc_id: string; body_json: string }[];
-    next_cursor_hex: string | null;
+    rows?: { doc_id: string; body_json: string; revision?: number }[];
+    next_cursor_hex?: string | null;
+    body_json?: string;
+    revision?: number;
   };
 }
 
@@ -104,7 +110,8 @@ function encodeRequest(v: ReqVector): Buffer {
         fromHex(s(i, "cursor_hex")),
         n(i, "limit"),
       );
-    case "Find": {
+    case "Find":
+    case "FindRev": {
       const proj = i["projection"] as { mode: string; fields: string[] };
       const projection: Projection =
         proj.mode === "include"
@@ -126,6 +133,25 @@ function encodeRequest(v: ReqVector): Buffer {
         fromHex(s(i, "cursor_hex")),
       );
     }
+    case "DocGetRev":
+      return encodeQueryById(s(i, "collection"), Buffer.from(s(i, "doc_id"), "utf8"));
+    case "DocPutIfMatch":
+      return encodeDocPutIfMatch(
+        s(i, "collection"),
+        Buffer.from(s(i, "doc_id"), "utf8"),
+        optBytes(s(i, "body_json")),
+        b(i, "relaxed"),
+        BigInt(n(i, "if_match")),
+        (i["expires_at"] as number | undefined) ?? 0,
+      );
+    case "DocUpdateIfMatch":
+      return encodeDocUpdateIfMatch(
+        s(i, "collection"),
+        Buffer.from(s(i, "doc_id"), "utf8"),
+        optBytes(s(i, "update_json")),
+        b(i, "relaxed"),
+        BigInt(n(i, "if_match")),
+      );
     case "Update":
       return encodeUpdate(
         s(i, "collection"),
@@ -171,19 +197,40 @@ for (const v of vectors.requests) {
 
 for (const v of vectors.responses) {
   test(`response: ${v.name}`, () => {
-    assert.equal(v.kind, "QueryPage");
-    const page = decodePage(fromHex(v.bytes_hex));
-    assert.equal(page.rows.length, v.decoded.rows.length);
-    page.rows.forEach((row, idx) => {
-      const exp = v.decoded.rows[idx]!;
-      assert.equal(row.docId.toString("utf8"), exp.doc_id);
-      assert.equal(row.body.toString("utf8"), exp.body_json);
-    });
-    if (v.decoded.next_cursor_hex === null) {
-      assert.equal(page.cursor, null);
-    } else {
-      assert.equal(page.cursor?.toString("hex"), v.decoded.next_cursor_hex);
+    if (v.kind === "QueryPage") {
+      const page = decodePage(fromHex(v.bytes_hex));
+      assert.equal(page.rows.length, v.decoded.rows!.length);
+      page.rows.forEach((row, idx) => {
+        const exp = v.decoded.rows![idx]!;
+        assert.equal(row.docId.toString("utf8"), exp.doc_id);
+        assert.equal(row.body.toString("utf8"), exp.body_json);
+      });
+      if (v.decoded.next_cursor_hex === null) {
+        assert.equal(page.cursor, null);
+      } else {
+        assert.equal(page.cursor?.toString("hex"), v.decoded.next_cursor_hex);
+      }
+      return;
     }
+    if (v.kind === "QueryPageRev") {
+      const page = decodePageWithRevision(fromHex(v.bytes_hex));
+      assert.equal(page.rows.length, v.decoded.rows!.length);
+      page.rows.forEach((row, idx) => {
+        const exp = v.decoded.rows![idx]!;
+        assert.equal(row.docId.toString("utf8"), exp.doc_id);
+        assert.equal(row.body.toString("utf8"), exp.body_json);
+        assert.equal(row.revision, BigInt(exp.revision!));
+      });
+      assert.equal(page.cursor, null);
+      return;
+    }
+    if (v.kind === "DocGetRevResponse") {
+      const got = decodeDocGetRevResponse(fromHex(v.bytes_hex));
+      assert.equal(got.body.toString("utf8"), v.decoded.body_json);
+      assert.equal(got.revision, BigInt(v.decoded.revision!));
+      return;
+    }
+    throw new Error(`unhandled response kind: ${v.kind}`);
   });
 }
 
@@ -193,6 +240,10 @@ test("command and status codes match vectors", () => {
   assert.equal(vectors.commands["Update"], Cmd.Update);
   assert.equal(vectors.commands["Delete"], Cmd.Delete);
   assert.equal(vectors.commands["Count"], Cmd.Count);
+  assert.equal(vectors.commands["DocGetRev"], Cmd.DocGetRev);
+  assert.equal(vectors.commands["FindRev"], Cmd.FindRev);
+  assert.equal(vectors.commands["DocPutIfMatch"], Cmd.DocPutIfMatch);
+  assert.equal(vectors.commands["DocUpdateIfMatch"], Cmd.DocUpdateIfMatch);
   assert.equal(vectors.commands["IndexDef"], Cmd.IndexDef);
   assert.equal(vectors.commands["SessionInit"], Cmd.SessionInit);
   assert.equal(vectors.statuses["Ok"], Status.Ok);

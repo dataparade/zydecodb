@@ -567,11 +567,23 @@ impl CountPayload {
 /// Encode an index-range response page:
 /// `[row_count u32]{[doc_id][body]}* [cursor]` (cursor empty = end of results).
 pub fn encode_query_page(page: &QueryPage) -> Vec<u8> {
+    encode_query_page_inner(page, false)
+}
+
+/// Encode a FindRev page: each row appends an 8-byte big-endian revision.
+pub fn encode_query_page_with_revision(page: &QueryPage) -> Vec<u8> {
+    encode_query_page_inner(page, true)
+}
+
+fn encode_query_page_inner(page: &QueryPage, with_revision: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(page.rows.len() as u32).to_be_bytes());
     for row in &page.rows {
         put_lp(&mut out, &row.doc_id);
         put_lp(&mut out, row.body.as_deref().unwrap_or(&[]));
+        if with_revision {
+            out.extend_from_slice(&row.revision.unwrap_or(0).to_be_bytes());
+        }
     }
     put_lp(&mut out, page.next_cursor.as_deref().unwrap_or(&[]));
     out
@@ -582,18 +594,42 @@ pub fn encode_query_page(page: &QueryPage) -> Vec<u8> {
 pub struct DecodedRow {
     pub doc_id: Vec<u8>,
     pub body: Vec<u8>,
+    pub revision: Option<u64>,
 }
 
 /// Decode an index-range response page produced by [`encode_query_page`].
 /// Returns the rows and an optional next-page cursor (empty cursor = end).
 pub fn decode_query_page(p: &[u8]) -> DocResult<(Vec<DecodedRow>, Option<Vec<u8>>)> {
+    decode_query_page_inner(p, false)
+}
+
+/// Decode a FindRev page produced by [`encode_query_page_with_revision`].
+pub fn decode_query_page_with_revision(p: &[u8]) -> DocResult<(Vec<DecodedRow>, Option<Vec<u8>>)> {
+    decode_query_page_inner(p, true)
+}
+
+fn decode_query_page_inner(
+    p: &[u8],
+    with_revision: bool,
+) -> DocResult<(Vec<DecodedRow>, Option<Vec<u8>>)> {
     let mut r = Reader::new(p);
     let count = r.u32()?;
     let mut rows = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
         let doc_id = r.lp()?.to_vec();
         let body = r.lp()?.to_vec();
-        rows.push(DecodedRow { doc_id, body });
+        let revision = if with_revision {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(r.take(8)?);
+            Some(u64::from_be_bytes(buf))
+        } else {
+            None
+        };
+        rows.push(DecodedRow {
+            doc_id,
+            body,
+            revision,
+        });
     }
     let cursor = r.lp()?.to_vec();
     let next = if cursor.is_empty() {
@@ -602,6 +638,135 @@ pub fn decode_query_page(p: &[u8]) -> DocResult<(Vec<DecodedRow>, Option<Vec<u8>
         Some(cursor)
     };
     Ok((rows, next))
+}
+
+// ---- DocGetRev request: same framing as Query ById ----
+// Response: [body lp][revision u64 BE]
+
+/// Encode a DocGetRev / Query-ById-shaped request body.
+pub fn encode_doc_get_rev(collection: &str, doc_id: &[u8]) -> Vec<u8> {
+    QueryPayload::ById {
+        collection: collection.to_string(),
+        doc_id: doc_id.to_vec(),
+    }
+    .encode()
+}
+
+pub fn decode_doc_get_rev(p: &[u8]) -> DocResult<(String, Vec<u8>)> {
+    match QueryPayload::decode(p)? {
+        QueryPayload::ById { collection, doc_id } => Ok((collection, doc_id)),
+        _ => Err(DocError::Protocol(
+            "DocGetRev expects ById query payload".into(),
+        )),
+    }
+}
+
+pub fn encode_doc_get_rev_response(body: &[u8], revision: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_lp(&mut out, body);
+    out.extend_from_slice(&revision.to_be_bytes());
+    out
+}
+
+pub fn decode_doc_get_rev_response(p: &[u8]) -> DocResult<(Vec<u8>, u64)> {
+    let mut r = Reader::new(p);
+    let body = r.lp()?.to_vec();
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(r.take(8)?);
+    Ok((body, u64::from_be_bytes(buf)))
+}
+
+// ---- DocPutIfMatch: [collection][doc_id][body][flags][if_match u64][optional expires_at] ----
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocPutIfMatchPayload {
+    pub collection: String,
+    pub doc_id: Vec<u8>,
+    pub body: Vec<u8>,
+    pub relaxed: bool,
+    pub if_match: u64,
+    pub expires_at: u64,
+}
+
+impl DocPutIfMatchPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_lp(&mut out, self.collection.as_bytes());
+        put_lp(&mut out, &self.doc_id);
+        put_lp(&mut out, &self.body);
+        out.push(if self.relaxed { FLAG_RELAXED } else { 0 });
+        out.extend_from_slice(&self.if_match.to_be_bytes());
+        if self.expires_at != 0 {
+            out.extend_from_slice(&self.expires_at.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(p: &[u8]) -> DocResult<DocPutIfMatchPayload> {
+        let mut r = Reader::new(p);
+        let collection = r.lp_string()?;
+        let doc_id = r.lp()?.to_vec();
+        let body = r.lp()?.to_vec();
+        let relaxed = r.u8()? & FLAG_RELAXED != 0;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(r.take(8)?);
+        let if_match = u64::from_be_bytes(buf);
+        let expires_at = if r.remaining() >= 8 {
+            buf.copy_from_slice(r.take(8)?);
+            u64::from_be_bytes(buf)
+        } else {
+            0
+        };
+        Ok(DocPutIfMatchPayload {
+            collection,
+            doc_id,
+            body,
+            relaxed,
+            if_match,
+            expires_at,
+        })
+    }
+}
+
+// ---- DocUpdateIfMatch: [collection][doc_id][update][flags][if_match u64] ----
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocUpdateIfMatchPayload {
+    pub collection: String,
+    pub doc_id: Vec<u8>,
+    pub update: Vec<u8>,
+    pub relaxed: bool,
+    pub if_match: u64,
+}
+
+impl DocUpdateIfMatchPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_lp(&mut out, self.collection.as_bytes());
+        put_lp(&mut out, &self.doc_id);
+        put_lp(&mut out, &self.update);
+        out.push(if self.relaxed { FLAG_RELAXED } else { 0 });
+        out.extend_from_slice(&self.if_match.to_be_bytes());
+        out
+    }
+
+    pub fn decode(p: &[u8]) -> DocResult<DocUpdateIfMatchPayload> {
+        let mut r = Reader::new(p);
+        let collection = r.lp_string()?;
+        let doc_id = r.lp()?.to_vec();
+        let update = r.lp()?.to_vec();
+        let relaxed = r.u8()? & FLAG_RELAXED != 0;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(r.take(8)?);
+        let if_match = u64::from_be_bytes(buf);
+        Ok(DocUpdateIfMatchPayload {
+            collection,
+            doc_id,
+            update,
+            relaxed,
+            if_match,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -768,10 +933,12 @@ mod tests {
                 crate::query::QueryRow {
                     doc_id: b"u1".to_vec(),
                     body: Some(b"{}".to_vec()),
+                    revision: None,
                 },
                 crate::query::QueryRow {
                     doc_id: b"u2".to_vec(),
                     body: None,
+                    revision: None,
                 },
             ],
             next_cursor: Some(b"cursor-bytes".to_vec()),
@@ -783,5 +950,41 @@ mod tests {
         assert_eq!(rows[1].doc_id, b"u2");
         assert_eq!(rows[1].body, b"");
         assert_eq!(cursor, Some(b"cursor-bytes".to_vec()));
+
+        let with_rev = QueryPage {
+            rows: vec![crate::query::QueryRow {
+                doc_id: b"u1".to_vec(),
+                body: Some(b"{}".to_vec()),
+                revision: Some(42),
+            }],
+            next_cursor: None,
+        };
+        let (rows, _) =
+            decode_query_page_with_revision(&encode_query_page_with_revision(&with_rev)).unwrap();
+        assert_eq!(rows[0].revision, Some(42));
+
+        let put = DocPutIfMatchPayload {
+            collection: "users".into(),
+            doc_id: b"u1".to_vec(),
+            body: br#"{"age":30}"#.to_vec(),
+            relaxed: false,
+            if_match: 7,
+            expires_at: 0,
+        };
+        assert_eq!(DocPutIfMatchPayload::decode(&put.encode()).unwrap(), put);
+
+        let upd = DocUpdateIfMatchPayload {
+            collection: "users".into(),
+            doc_id: b"u1".to_vec(),
+            update: br#"{"$inc":{"age":1}}"#.to_vec(),
+            relaxed: true,
+            if_match: 9,
+        };
+        assert_eq!(DocUpdateIfMatchPayload::decode(&upd.encode()).unwrap(), upd);
+
+        let (body, rev) =
+            decode_doc_get_rev_response(&encode_doc_get_rev_response(br#"{"a":1}"#, 11)).unwrap();
+        assert_eq!(body, br#"{"a":1}"#);
+        assert_eq!(rev, 11);
     }
 }

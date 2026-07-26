@@ -284,6 +284,38 @@ pub fn apply_to_id(
     }
 }
 
+/// Conditional by-id update: require `if_match` to equal the current revision,
+/// apply `update`, and return the newly committed revision. Missing or stale
+/// revisions return [`DocError::StaleRevision`].
+pub fn apply_to_id_if_match(
+    engine: &mut Engine,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+    update: &UpdateDoc,
+    if_match: u64,
+) -> DocResult<u64> {
+    store::check_if_match(engine, catalog, prefix, collection, doc_id, if_match)?;
+    match updated_body(engine, catalog, prefix, collection, doc_id, update, None)? {
+        Some((bytes, old)) => {
+            let ops = store::upsert_ops_with_old(
+                engine,
+                catalog,
+                prefix,
+                collection,
+                doc_id,
+                &bytes,
+                true,
+                0,
+                Some(&old),
+            )?;
+            Ok(engine.write_batch(ops)?)
+        }
+        None => Err(DocError::StaleRevision),
+    }
+}
+
 /// Apply `update` to many documents. With no unique index on the collection and
 /// a combined op count within one batch, the whole set is updated atomically
 /// (isolated from concurrent readers). When a unique index is present, updates

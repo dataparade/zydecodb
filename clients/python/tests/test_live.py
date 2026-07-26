@@ -118,3 +118,23 @@ def test_upsert_set_on_insert(coll):
     assert doc["n"] == 2
     assert doc["created"] is True
     assert "extra" not in doc
+
+
+def test_optimistic_concurrency(coll):
+    from zydecodb.errors import ConflictError
+
+    doc_id = coll.insert_one({"n": 1})
+    got = coll.get_with_revision(doc_id)
+    assert got is not None
+    doc, rev = got
+    assert doc["n"] == 1
+    assert rev > 0
+    new_rev = coll.replace_one_if_match(doc_id, {"n": 2}, if_match=rev)
+    assert new_rev > rev
+    try:
+        coll.replace_one_if_match(doc_id, {"n": 3}, if_match=rev)
+        assert False, "expected ConflictError"
+    except ConflictError:
+        pass
+    after = coll.update_by_id_if_match(doc_id, {"$inc": {"n": 1}}, if_match=new_rev)
+    assert after > new_rev

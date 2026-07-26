@@ -1,7 +1,11 @@
 name: Release
 
-# Cut a release by pushing a version tag, e.g.:
-#   git tag v0.9.0-beta.1 && git push origin v0.9.0-beta.1
+# Cut a release by pushing BOTH the root tag and the Go submodule tag at the
+# same commit (see docs/RELEASES.md), e.g.:
+#   ver=0.9.0
+#   git tag "v${ver}"
+#   git tag "clients/go/v${ver}" "$(git rev-parse "v${ver}^{commit}")"
+#   git push origin "v${ver}" "clients/go/v${ver}"
 # Tags containing a hyphen (e.g. -beta.1, -rc.1) are published as pre-releases.
 # ZydecoDB is Unix-only (the engine uses unix file APIs), so there is no Windows
 # target by design.
@@ -19,6 +23,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify Go submodule tag exists at this commit
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          go_tag="clients/go/v${ver}"
+          if ! git rev-parse "refs/tags/${go_tag}" >/dev/null 2>&1; then
+            echo "missing Go module tag ${go_tag} — create it at the same commit as ${tag}"
+            echo "see docs/RELEASES.md"
+            exit 1
+          fi
+          root_commit="$(git rev-parse "${tag}^{commit}")"
+          go_commit="$(git rev-parse "${go_tag}^{commit}")"
+          if [ "$root_commit" != "$go_commit" ]; then
+            echo "${go_tag} (${go_commit}) != ${tag} (${root_commit})"
+            exit 1
+          fi
+          test -f clients/go/go.mod
+          grep -q '^module github.com/dataparade/zydecodb/clients/go$' clients/go/go.mod
       - name: Create (pre)release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -152,3 +176,23 @@ jobs:
               ""|*-*) npm dist-tag add "zydecodb@${ver}" latest ;;
             esac
           fi
+
+  # Resolve the nested Go module tag with GOPROXY=direct so a forgotten or
+  # mismatched clients/go/v* tag fails the release before consumers notice.
+  verify-go-module:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Resolve tagged module version
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          tmp="$(mktemp -d)"
+          cd "$tmp"
+          go mod init verify
+          GOPROXY=direct go get "github.com/dataparade/zydecodb/clients/go@v${ver}"
+          go list -m -json github.com/dataparade/zydecodb/clients/go | tee /tmp/go-mod.json
+          grep -q "\"Version\": \"v${ver}\"" /tmp/go-mod.json
+          ! grep -q 'v0\.0\.0-' go.mod

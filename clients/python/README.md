@@ -56,6 +56,23 @@ with Client("127.0.0.1", 9470, api_key="YOUR_KEY") as db:
 - **Raw KV with TTL.** Side-channel `put` (with `expires_at`), `get`, and `delete` methods on `Client` for session data that needs a time-to-live.
 - **TLS.** Pass `tls=True` for system CA defaults, or an `ssl.SSLContext` for custom roots / verification.
 
+## Optimistic concurrency
+
+```python
+got = users.get_with_revision(uid)
+doc, rev = got
+doc["age"] += 1
+try:
+    users.replace_one_if_match(uid, doc, if_match=rev)
+except ConflictError:
+    pass  # re-read and retry, or merge
+```
+
+Also: `find_with_revision`, `update_by_id_if_match`. Revisions are opaque
+integers. Stale/missing documents raise `ConflictError`. Against an older
+server these methods fail with a protocol error instead of silently becoming
+unconditional writes.
+
 ## Durability
 
 Writes are durable (fsync-on-commit) by default. For latency-sensitive,

@@ -63,7 +63,7 @@ def _encode_request(kind: str, inp: dict) -> bytes:
             lo=_json_field(inp["lo_json"]), hi=_json_field(inp["hi_json"]),
             page_size=inp["limit"], cursor=bytes.fromhex(inp["cursor_hex"]),
         )
-    if kind == "Find":
+    if kind in ("Find", "FindRev"):
         proj = inp["projection"]
         mode = {"none": None, "include": proto.PROJ_INCLUDE, "exclude": proto.PROJ_EXCLUDE}[proj["mode"]]
         projection = None if mode is None else (mode, proj["fields"])
@@ -71,6 +71,25 @@ def _encode_request(kind: str, inp: dict) -> bytes:
             inp["collection"], _json_field(inp["filter_json"]),
             [tuple(s) for s in inp["sort"]], projection,
             inp["skip"], inp["limit"], bytes.fromhex(inp["cursor_hex"]),
+        )
+    if kind == "DocGetRev":
+        return proto.encode_query_by_id(inp["collection"], inp["doc_id"])
+    if kind == "DocPutIfMatch":
+        return proto.encode_doc_put_if_match(
+            inp["collection"],
+            inp["doc_id"],
+            _json_field(inp["body_json"]),
+            relaxed=inp["relaxed"],
+            if_match=inp["if_match"],
+            expires_at=inp.get("expires_at", 0),
+        )
+    if kind == "DocUpdateIfMatch":
+        return proto.encode_doc_update_if_match(
+            inp["collection"],
+            inp["doc_id"],
+            _json_field(inp["update_json"]),
+            relaxed=inp["relaxed"],
+            if_match=inp["if_match"],
         )
     if kind == "Update":
         return proto.encode_update(
@@ -106,18 +125,38 @@ def test_request_payload_matches(vec):
 
 @pytest.mark.parametrize("vec", VECTORS["responses"], ids=lambda v: v["name"])
 def test_response_decode_matches(vec):
-    assert vec["kind"] == "QueryPage"
-    rows, cursor = proto.decode_page(bytes.fromhex(vec["bytes_hex"]))
-    expected_rows = vec["decoded"]["rows"]
-    assert len(rows) == len(expected_rows), vec["name"]
-    for (doc_id, body), exp in zip(rows, expected_rows):
-        assert doc_id.decode("utf-8") == exp["doc_id"]
-        assert body.decode("utf-8") == exp["body_json"]
-    expected_cursor = vec["decoded"]["next_cursor_hex"]
-    if expected_cursor is None:
+    kind = vec["kind"]
+    if kind == "QueryPage":
+        rows, cursor = proto.decode_page(bytes.fromhex(vec["bytes_hex"]))
+        expected_rows = vec["decoded"]["rows"]
+        assert len(rows) == len(expected_rows), vec["name"]
+        for (doc_id, body), exp in zip(rows, expected_rows):
+            assert doc_id.decode("utf-8") == exp["doc_id"]
+            assert body.decode("utf-8") == exp["body_json"]
+        expected_cursor = vec["decoded"]["next_cursor_hex"]
+        if expected_cursor is None:
+            assert cursor == b""
+        else:
+            assert cursor.hex() == expected_cursor
+        return
+    if kind == "QueryPageRev":
+        rows, cursor = proto.decode_page_with_revision(
+            bytes.fromhex(vec["bytes_hex"]), with_revision=True
+        )
+        expected_rows = vec["decoded"]["rows"]
+        assert len(rows) == len(expected_rows), vec["name"]
+        for (doc_id, body, rev), exp in zip(rows, expected_rows):
+            assert doc_id.decode("utf-8") == exp["doc_id"]
+            assert body.decode("utf-8") == exp["body_json"]
+            assert rev == exp["revision"]
         assert cursor == b""
-    else:
-        assert cursor.hex() == expected_cursor
+        return
+    if kind == "DocGetRevResponse":
+        body, rev = proto.decode_doc_get_rev_response(bytes.fromhex(vec["bytes_hex"]))
+        assert body.decode("utf-8") == vec["decoded"]["body_json"]
+        assert rev == vec["decoded"]["revision"]
+        return
+    raise AssertionError(f"unhandled response kind: {kind}")
 
 
 def test_command_codes_match_vectors():
@@ -127,6 +166,10 @@ def test_command_codes_match_vectors():
     assert proto.CMD_UPDATE == cmds["Update"]
     assert proto.CMD_DELETE == cmds["Delete"]
     assert proto.CMD_COUNT == cmds["Count"]
+    assert proto.CMD_DOC_GET_REV == cmds["DocGetRev"]
+    assert proto.CMD_FIND_REV == cmds["FindRev"]
+    assert proto.CMD_DOC_PUT_IF_MATCH == cmds["DocPutIfMatch"]
+    assert proto.CMD_DOC_UPDATE_IF_MATCH == cmds["DocUpdateIfMatch"]
     assert proto.CMD_INDEX_DEF == cmds["IndexDef"]
     assert proto.CMD_SESSION_INIT == cmds["SessionInit"]
 

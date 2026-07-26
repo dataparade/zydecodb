@@ -669,3 +669,96 @@ fn concurrent_connection_progresses_during_queries() {
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();
 }
+
+#[test]
+fn optimistic_concurrency_if_match_over_wire() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    doc_put(&mut s, "users", b"u1", r#"{"n":1}"#);
+
+    let get = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(Command::DocGetRev, wire::encode_doc_get_rev("users", b"u1")),
+    );
+    assert_eq!(get.status, Status::Ok);
+    let (body, rev) = wire::decode_doc_get_rev_response(&get.payload).unwrap();
+    assert!(body.contains(&b'"') || !body.is_empty());
+    assert!(rev > 0);
+
+    let ok = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(
+            Command::DocPutIfMatch,
+            wire::DocPutIfMatchPayload {
+                collection: "users".into(),
+                doc_id: b"u1".to_vec(),
+                body: br#"{"n":2}"#.to_vec(),
+                relaxed: false,
+                if_match: rev,
+                expires_at: 0,
+            }
+            .encode(),
+        ),
+    );
+    assert_eq!(ok.status, Status::Ok);
+    let new_rev = u64::from_be_bytes(ok.payload[..8].try_into().unwrap());
+    assert!(new_rev > rev);
+
+    let stale = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(
+            Command::DocPutIfMatch,
+            wire::DocPutIfMatchPayload {
+                collection: "users".into(),
+                doc_id: b"u1".to_vec(),
+                body: br#"{"n":3}"#.to_vec(),
+                relaxed: false,
+                if_match: rev,
+                expires_at: 0,
+            }
+            .encode(),
+        ),
+    );
+    assert_eq!(stale.status, Status::Conflict);
+
+    let upd = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(
+            Command::DocUpdateIfMatch,
+            wire::DocUpdateIfMatchPayload {
+                collection: "users".into(),
+                doc_id: b"u1".to_vec(),
+                update: br#"{"$inc":{"n":1}}"#.to_vec(),
+                relaxed: false,
+                if_match: new_rev,
+            }
+            .encode(),
+        ),
+    );
+    assert_eq!(upd.status, Status::Ok);
+
+    let find = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(
+            Command::FindRev,
+            wire::FindPayload {
+                collection: "users".into(),
+                filter: br#"{"_id":"u1"}"#.to_vec(),
+                sort: vec![],
+                projection: wire::WireProjection::None,
+                skip: 0,
+                limit: 10,
+                cursor: vec![],
+            }
+            .encode(),
+        ),
+    );
+    assert_eq!(find.status, Status::Ok);
+    let (rows, _) = wire::decode_query_page_with_revision(&find.payload).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].revision.unwrap() > new_rev);
+
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}

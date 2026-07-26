@@ -904,6 +904,8 @@ fn is_write_command(cmd: Command) -> bool {
             | Command::DocDel
             | Command::Update
             | Command::Delete
+            | Command::DocPutIfMatch
+            | Command::DocUpdateIfMatch
             | Command::IndexDef
             | Command::AdminDropTenant
     )

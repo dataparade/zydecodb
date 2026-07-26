@@ -21,20 +21,24 @@ const HeaderLen = 6
 
 // Command codes (envelope byte 1).
 const (
-	CmdPut         byte = 0x01
-	CmdGet         byte = 0x02
-	CmdDel         byte = 0x03
-	CmdQuery       byte = 0x20
-	CmdDocPut      byte = 0x21
-	CmdDocDel      byte = 0x22
-	CmdFind        byte = 0x23
-	CmdUpdate      byte = 0x24
-	CmdDelete      byte = 0x25
-	CmdCount       byte = 0x26
-	CmdIndexDef    byte = 0x30
-	CmdSessionInit byte = 0x40
-	CmdPing        byte = 0xF0
-	CmdStats       byte = 0xF1
+	CmdPut              byte = 0x01
+	CmdGet              byte = 0x02
+	CmdDel              byte = 0x03
+	CmdQuery            byte = 0x20
+	CmdDocPut           byte = 0x21
+	CmdDocDel           byte = 0x22
+	CmdFind             byte = 0x23
+	CmdUpdate           byte = 0x24
+	CmdDelete           byte = 0x25
+	CmdCount            byte = 0x26
+	CmdDocGetRev        byte = 0x27
+	CmdFindRev          byte = 0x28
+	CmdDocPutIfMatch    byte = 0x29
+	CmdDocUpdateIfMatch byte = 0x2A
+	CmdIndexDef         byte = 0x30
+	CmdSessionInit      byte = 0x40
+	CmdPing             byte = 0xF0
+	CmdStats            byte = 0xF1
 )
 
 // Query / count sub-command discriminators (first payload byte).
@@ -171,6 +175,39 @@ func EncodeDocPut(collection string, docID, body []byte, relaxed bool, expiresAt
 		binary.BigEndian.PutUint64(e[:], expiresAt)
 		buf.Write(e[:])
 	}
+	return buf.Bytes()
+}
+
+// EncodeDocPutIfMatch builds a conditional replace payload:
+// [collection][doc_id][body][flags][if_match u64][optional expires_at].
+func EncodeDocPutIfMatch(collection string, docID, body []byte, relaxed bool, ifMatch, expiresAt uint64) []byte {
+	var buf bytes.Buffer
+	putLP(&buf, []byte(collection))
+	putLP(&buf, docID)
+	putLP(&buf, body)
+	buf.WriteByte(relaxedByte(relaxed))
+	var m [8]byte
+	binary.BigEndian.PutUint64(m[:], ifMatch)
+	buf.Write(m[:])
+	if expiresAt != 0 {
+		var e [8]byte
+		binary.BigEndian.PutUint64(e[:], expiresAt)
+		buf.Write(e[:])
+	}
+	return buf.Bytes()
+}
+
+// EncodeDocUpdateIfMatch builds a conditional by-id update payload:
+// [collection][doc_id][update][flags][if_match u64].
+func EncodeDocUpdateIfMatch(collection string, docID, update []byte, relaxed bool, ifMatch uint64) []byte {
+	var buf bytes.Buffer
+	putLP(&buf, []byte(collection))
+	putLP(&buf, docID)
+	putLP(&buf, update)
+	buf.WriteByte(relaxedByte(relaxed))
+	var m [8]byte
+	binary.BigEndian.PutUint64(m[:], ifMatch)
+	buf.Write(m[:])
 	return buf.Bytes()
 }
 
@@ -339,13 +376,23 @@ func EncodeDistinct(collection string, filter []byte, field string) []byte {
 
 // Row is one decoded row from a query/find response page.
 type Row struct {
-	DocID []byte
-	Body  []byte
+	DocID    []byte
+	Body     []byte
+	Revision uint64 // set only by DecodePageWithRevision
 }
 
 // DecodePage decodes a response page: [row_count u32]{[doc_id][body]}[cursor].
 // An empty next cursor (returned as nil) means there are no more pages.
 func DecodePage(buf []byte) (rows []Row, cursor []byte, err error) {
+	return decodePageInner(buf, false)
+}
+
+// DecodePageWithRevision decodes a FindRev page (each row ends with u64 revision).
+func DecodePageWithRevision(buf []byte) (rows []Row, cursor []byte, err error) {
+	return decodePageInner(buf, true)
+}
+
+func decodePageInner(buf []byte, withRevision bool) (rows []Row, cursor []byte, err error) {
 	r := &reader{buf: buf}
 	count, err := r.u32()
 	if err != nil {
@@ -361,7 +408,15 @@ func DecodePage(buf []byte) (rows []Row, cursor []byte, err error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		rows = append(rows, Row{DocID: docID, Body: body})
+		var rev uint64
+		if withRevision {
+			rb, err := r.take(8)
+			if err != nil {
+				return nil, nil, err
+			}
+			rev = binary.BigEndian.Uint64(rb)
+		}
+		rows = append(rows, Row{DocID: docID, Body: body, Revision: rev})
 	}
 	cur, err := r.lp()
 	if err != nil {
@@ -371,6 +426,20 @@ func DecodePage(buf []byte) (rows []Row, cursor []byte, err error) {
 		cur = nil
 	}
 	return rows, cur, nil
+}
+
+// DecodeDocGetRevResponse decodes [body lp][revision u64 BE].
+func DecodeDocGetRevResponse(buf []byte) (body []byte, revision uint64, err error) {
+	r := &reader{buf: buf}
+	body, err = r.lp()
+	if err != nil {
+		return nil, 0, err
+	}
+	rb, err := r.take(8)
+	if err != nil {
+		return nil, 0, err
+	}
+	return body, binary.BigEndian.Uint64(rb), nil
 }
 
 type reader struct {

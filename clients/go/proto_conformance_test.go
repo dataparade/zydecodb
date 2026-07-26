@@ -35,10 +35,13 @@ type respVector struct {
 	BytesHex string `json:"bytes_hex"`
 	Decoded  struct {
 		Rows []struct {
-			DocID    string `json:"doc_id"`
-			BodyJSON string `json:"body_json"`
+			DocID    string  `json:"doc_id"`
+			BodyJSON string  `json:"body_json"`
+			Revision *uint64 `json:"revision"`
 		} `json:"rows"`
 		NextCursorHex *string `json:"next_cursor_hex"`
+		BodyJSON      string  `json:"body_json"`
+		Revision      *uint64 `json:"revision"`
 	} `json:"decoded"`
 }
 
@@ -142,7 +145,7 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 		}
 		mustInput(t, v.Input, &in)
 		return EncodeQueryIndexRange(in.Collection, in.IndexName, optBytes(in.LoJSON), optBytes(in.HiJSON), mustHex(t, in.CursorHex), in.Limit)
-	case "Find":
+	case "Find", "FindRev":
 		var in struct {
 			Collection string  `json:"collection"`
 			FilterJSON string  `json:"filter_json"`
@@ -170,6 +173,34 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 			proj = Projection{Mode: ProjExclude, Fields: in.Projection.Fields}
 		}
 		return EncodeFind(in.Collection, optBytes(in.FilterJSON), sort, proj, in.Skip, in.Limit, mustHex(t, in.CursorHex))
+	case "DocGetRev":
+		var in struct {
+			Collection string `json:"collection"`
+			DocID      string `json:"doc_id"`
+		}
+		mustInput(t, v.Input, &in)
+		return EncodeQueryByID(in.Collection, []byte(in.DocID))
+	case "DocPutIfMatch":
+		var in struct {
+			Collection string `json:"collection"`
+			DocID      string `json:"doc_id"`
+			BodyJSON   string `json:"body_json"`
+			Relaxed    bool   `json:"relaxed"`
+			IfMatch    uint64 `json:"if_match"`
+			ExpiresAt  uint64 `json:"expires_at"`
+		}
+		mustInput(t, v.Input, &in)
+		return EncodeDocPutIfMatch(in.Collection, []byte(in.DocID), optBytes(in.BodyJSON), in.Relaxed, in.IfMatch, in.ExpiresAt)
+	case "DocUpdateIfMatch":
+		var in struct {
+			Collection string `json:"collection"`
+			DocID      string `json:"doc_id"`
+			UpdateJSON string `json:"update_json"`
+			Relaxed    bool   `json:"relaxed"`
+			IfMatch    uint64 `json:"if_match"`
+		}
+		mustInput(t, v.Input, &in)
+		return EncodeDocUpdateIfMatch(in.Collection, []byte(in.DocID), optBytes(in.UpdateJSON), in.Relaxed, in.IfMatch)
 	case "Update":
 		var in struct {
 			Collection string `json:"collection"`
@@ -249,30 +280,65 @@ func TestResponseVectors(t *testing.T) {
 	vf := loadVectors(t)
 	for _, v := range vf.Responses {
 		t.Run(v.Name, func(t *testing.T) {
-			if v.Kind != "QueryPage" {
-				t.Fatalf("unhandled response kind: %s", v.Kind)
-			}
-			rows, cursor, err := DecodePage(mustHex(t, v.BytesHex))
-			if err != nil {
-				t.Fatalf("decode page: %v", err)
-			}
-			if len(rows) != len(v.Decoded.Rows) {
-				t.Fatalf("row count: got %d want %d", len(rows), len(v.Decoded.Rows))
-			}
-			for i, exp := range v.Decoded.Rows {
-				if string(rows[i].DocID) != exp.DocID {
-					t.Errorf("row %d doc_id: got %q want %q", i, rows[i].DocID, exp.DocID)
+			switch v.Kind {
+			case "QueryPage":
+				rows, cursor, err := DecodePage(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode page: %v", err)
 				}
-				if string(rows[i].Body) != exp.BodyJSON {
-					t.Errorf("row %d body: got %q want %q", i, rows[i].Body, exp.BodyJSON)
+				if len(rows) != len(v.Decoded.Rows) {
+					t.Fatalf("row count: got %d want %d", len(rows), len(v.Decoded.Rows))
 				}
-			}
-			if v.Decoded.NextCursorHex == nil {
+				for i, exp := range v.Decoded.Rows {
+					if string(rows[i].DocID) != exp.DocID {
+						t.Errorf("row %d doc_id: got %q want %q", i, rows[i].DocID, exp.DocID)
+					}
+					if string(rows[i].Body) != exp.BodyJSON {
+						t.Errorf("row %d body: got %q want %q", i, rows[i].Body, exp.BodyJSON)
+					}
+				}
+				if v.Decoded.NextCursorHex == nil {
+					if cursor != nil {
+						t.Errorf("expected nil cursor, got %x", cursor)
+					}
+				} else if got := hex.EncodeToString(cursor); got != *v.Decoded.NextCursorHex {
+					t.Errorf("cursor: got %s want %s", got, *v.Decoded.NextCursorHex)
+				}
+			case "QueryPageRev":
+				rows, cursor, err := DecodePageWithRevision(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode page: %v", err)
+				}
+				if len(rows) != len(v.Decoded.Rows) {
+					t.Fatalf("row count: got %d want %d", len(rows), len(v.Decoded.Rows))
+				}
+				for i, exp := range v.Decoded.Rows {
+					if string(rows[i].DocID) != exp.DocID {
+						t.Errorf("row %d doc_id: got %q want %q", i, rows[i].DocID, exp.DocID)
+					}
+					if string(rows[i].Body) != exp.BodyJSON {
+						t.Errorf("row %d body: got %q want %q", i, rows[i].Body, exp.BodyJSON)
+					}
+					if exp.Revision == nil || rows[i].Revision != *exp.Revision {
+						t.Errorf("row %d revision: got %d want %v", i, rows[i].Revision, exp.Revision)
+					}
+				}
 				if cursor != nil {
 					t.Errorf("expected nil cursor, got %x", cursor)
 				}
-			} else if got := hex.EncodeToString(cursor); got != *v.Decoded.NextCursorHex {
-				t.Errorf("cursor: got %s want %s", got, *v.Decoded.NextCursorHex)
+			case "DocGetRevResponse":
+				body, rev, err := DecodeDocGetRevResponse(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if string(body) != v.Decoded.BodyJSON {
+					t.Errorf("body: got %q want %q", body, v.Decoded.BodyJSON)
+				}
+				if v.Decoded.Revision == nil || rev != *v.Decoded.Revision {
+					t.Errorf("revision: got %d want %v", rev, v.Decoded.Revision)
+				}
+			default:
+				t.Fatalf("unhandled response kind: %s", v.Kind)
 			}
 		})
 	}
@@ -281,13 +347,17 @@ func TestResponseVectors(t *testing.T) {
 func TestCommandAndStatusCodes(t *testing.T) {
 	vf := loadVectors(t)
 	checks := map[string]byte{
-		"DocPut":      CmdDocPut,
-		"Find":        CmdFind,
-		"Update":      CmdUpdate,
-		"Delete":      CmdDelete,
-		"Count":       CmdCount,
-		"IndexDef":    CmdIndexDef,
-		"SessionInit": CmdSessionInit,
+		"DocPut":           CmdDocPut,
+		"Find":             CmdFind,
+		"Update":           CmdUpdate,
+		"Delete":           CmdDelete,
+		"Count":            CmdCount,
+		"DocGetRev":        CmdDocGetRev,
+		"FindRev":          CmdFindRev,
+		"DocPutIfMatch":    CmdDocPutIfMatch,
+		"DocUpdateIfMatch": CmdDocUpdateIfMatch,
+		"IndexDef":         CmdIndexDef,
+		"SessionInit":      CmdSessionInit,
 	}
 	for name, want := range checks {
 		if vf.Commands[name] != want {

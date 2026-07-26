@@ -6,12 +6,16 @@ import { ConnectionError, fromStatus, ServerBusyError, ZydecoError } from "./err
 import { ConnectionPool } from "./pool.ts";
 import {
   Cmd,
+  decodeDocGetRevResponse,
   decodePage,
+  decodePageWithRevision,
   encodeCount,
   encodeDelete,
   encodeDistinct,
   encodeDocDel,
   encodeDocPut,
+  encodeDocPutIfMatch,
+  encodeDocUpdateIfMatch,
   encodeFind,
   encodeIndexDef,
   encodeQueryById,
@@ -234,8 +238,91 @@ export class Client {
     );
   }
 
+  /** Fetch one document and its opaque revision, or null if absent. */
+  async getDocumentWithRevision(
+    collection: string,
+    docId: string,
+  ): Promise<{ body: Buffer; revision: bigint } | null> {
+    const out = await this.execute(
+      Cmd.DocGetRev,
+      encodeQueryById(collection, Buffer.from(docId, "utf8")),
+      "DocGetRev",
+      { retryable: true, notFoundNull: true },
+    );
+    if (out === null) return null;
+    return decodeDocGetRevResponse(out);
+  }
+
+  /** Conditional replace; stale/missing revision → Conflict. Returns new revision. */
+  async putDocumentIfMatch(
+    collection: string,
+    docId: string,
+    body: Buffer,
+    relaxed: boolean,
+    ifMatch: bigint | number,
+    expiresAt: number | bigint = 0,
+  ): Promise<bigint> {
+    const out = await this.execute(
+      Cmd.DocPutIfMatch,
+      encodeDocPutIfMatch(
+        collection,
+        Buffer.from(docId, "utf8"),
+        body,
+        relaxed,
+        ifMatch,
+        expiresAt,
+      ),
+      "DocPutIfMatch",
+      { retryable: false },
+    );
+    return decodeU64(out, "DocPutIfMatch");
+  }
+
+  /** Conditional by-id update; returns the new revision. */
+  async updateDocumentIfMatch(
+    collection: string,
+    docId: string,
+    update: Buffer,
+    relaxed: boolean,
+    ifMatch: bigint | number,
+  ): Promise<bigint> {
+    const out = await this.execute(
+      Cmd.DocUpdateIfMatch,
+      encodeDocUpdateIfMatch(
+        collection,
+        Buffer.from(docId, "utf8"),
+        update,
+        relaxed,
+        ifMatch,
+      ),
+      "DocUpdateIfMatch",
+      { retryable: false },
+    );
+    return decodeU64(out, "DocUpdateIfMatch");
+  }
+
   /** Returns the raw JSON bodies of matching documents, auto-paginating. */
   async find(collection: string, filter: Buffer, opts: FindOptions = {}): Promise<Buffer[]> {
+    const rows = await this.findRows(collection, filter, opts, false);
+    return rows.map((r) => r.body);
+  }
+
+  /** Like find, but each row includes its opaque revision (bigint). */
+  async findWithRevision(
+    collection: string,
+    filter: Buffer,
+    opts: FindOptions = {},
+  ): Promise<{ body: Buffer; revision: bigint }[]> {
+    const rows = await this.findRows(collection, filter, opts, true);
+    return rows.map((r) => ({ body: r.body, revision: r.revision! }));
+  }
+
+  private async findRows(
+    collection: string,
+    filter: Buffer,
+    opts: FindOptions,
+    withRev: boolean,
+  ): Promise<{ body: Buffer; revision?: bigint }[]> {
     const pageSize = opts.pageSize && opts.pageSize > 0 ? opts.pageSize : 100;
     const limit = opts.limit ?? 0;
     const projection = opts.projection ?? { mode: Proj.None, fields: [] };
@@ -243,7 +330,9 @@ export class Client {
     let skip = opts.skip ?? 0;
     let cursor: Buffer = Buffer.alloc(0);
     let yielded = 0;
-    const results: Buffer[] = [];
+    const results: { body: Buffer; revision?: bigint }[] = [];
+    const cmd = withRev ? Cmd.FindRev : Cmd.Find;
+    const op = withRev ? "FindRev" : "Find";
 
     for (;;) {
       let want = pageSize;
@@ -253,11 +342,11 @@ export class Client {
         want = Math.min(want, remaining);
       }
       const payload = encodeFind(collection, filter, sort, projection, skip, want, cursor);
-      const body = await this.execute(Cmd.Find, payload, "Find", { retryable: true });
-      const page = decodePage(body!);
+      const body = await this.execute(cmd, payload, op, { retryable: true });
+      const page = withRev ? decodePageWithRevision(body!) : decodePage(body!);
       skip = 0; // applied on the first page; the cursor carries it onward
       for (const row of page.rows) {
-        results.push(row.body);
+        results.push({ body: row.body, revision: row.revision });
         yielded++;
         if (limit !== 0 && yielded >= limit) return results;
       }

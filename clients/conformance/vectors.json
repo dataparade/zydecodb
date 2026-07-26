@@ -5,8 +5,12 @@
     "Del": 3,
     "Delete": 37,
     "DocDel": 34,
+    "DocGetRev": 39,
     "DocPut": 33,
+    "DocPutIfMatch": 41,
+    "DocUpdateIfMatch": 42,
     "Find": 35,
+    "FindRev": 40,
     "Get": 2,
     "IndexDef": 48,
     "Ping": 240,
@@ -370,6 +374,69 @@
       "payload_hex": "01000000057573657273000000000000000463697479"
     },
     {
+      "command": 39,
+      "envelope_hex": "01270000001000000000057573657273000000027531",
+      "input": {
+        "collection": "users",
+        "doc_id": "u1"
+      },
+      "kind": "DocGetRev",
+      "name": "doc_get_rev",
+      "payload_hex": "00000000057573657273000000027531"
+    },
+    {
+      "command": 40,
+      "envelope_hex": "012800000039000000057573657273000000137b22616765223a7b2224677465223a31387d7d00000001000000036167650100000000000000003200000000",
+      "input": {
+        "collection": "users",
+        "cursor_hex": "",
+        "filter_json": "{\"age\":{\"$gte\":18}}",
+        "limit": 50,
+        "projection": {
+          "fields": [],
+          "mode": "none"
+        },
+        "skip": 0,
+        "sort": [
+          [
+            "age",
+            true
+          ]
+        ]
+      },
+      "kind": "FindRev",
+      "name": "find_rev_basic",
+      "payload_hex": "000000057573657273000000137b22616765223a7b2224677465223a31387d7d00000001000000036167650100000000000000003200000000"
+    },
+    {
+      "command": 41,
+      "envelope_hex": "0129000000260000000575736572730000000275310000000a7b22616765223a33317d000000000000000007",
+      "input": {
+        "body_json": "{\"age\":31}",
+        "collection": "users",
+        "doc_id": "u1",
+        "if_match": 7,
+        "relaxed": false
+      },
+      "kind": "DocPutIfMatch",
+      "name": "doc_put_if_match",
+      "payload_hex": "0000000575736572730000000275310000000a7b22616765223a33317d000000000000000007"
+    },
+    {
+      "command": 42,
+      "envelope_hex": "012a0000002e000000057573657273000000027531000000127b2224696e63223a7b22616765223a317d7d000000000000000007",
+      "input": {
+        "collection": "users",
+        "doc_id": "u1",
+        "if_match": 7,
+        "relaxed": false,
+        "update_json": "{\"$inc\":{\"age\":1}}"
+      },
+      "kind": "DocUpdateIfMatch",
+      "name": "doc_update_if_match",
+      "payload_hex": "000000057573657273000000027531000000127b2224696e63223a7b22616765223a317d7d000000000000000007"
+    },
+    {
       "command": 64,
       "envelope_hex": "01400000000b7a646b5f6578616d706c65",
       "input": {
@@ -429,6 +496,30 @@
       },
       "kind": "QueryPage",
       "name": "query_page_row_without_body"
+    },
+    {
+      "bytes_hex": "000000010000000275310000000c7b225f6964223a227531227d000000000000002a00000000",
+      "decoded": {
+        "next_cursor_hex": null,
+        "rows": [
+          {
+            "body_json": "{\"_id\":\"u1\"}",
+            "doc_id": "u1",
+            "revision": 42
+          }
+        ]
+      },
+      "kind": "QueryPageRev",
+      "name": "query_page_with_revision"
+    },
+    {
+      "bytes_hex": "0000000a7b22616765223a33307d0000000000000007",
+      "decoded": {
+        "body_json": "{\"age\":30}",
+        "revision": 7
+      },
+      "kind": "DocGetRevResponse",
+      "name": "doc_get_rev_response"
     }
   ],
   "statuses": {

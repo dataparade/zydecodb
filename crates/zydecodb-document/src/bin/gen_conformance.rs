@@ -21,8 +21,9 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use zydecodb_document::query::{QueryPage, QueryRow};
 use zydecodb_document::wire::{
-    self, CountPayload, DeletePayload, DocDelPayload, DocPutPayload, FindPayload, IndexDefPayload,
-    QueryPayload, UpdatePayload, WireProjection,
+    self, CountPayload, DeletePayload, DocDelPayload, DocPutIfMatchPayload, DocPutPayload,
+    DocUpdateIfMatchPayload, FindPayload, IndexDefPayload, QueryPayload, UpdatePayload,
+    WireProjection,
 };
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope, PROTO_VERSION};
@@ -424,6 +425,81 @@ fn payload_vectors() -> Vec<Value> {
         p.encode(),
     ));
 
+    // ---- DocGetRev ----
+    let p = QueryPayload::ById {
+        collection: "users".into(),
+        doc_id: b"u1".to_vec(),
+    };
+    v.push(req(
+        "doc_get_rev",
+        "DocGetRev",
+        json!({"collection":"users","doc_id":"u1"}),
+        Command::DocGetRev,
+        p.encode(),
+    ));
+
+    // ---- FindRev (same Find payload, different opcode) ----
+    let p = FindPayload {
+        collection: "users".into(),
+        filter: br#"{"age":{"$gte":18}}"#.to_vec(),
+        sort: vec![("age".into(), true)],
+        projection: WireProjection::None,
+        skip: 0,
+        limit: 50,
+        cursor: vec![],
+    };
+    v.push(req(
+        "find_rev_basic",
+        "FindRev",
+        json!({
+            "collection":"users","filter_json":"{\"age\":{\"$gte\":18}}",
+            "sort":[["age",true]],
+            "projection":{"mode":"none","fields":[]},
+            "skip":0,"limit":50,"cursor_hex":""
+        }),
+        Command::FindRev,
+        p.encode(),
+    ));
+
+    // ---- DocPutIfMatch ----
+    let p = DocPutIfMatchPayload {
+        collection: "users".into(),
+        doc_id: b"u1".to_vec(),
+        body: br#"{"age":31}"#.to_vec(),
+        relaxed: false,
+        if_match: 7,
+        expires_at: 0,
+    };
+    v.push(req(
+        "doc_put_if_match",
+        "DocPutIfMatch",
+        json!({
+            "collection":"users","doc_id":"u1","body_json":"{\"age\":31}",
+            "relaxed":false,"if_match":7
+        }),
+        Command::DocPutIfMatch,
+        p.encode(),
+    ));
+
+    // ---- DocUpdateIfMatch ----
+    let p = DocUpdateIfMatchPayload {
+        collection: "users".into(),
+        doc_id: b"u1".to_vec(),
+        update: br#"{"$inc":{"age":1}}"#.to_vec(),
+        relaxed: false,
+        if_match: 7,
+    };
+    v.push(req(
+        "doc_update_if_match",
+        "DocUpdateIfMatch",
+        json!({
+            "collection":"users","doc_id":"u1",
+            "update_json":"{\"$inc\":{\"age\":1}}","relaxed":false,"if_match":7
+        }),
+        Command::DocUpdateIfMatch,
+        p.encode(),
+    ));
+
     // ---- SessionInit / Ping (raw payloads on the envelope) ----
     v.push(req(
         "session_init",
@@ -446,10 +522,12 @@ fn response_vectors() -> Vec<Value> {
             QueryRow {
                 doc_id: b"u1".to_vec(),
                 body: Some(br#"{"_id":"u1"}"#.to_vec()),
+                revision: None,
             },
             QueryRow {
                 doc_id: b"u2".to_vec(),
                 body: Some(br#"{"_id":"u2"}"#.to_vec()),
+                revision: None,
             },
         ],
         next_cursor: Some(b"next-page".to_vec()),
@@ -482,6 +560,7 @@ fn response_vectors() -> Vec<Value> {
         rows: vec![QueryRow {
             doc_id: b"u3".to_vec(),
             body: None,
+            revision: None,
         }],
         next_cursor: None,
     };
@@ -490,6 +569,31 @@ fn response_vectors() -> Vec<Value> {
         "kind": "QueryPage",
         "bytes_hex": hex(&wire::encode_query_page(&page)),
         "decoded": {"rows": [{"doc_id":"u3","body_json":""}], "next_cursor_hex": null}
+    }));
+
+    let page = QueryPage {
+        rows: vec![QueryRow {
+            doc_id: b"u1".to_vec(),
+            body: Some(br#"{"_id":"u1"}"#.to_vec()),
+            revision: Some(42),
+        }],
+        next_cursor: None,
+    };
+    v.push(json!({
+        "name": "query_page_with_revision",
+        "kind": "QueryPageRev",
+        "bytes_hex": hex(&wire::encode_query_page_with_revision(&page)),
+        "decoded": {
+            "rows": [{"doc_id":"u1","body_json":"{\"_id\":\"u1\"}","revision":42}],
+            "next_cursor_hex": null
+        }
+    }));
+
+    v.push(json!({
+        "name": "doc_get_rev_response",
+        "kind": "DocGetRevResponse",
+        "bytes_hex": hex(&wire::encode_doc_get_rev_response(br#"{"age":30}"#, 7)),
+        "decoded": {"body_json":"{\"age\":30}","revision":7}
     }));
 
     v
@@ -509,6 +613,10 @@ fn commands_map() -> Value {
         "Update": Command::Update.as_u8(),
         "Delete": Command::Delete.as_u8(),
         "Count": Command::Count.as_u8(),
+        "DocGetRev": Command::DocGetRev.as_u8(),
+        "FindRev": Command::FindRev.as_u8(),
+        "DocPutIfMatch": Command::DocPutIfMatch.as_u8(),
+        "DocUpdateIfMatch": Command::DocUpdateIfMatch.as_u8(),
         "IndexDef": Command::IndexDef.as_u8(),
         "SessionInit": Command::SessionInit.as_u8(),
         "SetContext": Command::SetContext.as_u8(),

@@ -80,9 +80,14 @@ of scope here. Fields suffixed `_hex` (`cursor_hex`) carry raw bytes as hex.
 - **QueryById** — `collection`, `doc_id`
 - **QueryIndexRange** — `collection`, `index_name`, `lo_json`, `hi_json`,
   `cursor_hex`, `limit`
-- **Find** — `collection`, `filter_json`, `sort` (`[field, ascending][]`),
+- **Find** / **FindRev** — `collection`, `filter_json`, `sort` (`[field, ascending][]`),
   `projection` (`{mode: none|include|exclude, fields: string[]}`), `skip`,
-  `limit`, `cursor_hex`
+  `limit`, `cursor_hex` (FindRev uses the same payload; response rows include
+  revisions)
+- **DocGetRev** — `collection`, `doc_id` (same payload as QueryById)
+- **DocPutIfMatch** — `collection`, `doc_id`, `body_json`, `relaxed`, `if_match`,
+  optional `expires_at`
+- **DocUpdateIfMatch** — `collection`, `doc_id`, `update_json`, `relaxed`, `if_match`
 - **Update** — `collection`, `filter_json`, `update_json`, `multi`, `relaxed`,
   `upsert` (bool; sets `FLAG_UPSERT=0x02` on the trailing flags byte)
 - **Delete** — `collection`, `filter_json`, `multi`, `relaxed`

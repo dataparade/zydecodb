@@ -57,6 +57,25 @@ try {
 - **TLS.** Pass `tls: true` for system CA defaults, or a `tls.ConnectionOptions`
   object for custom roots / SNI / `rejectUnauthorized`.
 
+## Optimistic concurrency
+
+```ts
+const got = await users.getWithRevision(id);
+got!.doc.age = (got!.doc.age as number) + 1;
+try {
+  await users.replaceOneIfMatch(id, got!.doc, got!.revision);
+} catch (err) {
+  if (err instanceof ConflictError) {
+    // re-read and retry, or merge
+  } else throw err;
+}
+```
+
+Also: `findWithRevision`, `updateByIdIfMatch`. Revisions are opaque `bigint`
+values. Stale/missing documents throw `ConflictError`. Against an older server
+these methods fail with a protocol error instead of silently becoming
+unconditional writes.
+
 ## Durability
 
 Writes are durable (fsync-on-commit) by default. For latency-sensitive,

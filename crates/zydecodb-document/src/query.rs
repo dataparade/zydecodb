@@ -49,6 +49,8 @@ pub struct ScanSpec {
 pub struct QueryRow {
     pub doc_id: Vec<u8>,
     pub body: Option<Vec<u8>>,
+    /// Opaque document revision (`InternalKey.seq`) when requested.
+    pub revision: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,11 +68,24 @@ pub fn get_by_id(
     collection: &str,
     doc_id: &[u8],
 ) -> DocResult<Option<Vec<u8>>> {
+    Ok(get_by_id_with_revision(snap, catalog, prefix, collection, doc_id)?.map(|(b, _)| b))
+}
+
+/// Point lookup returning `(json_body, opaque_revision)`.
+pub fn get_by_id_with_revision(
+    snap: &SnapshotHandle,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+) -> DocResult<Option<(Vec<u8>, u64)>> {
     let coll = catalog
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
     let dk = keys::doc_key(prefix, coll.id, doc_id);
-    Ok(snap.get(&dk)?.map(|stored| stored_to_json_vec(&stored)))
+    Ok(snap
+        .get_with_seq(&dk)?
+        .map(|(stored, rev)| (stored_to_json_vec(&stored), rev)))
 }
 
 /// Build a scan spec from the catalog and (optional) JSON-array bounds. Bounds
@@ -163,11 +178,31 @@ pub fn execute_index_scan(snap: &SnapshotHandle, spec: &ScanSpec) -> DocResult<Q
         } else {
             None
         };
-        rows.push(QueryRow { doc_id, body });
+        rows.push(QueryRow {
+            doc_id,
+            body,
+            revision: None,
+        });
         last_key = Some(ikey);
     }
 
     Ok(QueryPage { rows, next_cursor })
+}
+
+/// Fill `revision` on each row from the current snapshot (used by FindRev).
+pub fn attach_revisions(
+    snap: &SnapshotHandle,
+    prefix: &[u8],
+    coll: &CollectionMeta,
+    page: &mut QueryPage,
+) -> DocResult<()> {
+    let doc_prefix = keys::doc_prefix(prefix, coll.id);
+    for row in &mut page.rows {
+        let mut dk = doc_prefix.clone();
+        dk.extend_from_slice(&row.doc_id);
+        row.revision = snap.get_with_seq(&dk)?.map(|(_, rev)| rev);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +353,7 @@ fn make_row(doc_id: Vec<u8>, body: &Value, proj: &Option<Projection>) -> DocResu
     Ok(QueryRow {
         doc_id,
         body: Some(bytes),
+        revision: None,
     })
 }
 
@@ -335,6 +371,7 @@ fn row_from_stored(
             return Ok(Some(QueryRow {
                 doc_id,
                 body: Some(payload.to_vec()),
+                revision: None,
             }));
         }
     }
