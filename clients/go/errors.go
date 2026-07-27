@@ -3,6 +3,7 @@ package zydecodb
 import (
 	"errors"
 	"fmt"
+	"github.com/dataparade/zydecodb/clients/go/internal/proto"
 )
 
 // ConnError is a transport-level failure (dial/write/read). It is safe to retry
@@ -24,9 +25,9 @@ type ServerError struct {
 
 func (e *ServerError) Error() string {
 	if e.Detail != "" {
-		return fmt.Sprintf("zydecodb: %s failed: %s (%s)", e.Op, statusName(e.Status), e.Detail)
+		return fmt.Sprintf("zydecodb: %s failed: %s (%s)", e.Op, proto.StatusName(e.Status), e.Detail)
 	}
-	return fmt.Sprintf("zydecodb: %s failed: %s", e.Op, statusName(e.Status))
+	return fmt.Sprintf("zydecodb: %s failed: %s", e.Op, proto.StatusName(e.Status))
 }
 
 func fromStatus(status byte, op string, payload []byte) *ServerError {
@@ -45,40 +46,40 @@ func serverStatus(err error) (byte, bool) {
 // violation, status 0x03).
 func IsConflict(err error) bool {
 	s, ok := serverStatus(err)
-	return ok && s == StatusConflict
+	return ok && s == proto.StatusConflict
 }
 
 // IsAuth reports whether err is an authentication/authorization failure
 // (status 0x0B / 0x0C).
 func IsAuth(err error) bool {
 	s, ok := serverStatus(err)
-	return ok && (s == StatusUnauthorized || s == StatusForbidden)
+	return ok && (s == proto.StatusUnauthorized || s == proto.StatusForbidden)
 }
 
 // IsBusy reports whether the server is shedding load (status 0x07). The client
 // retries this automatically for idempotent operations.
 func IsBusy(err error) bool {
 	s, ok := serverStatus(err)
-	return ok && s == StatusEngineBusy
+	return ok && s == proto.StatusEngineBusy
 }
 
 // IsInvalidRequest reports whether the server rejected the request as malformed
 // (protocol / invalid-key / invalid-value).
 func IsInvalidRequest(err error) bool {
 	s, ok := serverStatus(err)
-	return ok && (s == StatusProtocolError || s == StatusInvalidKey || s == StatusInvalidValue)
+	return ok && (s == proto.StatusProtocolError || s == proto.StatusInvalidKey || s == proto.StatusInvalidValue)
 }
 
 // IsPolicyRejected reports whether the server rejected the request under an
 // admission/write policy (quota, status 0x09).
 func IsPolicyRejected(err error) bool {
 	s, ok := serverStatus(err)
-	return ok && s == StatusPolicyRejected
+	return ok && s == proto.StatusPolicyRejected
 }
 
 // IsUnsupportedFormat reports whether the server refused an on-disk artifact
 // whose format version it cannot read (status 0x0A).
 func IsUnsupportedFormat(err error) bool {
 	s, ok := serverStatus(err)
-	return ok && s == StatusUnsupportedFormat
+	return ok && s == proto.StatusUnsupportedFormat
 }

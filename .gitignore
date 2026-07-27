@@ -72,6 +72,7 @@ tls.key
 
 # Internal / Archived Docs
 /ROADMAP.md
+/1.0-Roadmap.md
 /docs/archive/
 /docs/soak-baselines/
 .cargo-home/

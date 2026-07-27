@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dataparade/zydecodb/clients/go/internal/proto"
 )
 
 // ErrUnknownCommitResult is returned when Commit's transport fails after the
@@ -27,16 +28,16 @@ func (c *Client) BeginTx(ctx context.Context) (*Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	status, body, err := conn.request(ctx, CmdBegin, nil)
+	status, body, err := conn.request(ctx, proto.CmdBegin, nil)
 	if err != nil {
 		c.pool.discard(conn)
 		return nil, err
 	}
-	if status != StatusOK {
+	if status != proto.StatusOK {
 		c.pool.release(conn)
 		return nil, fromStatus(status, "Begin", body)
 	}
-	txID, _, err := DecodeBeginResponse(body)
+	txID, _, err := proto.DecodeBeginResponse(body)
 	if err != nil {
 		c.pool.discard(conn)
 		return nil, err
@@ -87,8 +88,8 @@ func (tx *Tx) request(ctx context.Context, command byte, payload []byte, op stri
 		tx.done = true
 		return nil, err
 	}
-	if status != StatusOK {
-		if status == StatusNotFound {
+	if status != proto.StatusOK {
+		if status == proto.StatusNotFound {
 			return nil, fromStatus(status, op, body)
 		}
 		return nil, fromStatus(status, op, body)
@@ -101,7 +102,7 @@ func (tx *Tx) Commit(ctx context.Context) (uint64, error) {
 	if err := tx.ensureOpen(); err != nil {
 		return 0, err
 	}
-	status, body, err := tx.conn.request(ctx, CmdCommit, nil)
+	status, body, err := tx.conn.request(ctx, proto.CmdCommit, nil)
 	if err != nil {
 		tx.client.pool.discard(tx.conn)
 		tx.conn = nil
@@ -111,10 +112,10 @@ func (tx *Tx) Commit(ctx context.Context) (uint64, error) {
 	tx.client.pool.release(tx.conn)
 	tx.conn = nil
 	tx.done = true
-	if status != StatusOK {
+	if status != proto.StatusOK {
 		return 0, fromStatus(status, "Commit", body)
 	}
-	return DecodeCommitResponse(body)
+	return proto.DecodeCommitResponse(body)
 }
 
 // Rollback discards staged operations.
@@ -126,7 +127,7 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 		tx.done = true
 		return nil
 	}
-	status, body, err := tx.conn.request(ctx, CmdRollback, nil)
+	status, body, err := tx.conn.request(ctx, proto.CmdRollback, nil)
 	if err != nil {
 		tx.client.pool.discard(tx.conn)
 		tx.conn = nil
@@ -136,7 +137,7 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 	tx.client.pool.release(tx.conn)
 	tx.conn = nil
 	tx.done = true
-	if status != StatusOK {
+	if status != proto.StatusOK {
 		return fromStatus(status, "Rollback", body)
 	}
 	return nil
@@ -144,7 +145,7 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 
 // Put stages a raw KV put.
 func (tx *Tx) Put(ctx context.Context, key, value []byte, expiresAt uint64) error {
-	_, err := tx.request(ctx, CmdPut, EncodePut(key, value, expiresAt), "Put")
+	_, err := tx.request(ctx, proto.CmdPut, proto.EncodePut(key, value, expiresAt), "Put")
 	return err
 }
 
@@ -153,17 +154,17 @@ func (tx *Tx) Get(ctx context.Context, key []byte) ([]byte, error) {
 	if err := tx.ensureOpen(); err != nil {
 		return nil, err
 	}
-	status, body, err := tx.conn.request(ctx, CmdGet, EncodeKey(key))
+	status, body, err := tx.conn.request(ctx, proto.CmdGet, proto.EncodeKey(key))
 	if err != nil {
 		tx.client.pool.discard(tx.conn)
 		tx.conn = nil
 		tx.done = true
 		return nil, err
 	}
-	if status == StatusNotFound {
+	if status == proto.StatusNotFound {
 		return nil, nil
 	}
-	if status != StatusOK {
+	if status != proto.StatusOK {
 		return nil, fromStatus(status, "Get", body)
 	}
 	return body, nil
@@ -171,7 +172,7 @@ func (tx *Tx) Get(ctx context.Context, key []byte) ([]byte, error) {
 
 // Delete stages a raw KV delete.
 func (tx *Tx) Delete(ctx context.Context, key []byte) error {
-	_, err := tx.request(ctx, CmdDel, EncodeKey(key), "Del")
+	_, err := tx.request(ctx, proto.CmdDel, proto.EncodeKey(key), "Del")
 	return err
 }
 
@@ -181,7 +182,7 @@ func (tx *Tx) PutDocument(ctx context.Context, collection, docID string, doc any
 	if err != nil {
 		return err
 	}
-	_, err = tx.request(ctx, CmdDocPut, EncodeDocPut(collection, []byte(docID), body, false, 0), "DocPut")
+	_, err = tx.request(ctx, proto.CmdDocPut, proto.EncodeDocPut(collection, []byte(docID), body, false, 0), "DocPut")
 	return err
 }
 
@@ -191,13 +192,13 @@ func (tx *Tx) PutDocumentIfMatch(ctx context.Context, collection, docID string, 
 	if err != nil {
 		return err
 	}
-	_, err = tx.request(ctx, CmdDocPutIfMatch, EncodeDocPutIfMatch(collection, []byte(docID), body, false, ifMatch, 0), "DocPutIfMatch")
+	_, err = tx.request(ctx, proto.CmdDocPutIfMatch, proto.EncodeDocPutIfMatch(collection, []byte(docID), body, false, ifMatch, 0), "DocPutIfMatch")
 	return err
 }
 
 // DeleteDocument stages a document delete.
 func (tx *Tx) DeleteDocument(ctx context.Context, collection, docID string) error {
-	_, err := tx.request(ctx, CmdDocDel, EncodeDocDel(collection, []byte(docID)), "DocDel")
+	_, err := tx.request(ctx, proto.CmdDocDel, proto.EncodeDocDel(collection, []byte(docID)), "DocDel")
 	return err
 }
 
@@ -207,20 +208,20 @@ func (tx *Tx) GetDocumentWithRevision(ctx context.Context, collection, docID str
 	if err := tx.ensureOpen(); err != nil {
 		return nil, 0, err
 	}
-	status, body, err := tx.conn.request(ctx, CmdDocGetRev, EncodeQueryByID(collection, []byte(docID)))
+	status, body, err := tx.conn.request(ctx, proto.CmdDocGetRev, proto.EncodeQueryByID(collection, []byte(docID)))
 	if err != nil {
 		tx.client.pool.discard(tx.conn)
 		tx.conn = nil
 		tx.done = true
 		return nil, 0, err
 	}
-	if status == StatusNotFound {
+	if status == proto.StatusNotFound {
 		return nil, 0, nil
 	}
-	if status != StatusOK {
+	if status != proto.StatusOK {
 		return nil, 0, fromStatus(status, "DocGetRev", body)
 	}
-	raw, rev, err := DecodeDocGetRevResponse(body)
+	raw, rev, err := proto.DecodeDocGetRevResponse(body)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -233,6 +234,6 @@ func (tx *Tx) UpdateDocumentIfMatch(ctx context.Context, collection, docID strin
 	if err != nil {
 		return err
 	}
-	_, err = tx.request(ctx, CmdDocUpdateIfMatch, EncodeDocUpdateIfMatch(collection, []byte(docID), body, false, ifMatch), "DocUpdateIfMatch")
+	_, err = tx.request(ctx, proto.CmdDocUpdateIfMatch, proto.EncodeDocUpdateIfMatch(collection, []byte(docID), body, false, ifMatch), "DocUpdateIfMatch")
 	return err
 }

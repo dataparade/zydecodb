@@ -70,7 +70,9 @@ interface RespVector {
     resume_token_hex?: string;
     op?: string;
     doc_id?: string;
-    body_json?: string;
+    status?: number;
+    status_name?: string;
+    detail?: string;
   };
 }
 
@@ -129,6 +131,7 @@ function encodeRequest(v: ReqVector): Buffer {
         optBytes(s(i, "hi_json")),
         fromHex(s(i, "cursor_hex")),
         n(i, "limit"),
+        i["include_bodies"] === undefined ? true : Boolean(i["include_bodies"]),
       );
     case "Find":
     case "FindRev": {
@@ -198,7 +201,15 @@ function encodeRequest(v: ReqVector): Buffer {
     case "SessionInit":
       return Buffer.from(s(i, "api_key"), "utf8");
     case "Ping":
+    case "Stats":
+    case "SchemaDef":
       return Buffer.alloc(0);
+    case "SetContext":
+      return fromHex(s(i, "tenant_hex"));
+    case "AdminDropTenant": {
+      const tenant = fromHex(s(i, "tenant_hex"));
+      return Buffer.concat([tenant, Buffer.from([i["compact"] ? 1 : 0])]);
+    }
     default:
       throw new Error(`unhandled request kind: ${v.kind}`);
   }
@@ -298,6 +309,16 @@ for (const v of vectors.responses) {
       assert.equal(frame.body?.toString("utf8") ?? "", v.decoded.body_json);
       const wantOp = v.decoded.op === "upsert" ? 0x01 : 0x02;
       assert.equal(frame.op, wantOp);
+      return;
+    }
+    if (v.kind === "StatusResponse") {
+      const raw = fromHex(v.bytes_hex);
+      assert.equal(raw[0], PROTO_VERSION);
+      const status = raw[1]!;
+      const plen = raw.readUInt32BE(2);
+      const detail = raw.subarray(6, 6 + plen).toString("utf8");
+      assert.equal(status, v.decoded.status);
+      assert.equal(detail, v.decoded.detail ?? "");
       return;
     }
     throw new Error(`unhandled response kind: ${v.kind}`);

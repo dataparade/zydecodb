@@ -1,11 +1,11 @@
-// Package zydecodb is the official Go driver for ZydecoDB, a document store
-// that speaks a compact binary wire protocol.
+// Package proto is the internal wire codec for the ZydecoDB Go driver.
 //
-// This file is the pure codec: command/status constants and the encode/decode
-// of payload bodies, with no I/O. It mirrors the Rust definitions in
-// crates/zydecodb-engine/src/frame.rs and crates/zydecodb-document/src/wire.rs
-// and is verified byte-for-byte against clients/conformance/vectors.json.
-package zydecodb
+// Applications must not import this package. The public API is Client,
+// Collection, Tx, and the error helpers in package zydecodb.
+// Mirrors crates/zydecodb-engine/src/frame.rs and
+// crates/zydecodb-document/src/wire.rs; verified against
+// clients/conformance/vectors.json.
+package proto
 
 import (
 	"bytes"
@@ -41,7 +41,10 @@ const (
 	CmdAggregate        byte = 0x2B
 	CmdWatch            byte = 0x2C
 	CmdIndexDef         byte = 0x30
+	CmdSchemaDef        byte = 0x31
 	CmdSessionInit      byte = 0x40
+	CmdSetContext       byte = 0x41
+	CmdAdminDropTenant  byte = 0x42
 	CmdPing             byte = 0xF0
 	CmdStats            byte = 0xF1
 )
@@ -97,7 +100,8 @@ const (
 	StatusForbidden         byte = 0x0C
 )
 
-func statusName(status byte) string {
+// StatusName returns the frozen wire status name for diagnostics.
+func StatusName(status byte) string {
 	switch status {
 	case StatusOK:
 		return "Ok"
@@ -320,9 +324,11 @@ func EncodeQueryByID(collection string, docID []byte) []byte {
 }
 
 // EncodeQueryIndexRange builds an index-range Query payload:
-// [mode][collection][index][limit u32][lo][hi][cursor]. lo/hi are JSON-array
-// bound bytes (empty = unbounded); cursor is an opaque page token.
-func EncodeQueryIndexRange(collection, index string, lo, hi, cursor []byte, limit uint32) []byte {
+// [mode][collection][index][limit u32][lo][hi][cursor][optional include_bodies u8].
+// lo/hi are JSON-array bound bytes (empty = unbounded); cursor is an opaque page
+// token. When includeBodies is false, a trailing 0x00 is appended; when true the
+// trailer is omitted (legacy wire shape).
+func EncodeQueryIndexRange(collection, index string, lo, hi, cursor []byte, limit uint32, includeBodies bool) []byte {
 	var buf bytes.Buffer
 	buf.WriteByte(queryIndexRange)
 	putLP(&buf, []byte(collection))
@@ -331,6 +337,9 @@ func EncodeQueryIndexRange(collection, index string, lo, hi, cursor []byte, limi
 	putLP(&buf, lo)
 	putLP(&buf, hi)
 	putLP(&buf, cursor)
+	if !includeBodies {
+		buf.WriteByte(0)
+	}
 	return buf.Bytes()
 }
 
@@ -434,11 +443,11 @@ func EncodeWatch(collection string, resumeToken []byte) []byte {
 
 // WatchFrame is one decoded Watch stream frame.
 type WatchFrame struct {
-	Kind         string // "ack", "event", "heartbeat"
-	ResumeToken  []byte
-	Op           byte
-	DocID        []byte
-	Body         []byte
+	Kind        string // "ack", "event", "heartbeat"
+	ResumeToken []byte
+	Op          byte
+	DocID       []byte
+	Body        []byte
 }
 
 // DecodeWatchFrame decodes [kind u8][resume_token lp][event fields...].

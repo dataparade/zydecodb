@@ -46,7 +46,7 @@ pub struct Config {
     #[serde(default)]
     pub runtime: RuntimeConfig,
     /// δ-fair multi-tenant isolation (pods). Off by default — enable when
-    /// hosting multiple tenants on one process. See `docs/SECURITY.md`.
+    /// hosting multiple tenants on one process. See `docs/GUIDE.md#security`.
     #[serde(default)]
     pub fair: FairTomlConfig,
     /// Bounded aggregation resource limits (`[aggregation]`).

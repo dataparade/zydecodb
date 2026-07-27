@@ -20,6 +20,7 @@
     "Put": 1,
     "Query": 32,
     "Rollback": 18,
+    "SchemaDef": 49,
     "SessionInit": 64,
     "SetContext": 65,
     "Stats": 241,
@@ -225,6 +226,7 @@
         "collection": "users",
         "cursor_hex": "abcd",
         "hi_json": "",
+        "include_bodies": true,
         "index_name": "by_age",
         "limit": 100,
         "lo_json": ""
@@ -232,6 +234,22 @@
       "kind": "QueryIndexRange",
       "name": "query_index_range_unbounded_with_cursor",
       "payload_hex": "010000000575736572730000000662795f61676500000064000000000000000000000002abcd"
+    },
+    {
+      "command": 32,
+      "envelope_hex": "01200000002d010000000575736572730000000662795f61676500000032000000045b31385d000000045b36355d0000000000",
+      "input": {
+        "collection": "users",
+        "cursor_hex": "",
+        "hi_json": "[65]",
+        "include_bodies": false,
+        "index_name": "by_age",
+        "limit": 50,
+        "lo_json": "[18]"
+      },
+      "kind": "QueryIndexRange",
+      "name": "query_index_range_ids_only",
+      "payload_hex": "010000000575736572730000000662795f61676500000032000000045b31385d000000045b36355d0000000000"
     },
     {
       "command": 35,
@@ -535,6 +553,43 @@
       "kind": "Ping",
       "name": "ping",
       "payload_hex": ""
+    },
+    {
+      "command": 241,
+      "envelope_hex": "01f100000000",
+      "input": {},
+      "kind": "Stats",
+      "name": "stats_empty",
+      "payload_hex": ""
+    },
+    {
+      "command": 65,
+      "envelope_hex": "01410000001011111111111111111111111111111111",
+      "input": {
+        "tenant_hex": "11111111111111111111111111111111"
+      },
+      "kind": "SetContext",
+      "name": "set_context",
+      "payload_hex": "11111111111111111111111111111111"
+    },
+    {
+      "command": 66,
+      "envelope_hex": "0142000000111111111111111111111111111111111101",
+      "input": {
+        "compact": true,
+        "tenant_hex": "11111111111111111111111111111111"
+      },
+      "kind": "AdminDropTenant",
+      "name": "admin_drop_tenant",
+      "payload_hex": "1111111111111111111111111111111101"
+    },
+    {
+      "command": 49,
+      "envelope_hex": "013100000000",
+      "input": {},
+      "kind": "SchemaDef",
+      "name": "schema_def_reserved",
+      "payload_hex": ""
     }
   ],
   "responses": [
@@ -677,6 +732,126 @@
       },
       "kind": "WatchFrameHeartbeat",
       "name": "watch_frame_heartbeat"
+    },
+    {
+      "bytes_hex": "010100000000",
+      "decoded": {
+        "detail": "",
+        "status": 1,
+        "status_name": "NotFound"
+      },
+      "kind": "StatusResponse",
+      "name": "status_not_found"
+    },
+    {
+      "bytes_hex": "010200000010696e7465726e616c206661696c757265",
+      "decoded": {
+        "detail": "internal failure",
+        "status": 2,
+        "status_name": "Error"
+      },
+      "kind": "StatusResponse",
+      "name": "status_error"
+    },
+    {
+      "bytes_hex": "0103000000117265766973696f6e206d69736d61746368",
+      "decoded": {
+        "detail": "revision mismatch",
+        "status": 3,
+        "status_name": "Conflict"
+      },
+      "kind": "StatusResponse",
+      "name": "status_conflict"
+    },
+    {
+      "bytes_hex": "0104000000116469736b207772697465206661696c6564",
+      "decoded": {
+        "detail": "disk write failed",
+        "status": 4,
+        "status_name": "IoError"
+      },
+      "kind": "StatusResponse",
+      "name": "status_io_error"
+    },
+    {
+      "bytes_hex": "01050000000c6b657920746f6f206c6f6e67",
+      "decoded": {
+        "detail": "key too long",
+        "status": 5,
+        "status_name": "InvalidKey"
+      },
+      "kind": "StatusResponse",
+      "name": "status_invalid_key"
+    },
+    {
+      "bytes_hex": "01060000000c62616420646f63756d656e74",
+      "decoded": {
+        "detail": "bad document",
+        "status": 6,
+        "status_name": "InvalidValue"
+      },
+      "kind": "StatusResponse",
+      "name": "status_invalid_value"
+    },
+    {
+      "bytes_hex": "01070000001372617465206c696d6974206578636565646564",
+      "decoded": {
+        "detail": "rate limit exceeded",
+        "status": 7,
+        "status_name": "EngineBusy"
+      },
+      "kind": "StatusResponse",
+      "name": "status_engine_busy"
+    },
+    {
+      "bytes_hex": "010800000014756e6b6e6f776e20636f6d6d616e642030783939",
+      "decoded": {
+        "detail": "unknown command 0x99",
+        "status": 8,
+        "status_name": "ProtocolError"
+      },
+      "kind": "StatusResponse",
+      "name": "status_protocol_error"
+    },
+    {
+      "bytes_hex": "01090000000e71756f7461206578636565646564",
+      "decoded": {
+        "detail": "quota exceeded",
+        "status": 9,
+        "status_name": "PolicyRejected"
+      },
+      "kind": "StatusResponse",
+      "name": "status_policy_rejected"
+    },
+    {
+      "bytes_hex": "010a00000017756e6b6e6f776e2073737461626c652076657273696f6e",
+      "decoded": {
+        "detail": "unknown sstable version",
+        "status": 10,
+        "status_name": "UnsupportedFormat"
+      },
+      "kind": "StatusResponse",
+      "name": "status_unsupported_format"
+    },
+    {
+      "bytes_hex": "010b0000000f696e76616c696420617069206b6579",
+      "decoded": {
+        "detail": "invalid api key",
+        "status": 11,
+        "status_name": "Unauthorized"
+      },
+      "kind": "StatusResponse",
+      "name": "status_unauthorized"
+    },
+    {
+      "bytes_hex": "010c0000000d726561642d6f6e6c79206b6579",
+      "decoded": {
+        "detail": "read-only key",
+        "status": 12,
+        "status_name": "Forbidden"
+      },
+      "kind": "StatusResponse",
+      "name": "status_forbidden"
     }
   ],
   "statuses": {

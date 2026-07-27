@@ -26,7 +26,9 @@ use zydecodb_document::wire::{
     UpdatePayload, WatchPayload, WireProjection, WATCH_OP_DELETE, WATCH_OP_UPSERT,
 };
 use zydecodb_engine::errors::Status;
-use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope, PROTO_VERSION};
+use zydecodb_engine::frame::{
+    Command, KeyPayload, PutPayload, RequestEnvelope, ResponseEnvelope, PROTO_VERSION,
+};
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -264,7 +266,23 @@ fn payload_vectors() -> Vec<Value> {
     v.push(req(
         "query_index_range_unbounded_with_cursor",
         "QueryIndexRange",
-        json!({"collection":"users","index_name":"by_age","lo_json":"","hi_json":"","cursor_hex":"abcd","limit":100}),
+        json!({"collection":"users","index_name":"by_age","lo_json":"","hi_json":"","cursor_hex":"abcd","limit":100,"include_bodies":true}),
+        Command::Query,
+        p.encode(),
+    ));
+    let p = QueryPayload::IndexRange {
+        collection: "users".into(),
+        index_name: "by_age".into(),
+        lo: b"[18]".to_vec(),
+        hi: b"[65]".to_vec(),
+        cursor: vec![],
+        limit: 50,
+        include_bodies: false,
+    };
+    v.push(req(
+        "query_index_range_ids_only",
+        "QueryIndexRange",
+        json!({"collection":"users","index_name":"by_age","lo_json":"[18]","hi_json":"[65]","cursor_hex":"","limit":50,"include_bodies":false}),
         Command::Query,
         p.encode(),
     ));
@@ -582,7 +600,7 @@ fn payload_vectors() -> Vec<Value> {
         vec![],
     ));
 
-    // ---- SessionInit / Ping (raw payloads on the envelope) ----
+    // ---- SessionInit / Ping / Stats / SetContext / AdminDropTenant / SchemaDef ----
     v.push(req(
         "session_init",
         "SessionInit",
@@ -591,6 +609,31 @@ fn payload_vectors() -> Vec<Value> {
         b"zdk_example".to_vec(),
     ));
     v.push(req("ping", "Ping", json!({}), Command::Ping, Vec::new()));
+    v.push(req("stats_empty", "Stats", json!({}), Command::Stats, Vec::new()));
+    let tenant = [0x11u8; 16];
+    v.push(req(
+        "set_context",
+        "SetContext",
+        json!({"tenant_hex": hex(&tenant)}),
+        Command::SetContext,
+        tenant.to_vec(),
+    ));
+    let mut drop_payload = tenant.to_vec();
+    drop_payload.push(1); // compact = true
+    v.push(req(
+        "admin_drop_tenant",
+        "AdminDropTenant",
+        json!({"tenant_hex": hex(&tenant), "compact": true}),
+        Command::AdminDropTenant,
+        drop_payload,
+    ));
+    v.push(req(
+        "schema_def_reserved",
+        "SchemaDef",
+        json!({}),
+        Command::SchemaDef,
+        Vec::new(),
+    ));
 
     v
 }
@@ -761,11 +804,51 @@ fn response_vectors() -> Vec<Value> {
         "decoded": {"resume_token_hex": hex(resume)}
     }));
 
+    // Full response envelopes for every status byte (wire-freeze gate).
+    for (name, status, detail) in [
+        ("status_not_found", Status::NotFound, ""),
+        ("status_error", Status::Error, "internal failure"),
+        ("status_conflict", Status::Conflict, "revision mismatch"),
+        ("status_io_error", Status::IoError, "disk write failed"),
+        ("status_invalid_key", Status::InvalidKey, "key too long"),
+        ("status_invalid_value", Status::InvalidValue, "bad document"),
+        ("status_engine_busy", Status::EngineBusy, "rate limit exceeded"),
+        (
+            "status_protocol_error",
+            Status::ProtocolError,
+            "unknown command 0x99",
+        ),
+        ("status_policy_rejected", Status::PolicyRejected, "quota exceeded"),
+        (
+            "status_unsupported_format",
+            Status::UnsupportedFormat,
+            "unknown sstable version",
+        ),
+        ("status_unauthorized", Status::Unauthorized, "invalid api key"),
+        ("status_forbidden", Status::Forbidden, "read-only key"),
+    ] {
+        let env = if detail.is_empty() {
+            ResponseEnvelope::new(status, Vec::new())
+        } else {
+            ResponseEnvelope::error(status, detail)
+        };
+        v.push(json!({
+            "name": name,
+            "kind": "StatusResponse",
+            "bytes_hex": hex(&env.encode()),
+            "decoded": {
+                "status": status.as_u8(),
+                "status_name": format!("{status:?}").replace("Status::", ""),
+                "detail": detail,
+            }
+        }));
+    }
+
     v
 }
 
 fn commands_map() -> Value {
-    // Implemented 0.9 opcodes (frozen). SchemaDef remains reserved/omitted.
+    // Wire v1 opcodes (frozen for 1.x). SchemaDef is reserved but listed.
     json!({
         "Put": Command::Put.as_u8(),
         "Get": Command::Get.as_u8(),
@@ -787,6 +870,7 @@ fn commands_map() -> Value {
         "Aggregate": Command::Aggregate.as_u8(),
         "Watch": Command::Watch.as_u8(),
         "IndexDef": Command::IndexDef.as_u8(),
+        "SchemaDef": Command::SchemaDef.as_u8(),
         "SessionInit": Command::SessionInit.as_u8(),
         "SetContext": Command::SetContext.as_u8(),
         "AdminDropTenant": Command::AdminDropTenant.as_u8(),

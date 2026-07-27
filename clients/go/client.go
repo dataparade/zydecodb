@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/dataparade/zydecodb/clients/go/internal/proto"
 	"math"
 	mrand "math/rand"
 	"time"
@@ -99,11 +100,11 @@ func (c *Client) backoff(attempt int) time.Duration {
 // execOptions tunes a single request execution.
 type execOptions struct {
 	retryable   bool
-	notFoundNil bool // map StatusNotFound to (nil, nil)
+	notFoundNil bool // map proto.StatusNotFound to (nil, nil)
 }
 
-// execute runs one request with pooling and the retry policy. On StatusOK it
-// returns the response body. With notFoundNil, StatusNotFound returns (nil, nil).
+// execute runs one request with pooling and the retry policy. On proto.StatusOK it
+// returns the response body. With notFoundNil, proto.StatusNotFound returns (nil, nil).
 func (c *Client) execute(ctx context.Context, command byte, payload []byte, op string, eo execOptions) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
@@ -126,11 +127,11 @@ func (c *Client) execute(ctx context.Context, command byte, payload []byte, op s
 		c.pool.release(conn)
 
 		switch {
-		case status == StatusOK:
+		case status == proto.StatusOK:
 			return body, nil
-		case eo.notFoundNil && status == StatusNotFound:
+		case eo.notFoundNil && status == proto.StatusNotFound:
 			return nil, nil
-		case status == StatusEngineBusy && eo.retryable && attempt < c.maxRetries:
+		case status == proto.StatusEngineBusy && eo.retryable && attempt < c.maxRetries:
 			lastErr = fromStatus(status, op, body)
 			if werr := c.wait(ctx, attempt); werr != nil {
 				return nil, werr
@@ -161,13 +162,13 @@ func (c *Client) wait(ctx context.Context, attempt int) error {
 
 // Ping verifies the server is reachable and responsive.
 func (c *Client) Ping(ctx context.Context) error {
-	_, err := c.execute(ctx, CmdPing, nil, "Ping", execOptions{retryable: true})
+	_, err := c.execute(ctx, proto.CmdPing, nil, "Ping", execOptions{retryable: true})
 	return err
 }
 
 // Stats returns the server's runtime statistics as decoded JSON.
 func (c *Client) Stats(ctx context.Context) (map[string]any, error) {
-	body, err := c.execute(ctx, CmdStats, nil, "Stats", execOptions{retryable: true})
+	body, err := c.execute(ctx, proto.CmdStats, nil, "Stats", execOptions{retryable: true})
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +183,7 @@ func (c *Client) Stats(ctx context.Context) (map[string]any, error) {
 
 // Put inserts or replaces a raw KV pair. It returns the engine sequence number.
 func (c *Client) Put(ctx context.Context, key, value []byte, expiresAt uint64) (uint64, error) {
-	out, err := c.execute(ctx, CmdPut, EncodePut(key, value, expiresAt), "Put", execOptions{retryable: true})
+	out, err := c.execute(ctx, proto.CmdPut, proto.EncodePut(key, value, expiresAt), "Put", execOptions{retryable: true})
 	if err != nil {
 		return 0, err
 	}
@@ -191,12 +192,12 @@ func (c *Client) Put(ctx context.Context, key, value []byte, expiresAt uint64) (
 
 // Get fetches a raw KV pair. It returns nil if not found.
 func (c *Client) Get(ctx context.Context, key []byte) ([]byte, error) {
-	return c.execute(ctx, CmdGet, EncodeKey(key), "Get", execOptions{retryable: true, notFoundNil: true})
+	return c.execute(ctx, proto.CmdGet, proto.EncodeKey(key), "Get", execOptions{retryable: true, notFoundNil: true})
 }
 
 // Delete removes a raw KV pair, returning whether it existed.
 func (c *Client) Delete(ctx context.Context, key []byte) (bool, error) {
-	out, err := c.execute(ctx, CmdDel, EncodeKey(key), "Delete", execOptions{retryable: false})
+	out, err := c.execute(ctx, proto.CmdDel, proto.EncodeKey(key), "Delete", execOptions{retryable: false})
 	if err != nil {
 		return false, err
 	}
@@ -214,21 +215,21 @@ func (c *Client) DefineIndex(ctx context.Context, collection, index string, fiel
 
 // DefineIndexDirected is DefineIndex with per-field ascending flags (nil = all ASC).
 func (c *Client) DefineIndexDirected(ctx context.Context, collection, index string, fields []string, directions []bool, unique, ifNotExists bool, expireAfterSeconds uint64) (bool, error) {
-	payload := EncodeIndexDefDirected(collection, index, fields, directions, unique, expireAfterSeconds)
+	payload := proto.EncodeIndexDefDirected(collection, index, fields, directions, unique, expireAfterSeconds)
 	conn, err := c.pool.acquire(ctx)
 	if err != nil {
 		return false, err
 	}
-	status, body, err := conn.request(ctx, CmdIndexDef, payload)
+	status, body, err := conn.request(ctx, proto.CmdIndexDef, payload)
 	if err != nil {
 		c.pool.discard(conn)
 		return false, err
 	}
 	c.pool.release(conn)
-	if ifNotExists && status == StatusConflict {
+	if ifNotExists && status == proto.StatusConflict {
 		return false, nil
 	}
-	if status != StatusOK {
+	if status != proto.StatusOK {
 		return false, fromStatus(status, "IndexDef", body)
 	}
 	return true, nil
@@ -238,7 +239,7 @@ func (c *Client) DefineIndexDirected(ctx context.Context, collection, index stri
 // engine sequence number assigned to the write. expiresAt is absolute unix
 // millis; 0 means never expires.
 func (c *Client) PutDocument(ctx context.Context, collection, docID string, body []byte, relaxed bool, expiresAt uint64) (uint64, error) {
-	out, err := c.execute(ctx, CmdDocPut, EncodeDocPut(collection, []byte(docID), body, relaxed, expiresAt), "DocPut", execOptions{retryable: true})
+	out, err := c.execute(ctx, proto.CmdDocPut, proto.EncodeDocPut(collection, []byte(docID), body, relaxed, expiresAt), "DocPut", execOptions{retryable: true})
 	if err != nil {
 		return 0, err
 	}
@@ -247,7 +248,7 @@ func (c *Client) PutDocument(ctx context.Context, collection, docID string, body
 
 // DeleteDocument deletes a document by id, returning whether a document existed.
 func (c *Client) DeleteDocument(ctx context.Context, collection, docID string) (bool, error) {
-	out, err := c.execute(ctx, CmdDocDel, EncodeDocDel(collection, []byte(docID)), "DocDel", execOptions{retryable: false})
+	out, err := c.execute(ctx, proto.CmdDocDel, proto.EncodeDocDel(collection, []byte(docID)), "DocDel", execOptions{retryable: false})
 	if err != nil {
 		return false, err
 	}
@@ -256,17 +257,17 @@ func (c *Client) DeleteDocument(ctx context.Context, collection, docID string) (
 
 // GetDocument fetches one document by id. It returns (nil, nil) if not found.
 func (c *Client) GetDocument(ctx context.Context, collection, docID string) ([]byte, error) {
-	return c.execute(ctx, CmdQuery, EncodeQueryByID(collection, []byte(docID)), "Query", execOptions{retryable: true, notFoundNil: true})
+	return c.execute(ctx, proto.CmdQuery, proto.EncodeQueryByID(collection, []byte(docID)), "Query", execOptions{retryable: true, notFoundNil: true})
 }
 
 // GetDocumentWithRevision fetches one document by id and its opaque revision.
 // It returns (nil, 0, nil) if not found.
 func (c *Client) GetDocumentWithRevision(ctx context.Context, collection, docID string) ([]byte, uint64, error) {
-	out, err := c.execute(ctx, CmdDocGetRev, EncodeQueryByID(collection, []byte(docID)), "DocGetRev", execOptions{retryable: true, notFoundNil: true})
+	out, err := c.execute(ctx, proto.CmdDocGetRev, proto.EncodeQueryByID(collection, []byte(docID)), "DocGetRev", execOptions{retryable: true, notFoundNil: true})
 	if err != nil || out == nil {
 		return nil, 0, err
 	}
-	body, rev, err := DecodeDocGetRevResponse(out)
+	body, rev, err := proto.DecodeDocGetRevResponse(out)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -277,7 +278,7 @@ func (c *Client) GetDocumentWithRevision(ctx context.Context, collection, docID 
 // revision. A stale or missing document returns a Conflict error. The new
 // revision is returned on success.
 func (c *Client) PutDocumentIfMatch(ctx context.Context, collection, docID string, body []byte, relaxed bool, ifMatch, expiresAt uint64) (uint64, error) {
-	out, err := c.execute(ctx, CmdDocPutIfMatch, EncodeDocPutIfMatch(collection, []byte(docID), body, relaxed, ifMatch, expiresAt), "DocPutIfMatch", execOptions{retryable: false})
+	out, err := c.execute(ctx, proto.CmdDocPutIfMatch, proto.EncodeDocPutIfMatch(collection, []byte(docID), body, relaxed, ifMatch, expiresAt), "DocPutIfMatch", execOptions{retryable: false})
 	if err != nil {
 		return 0, err
 	}
@@ -287,7 +288,7 @@ func (c *Client) PutDocumentIfMatch(ctx context.Context, collection, docID strin
 // UpdateDocumentIfMatch applies a partial update by id only when ifMatch equals
 // the current revision. Returns the new revision on success.
 func (c *Client) UpdateDocumentIfMatch(ctx context.Context, collection, docID string, update []byte, relaxed bool, ifMatch uint64) (uint64, error) {
-	out, err := c.execute(ctx, CmdDocUpdateIfMatch, EncodeDocUpdateIfMatch(collection, []byte(docID), update, relaxed, ifMatch), "DocUpdateIfMatch", execOptions{retryable: false})
+	out, err := c.execute(ctx, proto.CmdDocUpdateIfMatch, proto.EncodeDocUpdateIfMatch(collection, []byte(docID), update, relaxed, ifMatch), "DocUpdateIfMatch", execOptions{retryable: false})
 	if err != nil {
 		return 0, err
 	}
@@ -342,10 +343,10 @@ func (c *Client) findRows(ctx context.Context, collection string, filter []byte,
 	if pageSize == 0 {
 		pageSize = 100
 	}
-	cmd := CmdFind
+	cmd := proto.CmdFind
 	op := "Find"
 	if withRev {
-		cmd = CmdFindRev
+		cmd = proto.CmdFindRev
 		op = "FindRev"
 	}
 	var (
@@ -365,7 +366,7 @@ func (c *Client) findRows(ctx context.Context, collection string, filter []byte,
 				want = remaining
 			}
 		}
-		payload := EncodeFind(collection, filter, opts.Sort, opts.Projection, skip, want, cursor)
+		payload := proto.EncodeFind(collection, filter, opts.Sort, opts.Projection, skip, want, cursor)
 		body, err := c.execute(ctx, cmd, payload, op, execOptions{retryable: true})
 		if err != nil {
 			return nil, err
@@ -373,9 +374,9 @@ func (c *Client) findRows(ctx context.Context, collection string, filter []byte,
 		var rows []Row
 		var next []byte
 		if withRev {
-			rows, next, err = DecodePageWithRevision(body)
+			rows, next, err = proto.DecodePageWithRevision(body)
 		} else {
-			rows, next, err = DecodePage(body)
+			rows, next, err = proto.DecodePage(body)
 		}
 		if err != nil {
 			return nil, err
@@ -398,13 +399,13 @@ func (c *Client) findRows(ctx context.Context, collection string, filter []byte,
 // Update applies an update to matching documents and returns the raw JSON
 // summary ({"matched":N,"modified":M}). Never retried automatically.
 func (c *Client) Update(ctx context.Context, collection string, filter, update []byte, multi, relaxed, upsert bool) ([]byte, error) {
-	return c.execute(ctx, CmdUpdate, EncodeUpdate(collection, filter, update, multi, relaxed, upsert), "Update", execOptions{retryable: false})
+	return c.execute(ctx, proto.CmdUpdate, proto.EncodeUpdate(collection, filter, update, multi, relaxed, upsert), "Update", execOptions{retryable: false})
 }
 
 // DeleteByFilter deletes matching documents and returns the deleted count.
 // Never retried automatically.
 func (c *Client) DeleteByFilter(ctx context.Context, collection string, filter []byte, multi, relaxed bool) (int64, error) {
-	body, err := c.execute(ctx, CmdDelete, EncodeDelete(collection, filter, multi, relaxed), "Delete", execOptions{retryable: false})
+	body, err := c.execute(ctx, proto.CmdDelete, proto.EncodeDelete(collection, filter, multi, relaxed), "Delete", execOptions{retryable: false})
 	if err != nil {
 		return 0, err
 	}
@@ -419,7 +420,7 @@ func (c *Client) DeleteByFilter(ctx context.Context, collection string, filter [
 
 // Count returns the number of documents matching filter (nil = all).
 func (c *Client) Count(ctx context.Context, collection string, filter []byte) (int64, error) {
-	body, err := c.execute(ctx, CmdCount, EncodeCount(collection, filter), "Count", execOptions{retryable: true})
+	body, err := c.execute(ctx, proto.CmdCount, proto.EncodeCount(collection, filter), "Count", execOptions{retryable: true})
 	if err != nil {
 		return 0, err
 	}
@@ -432,7 +433,7 @@ func (c *Client) Count(ctx context.Context, collection string, filter []byte) (i
 
 // Distinct returns the distinct values of field across matching documents.
 func (c *Client) Distinct(ctx context.Context, collection, field string, filter []byte) ([]any, error) {
-	body, err := c.execute(ctx, CmdCount, EncodeDistinct(collection, filter, field), "Distinct", execOptions{retryable: true})
+	body, err := c.execute(ctx, proto.CmdCount, proto.EncodeDistinct(collection, filter, field), "Distinct", execOptions{retryable: true})
 	if err != nil {
 		return nil, err
 	}
@@ -445,11 +446,11 @@ func (c *Client) Distinct(ctx context.Context, collection, field string, filter 
 
 // Aggregate runs a bounded aggregation pipeline and returns result documents.
 func (c *Client) Aggregate(ctx context.Context, collection string, pipeline []byte) ([]Document, error) {
-	body, err := c.execute(ctx, CmdAggregate, EncodeAggregate(collection, pipeline), "Aggregate", execOptions{retryable: true})
+	body, err := c.execute(ctx, proto.CmdAggregate, proto.EncodeAggregate(collection, pipeline), "Aggregate", execOptions{retryable: true})
 	if err != nil {
 		return nil, err
 	}
-	rows, err := DecodeAggregateResponse(body)
+	rows, err := proto.DecodeAggregateResponse(body)
 	if err != nil {
 		return nil, fmt.Errorf("zydecodb: decode aggregate: %w", err)
 	}

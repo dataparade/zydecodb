@@ -239,11 +239,15 @@ def encode_query_index_range(
     hi: Any,
     page_size: int,
     cursor: bytes,
+    include_bodies: bool = True,
 ) -> bytes:
     out = bytes([QUERY_INDEX_RANGE])
     out += _lp(collection.encode()) + _lp(index.encode())
     out += struct.pack(">I", page_size)
     out += _lp(_encode_bound(lo)) + _lp(_encode_bound(hi)) + _lp(cursor)
+    # Append-only trailer: omit when true so legacy vectors match.
+    if not include_bodies:
+        out += b"\x00"
     return out
 
 

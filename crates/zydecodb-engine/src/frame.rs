@@ -18,8 +18,9 @@ use crate::errors::{EngineError, Status};
 pub const PROTO_VERSION: u8 = 0x01;
 pub const ENVELOPE_HEADER_LEN: usize = 6;
 
-/// Command codes for the 0.9 wire. Implemented opcodes and this numbering are
-/// frozen for 0.11.x; reserved slots may gain semantics later without renumbering.
+/// Command codes for wire `proto_version = 1`. Implemented opcodes and this
+/// numbering are frozen for 1.x; new opcodes append only. Reserved slots may
+/// gain semantics later without renumbering.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -189,20 +190,19 @@ impl RequestEnvelope {
     }
 
     /// Parse a header (6 bytes). Returns `(command, payload_len)`.
+    ///
+    /// Unknown opcodes are an error here so in-memory [`RequestEnvelope`]
+    /// decode stays strict. The server read path uses
+    /// [`parse_request_header`] instead, which drains the payload and answers
+    /// unknown opcodes with `ProtocolError` without closing the connection.
     pub fn parse_header(header: &[u8]) -> Result<(Command, usize), EngineError> {
-        if header.len() < ENVELOPE_HEADER_LEN {
-            return Err(EngineError::Protocol("short header".into()));
+        match parse_request_header(header)? {
+            RequestHeader::Known { command, len } => Ok((command, len)),
+            RequestHeader::Unknown { opcode, .. } => Err(EngineError::Protocol(format!(
+                "unknown command 0x{:02x}",
+                opcode
+            ))),
         }
-        if header[0] != PROTO_VERSION {
-            return Err(EngineError::Protocol(format!(
-                "unsupported protocol version 0x{:02x}",
-                header[0]
-            )));
-        }
-        let command = Command::from_u8(header[1])
-            .ok_or_else(|| EngineError::Protocol(format!("unknown command 0x{:02x}", header[1])))?;
-        let len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
-        Ok((command, len))
     }
 
     /// Decode a complete in-memory buffer (header + payload).
@@ -216,6 +216,35 @@ impl RequestEnvelope {
             command,
             payload: body[..len].to_vec(),
         })
+    }
+}
+
+/// Result of parsing a request envelope header on the live server path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestHeader {
+    Known { command: Command, len: usize },
+    /// Recognized framing, unrecognized opcode. Caller must still read `len`
+    /// payload bytes to stay synchronized, then reply with `ProtocolError`.
+    Unknown { opcode: u8, len: usize },
+}
+
+/// Parse a 6-byte request header, distinguishing unknown opcodes from hard
+/// protocol errors (bad version / short header).
+pub fn parse_request_header(header: &[u8]) -> Result<RequestHeader, EngineError> {
+    if header.len() < ENVELOPE_HEADER_LEN {
+        return Err(EngineError::Protocol("short header".into()));
+    }
+    if header[0] != PROTO_VERSION {
+        return Err(EngineError::Protocol(format!(
+            "unsupported protocol version 0x{:02x}",
+            header[0]
+        )));
+    }
+    let opcode = header[1];
+    let len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+    match Command::from_u8(opcode) {
+        Some(command) => Ok(RequestHeader::Known { command, len }),
+        None => Ok(RequestHeader::Unknown { opcode, len }),
     }
 }
 
@@ -370,12 +399,24 @@ mod tests {
     fn command_round_trips() {
         for b in [
             0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
-            0x28, 0x29, 0x2A, 0x2B, 0x30, 0x31, 0x40, 0x41, 0xF0, 0xF1,
+            0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x30, 0x31, 0x40, 0x41, 0x42, 0xF0, 0xF1,
         ] {
             let c = Command::from_u8(b).unwrap();
             assert_eq!(c.as_u8(), b);
         }
         assert!(Command::from_u8(0x99).is_none());
+    }
+
+    #[test]
+    fn parse_request_header_unknown_opcode() {
+        let header = [PROTO_VERSION, 0x99, 0, 0, 0, 4];
+        match parse_request_header(&header).unwrap() {
+            RequestHeader::Unknown { opcode, len } => {
+                assert_eq!(opcode, 0x99);
+                assert_eq!(len, 4);
+            }
+            RequestHeader::Known { .. } => panic!("expected unknown"),
+        }
     }
 
     #[test]

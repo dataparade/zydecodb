@@ -1,4 +1,4 @@
-# ZydecoDB Document Store — Architecture
+# Protocol and document store
 
 How the document layer works today: collections of JSON documents with a
 query/index layer, riding on the durable LSM key-value engine.
@@ -6,9 +6,9 @@ query/index layer, riding on the durable LSM key-value engine.
 **Audience:** Engineers working on collections, indexes, query execution, or the
 wire protocol.
 
-**Related:** [`docs/SECURITY.md`](SECURITY.md), [`docs/REPLICATION.md`](REPLICATION.md),
-[`docs/SHIPPING.md`](SHIPPING.md). Pre-implementation design notes and ADRs live
-in [`docs/archive/`](archive/) and are lineage only.
+**Related:** [`GUIDE.md`](GUIDE.md) (security, pods, replication, shipping, upgrades),
+[`COMPATIBILITY.md`](COMPATIBILITY.md) (1.x semver contract). Pre-implementation
+design notes and ADRs live in [`docs/archive/`](archive/) and are lineage only.
 
 ---
 
@@ -211,42 +211,84 @@ indexer.
 | `0x01` | `Put` | Implemented (raw KV) |
 | `0x02` | `Get` | Implemented (raw KV) |
 | `0x03` | `Del` | Implemented (raw KV) |
-| `0x20` | `Query` | Implemented (document layer) |
+| `0x10` | `Begin` | Implemented (start bounded per-connection transaction) |
+| `0x11` | `Commit` | Implemented (validate + one atomic WAL batch) |
+| `0x12` | `Rollback` | Implemented (discard staged ops) |
+| `0x20` | `Query` | Implemented (document layer; modes below) |
 | `0x21` | `DocPut` | Implemented (document upsert; optional `expires_at` trailer) |
 | `0x22` | `DocDel` | Implemented (document delete) |
 | `0x23` | `Find` | Implemented (filter + sort/projection/pagination) |
 | `0x24` | `Update` | Implemented (filter-based partial update; `FLAG_UPSERT`) |
 | `0x25` | `Delete` | Implemented (filter-based delete) |
-| `0x26` | `Count` | Implemented (count / distinct) |
+| `0x26` | `Count` | Implemented (count / distinct; modes below) |
 | `0x27` | `DocGetRev` | Implemented (by-id get returning opaque revision) |
 | `0x28` | `FindRev` | Implemented (find page rows include opaque revision) |
 | `0x29` | `DocPutIfMatch` | Implemented (conditional replace; stale/missing → `Conflict`) |
 | `0x2A` | `DocUpdateIfMatch` | Implemented (conditional by-id update; stale/missing → `Conflict`) |
-| `0x2B` | `Aggregate` | Implemented (optional `$match` + one `$group`; see [`AGGREGATION.md`](AGGREGATION.md)) |
-| `0x2C` | `Watch` | Implemented (primary-only collection change stream; see [`CHANGE_STREAMS.md`](CHANGE_STREAMS.md)) |
-| `0x30` | `IndexDef` | Implemented (index create + backfill; optional TTL `expire_after_seconds` trailer) |
+| `0x2B` | `Aggregate` | Implemented (optional `$match` + one `$group`; see [Aggregation](#aggregation)) |
+| `0x2C` | `Watch` | Implemented (primary-only collection change stream; see [Change streams](#change-streams)) |
+| `0x30` | `IndexDef` | Implemented (index create + backfill; optional TTL / direction trailers) |
+| `0x31` | `SchemaDef` | Reserved (parseable; responds `ProtocolError` until schemas) |
 | `0x40` | `SessionInit` | Implemented (API-key auth handshake) |
 | `0x41` | `SetContext` | Implemented (admin tenant switch) |
 | `0x42` | `AdminDropTenant` | Implemented (live tenant offboard; admin path) |
 | `0xF0` | `Ping` | Implemented |
 | `0xF1` | `Stats` | Implemented |
-| `0x10` | `Begin` | Implemented (start bounded per-connection transaction) |
-| `0x11` | `Commit` | Implemented (validate + one atomic WAL batch) |
-| `0x12` | `Rollback` | Implemented (discard staged ops) |
-| `0x31` | `SchemaDef` | Reserved (parseable; `ProtocolError` until schemas) |
 
-**0.9 freeze:** implemented opcodes above, write flags (`FLAG_RELAXED=0x01`,
-`FLAG_UPSERT=0x02`; unused flag bits must be zero), and status bytes in
-`zydecodb-engine::errors` (including `PolicyRejected` / `UnsupportedFormat`) are
-**frozen for 0.11.x** — append-only, no renumbering. Reserved slots and the
-Not-yet list may gain semantics later without changing existing codes. On-disk
-format upgrades follow [`UPGRADE.md`](UPGRADE.md). Official drivers expose DocPut
-`expires_at` and IndexDef `expire_after_seconds` (TTL indexes); other admin
-opcodes may still lag the freeze. Driver and server version pinning (including
-the nested Go module tag `clients/go/vX.Y.Z`) is documented in
-[`RELEASES.md`](RELEASES.md).
+### Status bytes (`errors.rs`)
 
-Payload codecs are in `zydecodb-document/src/wire.rs`. The official drivers (Python, Go, TypeScript) are the intended product surface; the binary wire sits behind them.
+| Byte | Name | Meaning |
+|------|------|---------|
+| `0x00` | `Ok` | Success |
+| `0x01` | `NotFound` | Missing key/document (drivers often map to absence, not an exception) |
+| `0x02` | `Error` | Generic server failure |
+| `0x03` | `Conflict` | Constraint / revision conflict |
+| `0x04` | `IoError` | I/O failure |
+| `0x05` | `InvalidKey` | Malformed key |
+| `0x06` | `InvalidValue` | Malformed value / document body |
+| `0x07` | `EngineBusy` | Load shedding / rate limit (idempotent ops may retry) |
+| `0x08` | `ProtocolError` | Malformed payload, unused flag bits, unknown/unimplemented opcode |
+| `0x09` | `PolicyRejected` | Write-policy / quota rejection |
+| `0x0A` | `UnsupportedFormat` | On-disk artifact version the engine cannot read |
+| `0x0B` | `Unauthorized` | Missing/invalid API key or pre-SessionInit |
+| `0x0C` | `Forbidden` | Authenticated but not permitted (role, ACL, replica) |
+
+### Payload discriminators (`wire.rs`)
+
+| Surface | Bytes | Notes |
+|---------|-------|-------|
+| Write flags | `FLAG_RELAXED=0x01`, `FLAG_UPSERT=0x02` | Trailing flags on DocPut / Update / Delete / if-match writes. **Unused bits must be zero** — non-zero unknown bits → `ProtocolError`. |
+| Query mode | `0x00` by-id, `0x01` index-range | First payload byte |
+| Query `include_bodies` | trailing `u8` on index-range | `0` = ids only; omitted/`1` = include bodies (append-only trailer) |
+| Find projection | `0x00` none, `0x01` include, `0x02` exclude | |
+| Count mode | `0x00` count, `0x01` distinct | First payload byte |
+| IndexDef direction | trailer tag `0x02` + per-field ASC/DESC | Optional; omitted = all ASC |
+| IndexDef TTL | optional `expire_after_seconds` u64 | |
+| DocPut / DocPutIfMatch | optional `expires_at` u64 trailer | Absolute unix millis; `0`/omitted = never |
+| Watch frames | `0x01` ack, `0x02` event, `0x03` heartbeat | First byte of Ok streaming payloads |
+| Watch ops | `0x01` upsert, `0x02` delete | Inside event frames |
+
+Payload codecs live in `zydecodb-document/src/wire.rs`. Golden encode/decode
+vectors are in [`clients/conformance/vectors.json`](../clients/conformance/vectors.json).
+
+### 1.x wire freeze
+
+`proto_version = 1` opcodes, status bytes, write flags, and payload discriminators
+above are **frozen for 1.x**:
+
+- Existing encodings never change shape or renumber.
+- New opcodes and status bytes may append; they must not reuse assigned values.
+- Unknown opcodes (bytes outside `Command::from_u8`) and reserved-but-unimplemented
+  opcodes (e.g. `SchemaDef`) both respond with status `ProtocolError` (`0x08`) and
+  **keep the connection open**. Hard connection close is reserved for unparseable
+  framing (bad version, truncated header/payload, desync).
+- Official drivers never send opcodes they do not implement. Older servers answer
+  new opcodes with `ProtocolError` rather than silently degrading.
+- On-disk format upgrades follow [`GUIDE.md`](GUIDE.md#upgrading). Semver / driver
+  compatibility policy and tagging are in [`COMPATIBILITY.md`](COMPATIBILITY.md#releases-and-tagging).
+
+The official drivers (Python, Go, TypeScript) are the intended product surface;
+the binary wire sits behind them.
 
 ### Storage key layout
 
@@ -376,7 +418,7 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 
 ## Not yet
 
-- Full Mongo aggregation compatibility (`$lookup`, joins, `$unwind`, expressions, multi-stage pipelines beyond `$match`→`$group` — see [`AGGREGATION.md`](AGGREGATION.md) for the supported subset)
+- Full Mongo aggregation compatibility (`$lookup`, joins, `$unwind`, expressions, multi-stage pipelines beyond `$match`→`$group` — see [Aggregation](#aggregation) for the supported subset)
 - Projection pushdown / covered queries (the body is always fetched)
 - Other upsert edge-case Mongo parity beyond `$setOnInsert`
 - Mongo `arrayFilters`, bare `$` / `$[]` / `$[<id>]`, multi-match positional
@@ -390,8 +432,8 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 - Marketed multi-tenant p99 SLA as a universal default (simulated soak ship bar
   δ≤50 ms clears with `[fair]` on; CI gates on ubuntu-latest via
   `tenant-isolation-soak.yml`; still off by default for single-tenant — enable via
-  `config/zydecodb.pods.example.toml`; see [`SECURITY.md`](SECURITY.md#multi-tenant-sharing-model))
-- ZDoc-to-client wire (not part of the 0.9 freeze)
+  `config/zydecodb.pods.example.toml`; see [`GUIDE.md`](GUIDE.md#multi-tenant-sharing-model))
+- ZDoc-to-client wire (not part of the 1.x freeze)
 
 ---
 
@@ -408,3 +450,151 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 9. [`crates/zydecodb/src/server.rs`](../crates/zydecodb/src/server.rs) — `EngineHandle` + thread-per-connection
 
 **Tests:** `crates/zydecodb/tests/document_e2e.rs`, `crates/zydecodb-engine/tests/range_scan.rs`.
+
+## Aggregation
+
+ZydecoDB supports a **bounded**, **deterministic** aggregation opcode (`Aggregate = 0x2B`) for simple rollups. This is not MongoDB aggregation compatibility.
+
+### Supported pipeline
+
+Exactly:
+
+1. Optional first stage: `$match` (same filter language as `Find`)
+2. Required final stage: `$group`
+
+`$group` rules:
+
+- `_id` must be JSON `null` (one global bucket) or a single field reference `"$dotted.path"`
+- Accumulator fields may only be:
+  - `{"$sum":"$path"}` — missing/non-numeric inputs contribute `0`
+  - `{"$count":{}}` — counts every document that reaches `$group`
+
+Hard parser ceilings (not configurable):
+
+- At most two stages
+- At most 16 accumulators
+- Pipeline JSON ≤ 64 KiB
+
+### Numeric semantics
+
+- Integer-only sums stay checked `i64` until any float input promotes the group to finite `f64`
+- Integer overflow or non-finite float output is rejected
+- Missing group-key fields map to `null`
+- Object/array group keys are rejected
+- Result groups are emitted in deterministic scalar/`null` key order
+
+### Resource limits (`[aggregation]`)
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `max_scan_docs` | `100000` | Candidates inspected (counted before residual filter) |
+| `max_groups` | `10000` | Distinct group keys |
+| `max_memory_bytes` | `16MiB` | Group key + accumulator state |
+| `max_result_bytes` | `4MiB` | Encoded response size (enforced while encoding) |
+
+Aggregation is an authenticated **read**. It is unavailable inside bounded transactions. Tenant prefix and collection-prefix ACL apply like other document reads.
+
+### Explicit non-goals
+
+The following remain unsupported and are rejected by the parser:
+
+- `$lookup`, joins, `$unwind`
+- Expression languages, window functions, `$facet`
+- Multi-stage pipelines beyond `$match` → `$group`
+- Spilling to disk / unbounded group maps
+
+### Client APIs
+
+Official clients expose `aggregate(pipeline)` on collection handles (Python, Go, TypeScript). Codec conformance vectors cover request/response framing.
+
+## Change streams
+
+ZydecoDB change streams (`Watch = 0x2C`) deliver **collection-scoped**, **primary-only** document change notifications with **durable resume tokens** backed by a retained WAL archive.
+
+This is **not** raw WAL replication. Replication/shipping uses the operator-owned ship directory; change streams use a separate local archive under `[change_streams].archive_dir` (default `<data_dir>/change_log`).
+
+### Guarantees
+
+- **Events:** `upsert` (full post-write document JSON) or `delete` (document ID only). WAL cannot truthfully distinguish insert/replace/update.
+- **Ordering:** strict `(engine_seq, WAL_op_ordinal)` for fsynced events only.
+- **Delivery:** at-least-once across reconnects. Resume is **exclusive** after the last processed token.
+- **Non-events:** TTL expiry, compaction, index keys, raw KV, and system metadata do not emit events.
+- **Primary-only:** replicas and `replica.from` configurations reject Watch.
+
+### Configuration (`[change_streams]`)
+
+Disabled by default.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Master switch |
+| `archive_dir` | `<data_dir>/change_log` | Retained sealed WAL segment archive |
+| `retention_secs` | `3600` | Time-based prune of oldest sealed archives |
+| `retention_bytes` | `1GiB` | Size-based prune |
+| `heartbeat_ms` | `15000` | Idle heartbeat cadence |
+| `write_timeout_ms` | `5000` | Slow-consumer socket write deadline |
+| `max_subscriptions` | `128` | Global concurrent Watch connections |
+| `max_subscriptions_per_tenant` | `8` | Per-tenant cap |
+
+When enabled, a covered WAL segment is unlinked only after archive confirmation. Archive failures retain the source WAL and retry rather than creating a silent history gap.
+
+### Protocol
+
+1. Client opens a **dedicated** connection (not a pooled one-request connection).
+2. After auth + collection ACL, client sends `Watch` with `[collection][resume_token]`.
+3. Server ACKs, then streams framed Ok payloads: `ACK`, `EVENT`, `HEARTBEAT`.
+4. Client cancellation closes the socket. Server shutdown, credential revocation, collection removal, write timeout, retention gap, and peer close all terminate the stream and release capacity.
+
+Resume tokens are opaque, versioned, CRC-checked, and bound to database ID, tenant prefix, and collection ID. Malformed/cross-scope tokens are protocol/forbidden errors; a valid token older than retention returns `Conflict`.
+
+Drivers accept **raw bytes** (or language buffer) on `watch(resume=...)` and
+surface **base64 strings** on emitted events. Do not round-trip the base64
+string back without decoding.
+
+### Internal formats (1.0)
+
+These formats are internal to the server. Drivers treat resume tokens as opaque.
+They are documented here so 1.0.x → 1.0.y upgrades stay honest.
+
+#### Resume token (`TOKEN_VERSION = 1`)
+
+```text
+[1]  version (0x01)
+[16] database_id
+[2]  tenant_prefix_len (u16 BE)
+[N]  tenant_prefix
+[4]  collection_id (u32 BE)
+[8]  seq (u64 BE)
+[4]  op_ordinal (u32 BE)
+[4]  crc32 of all preceding bytes (u32 BE)
+```
+
+Unknown versions fail decode with `ProtocolError`. A token that survives a
+patch upgrade is valid if its `(seq, op_ordinal)` is still inside the retained
+archive window.
+
+#### Archive `manifest.json` (1.0 shape)
+
+Required fields (no schema-version key today):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `database_id_hex` | string | 32-char hex of the 16-byte database id |
+| `segments` | array | Ordered archive entries |
+
+Each segment object: `segment_id`, `min_seq`, `max_seq`, `sealed_unix_ms`,
+`size_bytes`, `file_name`. Missing required fields fail closed on load.
+Unknown JSON fields are ignored by serde defaults (forward-tolerant within 1.x).
+Archived segment files reuse the live WAL segment format
+(`WAL_FORMAT_VERSION`).
+
+### Operational limits
+
+- No server-side event queue and no multiplexing: each subscriber pulls one event at a time on its connection.
+- Falling behind retention is a terminal gap error — shorten retention only if consumers can keep up.
+- Heartbeats keep NAT/load-balancer idle timeouts from killing quiet subscriptions.
+- Metrics include active subscriptions, delivered events/heartbeats, disconnect reasons, and archive segment/byte/sequence gauges.
+
+### Client APIs
+
+Python / Go / TypeScript expose `watch(...)` returning a stream/iterator of change events with opaque base64 resume tokens. Tokens are not advanced until the caller receives the event.

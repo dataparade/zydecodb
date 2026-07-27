@@ -357,3 +357,35 @@ fn fixtures_directory_is_a_format_history_archive() {
         fixtures.display()
     );
 }
+
+// ---------- Change-stream resume tokens ----------
+
+#[test]
+fn resume_token_version_is_pinned() {
+    assert_eq!(zydecodb_engine::change_log::TOKEN_VERSION, 1);
+}
+
+#[test]
+fn resume_token_round_trips_and_rejects_unknown_version() {
+    use zydecodb_engine::change_log::ResumeToken;
+
+    let token = ResumeToken {
+        database_id: [0xAB; 16],
+        tenant_prefix: vec![0x01, 0x02, 0x03],
+        collection_id: 7,
+        seq: 99,
+        op_ordinal: 3,
+    };
+    let bytes = token.encode();
+    assert_eq!(bytes[0], 1);
+    assert_eq!(ResumeToken::decode(&bytes).unwrap(), token);
+
+    let mut bad = bytes;
+    bad[0] = 0x99;
+    let err = ResumeToken::decode(&bad).expect_err("unknown token version");
+    assert!(matches!(err, EngineError::Protocol(_)));
+    assert!(
+        err.to_string().contains("unsupported resume token version"),
+        "{err}"
+    );
+}

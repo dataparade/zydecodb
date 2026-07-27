@@ -994,6 +994,16 @@ fn serve_stream<S: Read + Write>(
                 last_activity = Instant::now();
                 r
             }
+            ReadOutcome::UnknownCommand(opcode) => {
+                last_activity = Instant::now();
+                let resp = zydecodb_engine::frame::ResponseEnvelope::error(
+                    zydecodb_engine::errors::Status::ProtocolError,
+                    &format!("unknown command 0x{opcode:02x}"),
+                );
+                write_response(stream, &resp)?;
+                stream.flush()?;
+                continue;
+            }
             // Idle (no request started): keep the connection warm for pooled
             // clients, but enforce the configurable idle cap so dead peers are
             // eventually reclaimed. An open transaction also expires on its own
@@ -1229,6 +1239,9 @@ const MESSAGE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Result of attempting to read one request frame.
 enum ReadOutcome {
     Request(zydecodb_engine::frame::RequestEnvelope),
+    /// Framed request with an unrecognized opcode. Payload was drained so the
+    /// stream stays synchronized; reply with `ProtocolError` and continue.
+    UnknownCommand(u8),
     /// No request was in flight when the socket's read poll timed out. The
     /// connection is healthy and idle.
     Idle,
@@ -1306,7 +1319,9 @@ fn read_message<S: Read>(
     shutdown: &Arc<Mutex<bool>>,
     idle_timeout: Option<Duration>,
 ) -> ReadOutcome {
-    use zydecodb_engine::frame::{RequestEnvelope, ENVELOPE_HEADER_LEN};
+    use zydecodb_engine::frame::{
+        parse_request_header, RequestEnvelope, RequestHeader, ENVELOPE_HEADER_LEN,
+    };
 
     let mut header = [0u8; ENVELOPE_HEADER_LEN];
     match fill(stream, &mut header, shutdown, true, idle_timeout) {
@@ -1316,9 +1331,12 @@ fn read_message<S: Read>(
         Err(e) => return ReadOutcome::Error(e),
     }
 
-    let (command, len) = match RequestEnvelope::parse_header(&header) {
+    let parsed = match parse_request_header(&header) {
         Ok(v) => v,
         Err(e) => return ReadOutcome::Error(e),
+    };
+    let len = match parsed {
+        RequestHeader::Known { len, .. } | RequestHeader::Unknown { len, .. } => len,
     };
     if len > zydecodb_engine::keys::MAX_VALUE_BYTES + 4096 {
         return ReadOutcome::Error(zydecodb_engine::errors::EngineError::Protocol(
@@ -1342,7 +1360,12 @@ fn read_message<S: Read>(
         }
     }
 
-    ReadOutcome::Request(RequestEnvelope { command, payload })
+    match parsed {
+        RequestHeader::Known { command, .. } => {
+            ReadOutcome::Request(RequestEnvelope { command, payload })
+        }
+        RequestHeader::Unknown { opcode, .. } => ReadOutcome::UnknownCommand(opcode),
+    }
 }
 
 /// A read poll timed out / would block (no data yet), not a fatal error.

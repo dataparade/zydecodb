@@ -63,6 +63,7 @@ def _encode_request(kind: str, inp: dict) -> bytes:
             inp["collection"], inp["index_name"],
             lo=_json_field(inp["lo_json"]), hi=_json_field(inp["hi_json"]),
             page_size=inp["limit"], cursor=bytes.fromhex(inp["cursor_hex"]),
+            include_bodies=inp.get("include_bodies", True),
         )
     if kind in ("Find", "FindRev"):
         proj = inp["projection"]
@@ -121,8 +122,12 @@ def _encode_request(kind: str, inp: dict) -> bytes:
         return proto.encode_watch(inp["collection"], resume)
     if kind == "SessionInit":
         return inp["api_key"].encode("utf-8")
-    if kind == "Ping":
+    if kind in ("Ping", "Stats", "SchemaDef", "Begin", "Commit", "Rollback"):
         return b""
+    if kind == "SetContext":
+        return bytes.fromhex(inp["tenant_hex"])
+    if kind == "AdminDropTenant":
+        return bytes.fromhex(inp["tenant_hex"]) + bytes([1 if inp.get("compact") else 0])
     raise AssertionError(f"unhandled request kind: {kind}")
 
 
@@ -213,6 +218,15 @@ def test_response_decode_matches(vec):
         assert op == expected_op
         assert doc_id.decode("utf-8") == vec["decoded"]["doc_id"]
         assert (body or b"").decode("utf-8") == vec["decoded"]["body_json"]
+        return
+    if kind == "StatusResponse":
+        raw = bytes.fromhex(vec["bytes_hex"])
+        assert raw[0] == proto.PROTO_VERSION
+        status = raw[1]
+        plen = int.from_bytes(raw[2:6], "big")
+        detail = raw[6 : 6 + plen].decode("utf-8")
+        assert status == vec["decoded"]["status"], vec["name"]
+        assert detail == vec["decoded"]["detail"], vec["name"]
         return
     raise AssertionError(f"unhandled response kind: {kind}")
 

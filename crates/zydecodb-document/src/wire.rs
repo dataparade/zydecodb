@@ -18,6 +18,17 @@ const FLAG_RELAXED: u8 = 0x01;
 /// Bit 1: filter upsert — insert one document if the update matches nothing.
 const FLAG_UPSERT: u8 = 0x02;
 
+/// Reject unused write-flag bits. Documented contract: unknown bits must be zero.
+fn check_write_flags(flags: u8, allowed: u8) -> DocResult<()> {
+    let unknown = flags & !allowed;
+    if unknown != 0 {
+        return Err(DocError::Protocol(format!(
+            "unused write flag bits set: 0x{unknown:02x}"
+        )));
+    }
+    Ok(())
+}
+
 /// Cursor reader over a payload buffer with bounds-checked primitives.
 struct Reader<'a> {
     buf: &'a [u8],
@@ -117,7 +128,9 @@ impl DocPutPayload {
         let collection = r.lp_string()?;
         let doc_id = r.lp()?.to_vec();
         let body = r.lp()?.to_vec();
-        let relaxed = r.opt_u8() & FLAG_RELAXED != 0;
+        let flags = r.opt_u8();
+        check_write_flags(flags, FLAG_RELAXED)?;
+        let relaxed = flags & FLAG_RELAXED != 0;
         let expires_at = if r.remaining() >= 8 {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(r.take(8)?);
@@ -488,6 +501,7 @@ impl UpdatePayload {
         let update = r.lp()?.to_vec();
         let multi = r.u8()? != 0;
         let flags = r.opt_u8();
+        check_write_flags(flags, FLAG_RELAXED | FLAG_UPSERT)?;
         Ok(UpdatePayload {
             collection,
             filter,
@@ -526,12 +540,13 @@ impl DeletePayload {
         let collection = r.lp_string()?;
         let filter = r.lp()?.to_vec();
         let multi = r.u8()? != 0;
-        let relaxed = r.opt_u8() & FLAG_RELAXED != 0;
+        let flags = r.opt_u8();
+        check_write_flags(flags, FLAG_RELAXED)?;
         Ok(DeletePayload {
             collection,
             filter,
             multi,
-            relaxed,
+            relaxed: flags & FLAG_RELAXED != 0,
         })
     }
 }
@@ -909,7 +924,9 @@ impl DocPutIfMatchPayload {
         let collection = r.lp_string()?;
         let doc_id = r.lp()?.to_vec();
         let body = r.lp()?.to_vec();
-        let relaxed = r.u8()? & FLAG_RELAXED != 0;
+        let flags = r.u8()?;
+        check_write_flags(flags, FLAG_RELAXED)?;
+        let relaxed = flags & FLAG_RELAXED != 0;
         let mut buf = [0u8; 8];
         buf.copy_from_slice(r.take(8)?);
         let if_match = u64::from_be_bytes(buf);
@@ -957,7 +974,9 @@ impl DocUpdateIfMatchPayload {
         let collection = r.lp_string()?;
         let doc_id = r.lp()?.to_vec();
         let update = r.lp()?.to_vec();
-        let relaxed = r.u8()? & FLAG_RELAXED != 0;
+        let flags = r.u8()?;
+        check_write_flags(flags, FLAG_RELAXED)?;
+        let relaxed = flags & FLAG_RELAXED != 0;
         let mut buf = [0u8; 8];
         buf.copy_from_slice(r.take(8)?);
         let if_match = u64::from_be_bytes(buf);
@@ -974,6 +993,38 @@ impl DocUpdateIfMatchPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unused_write_flag_bits_rejected() {
+        let mut put = DocPutPayload {
+            collection: "users".into(),
+            doc_id: b"u1".to_vec(),
+            body: br#"{}"#.to_vec(),
+            relaxed: false,
+            expires_at: 0,
+        }
+        .encode();
+        *put.last_mut().unwrap() |= 0x80;
+        assert!(matches!(
+            DocPutPayload::decode(&put),
+            Err(DocError::Protocol(_))
+        ));
+
+        let mut upd = UpdatePayload {
+            collection: "users".into(),
+            filter: br#"{}"#.to_vec(),
+            update: br#"{"$set":{"a":1}}"#.to_vec(),
+            multi: false,
+            relaxed: false,
+            upsert: false,
+        }
+        .encode();
+        *upd.last_mut().unwrap() |= 0x04;
+        assert!(matches!(
+            UpdatePayload::decode(&upd),
+            Err(DocError::Protocol(_))
+        ));
+    }
 
     #[test]
     fn doc_put_round_trips() {

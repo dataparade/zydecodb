@@ -5,11 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/dataparade/zydecodb/clients/go/internal/proto"
 )
 
 // ChangeEvent is one durable change from a Watch subscription.
 type ChangeEvent struct {
-	Op          string   // "upsert" or "delete"
+	Op          string // "upsert" or "delete"
 	DocID       string
 	Document    Document // nil for delete
 	ResumeToken string   // base64-encoded opaque bytes
@@ -41,19 +42,19 @@ func (cs *ChangeStream) open(ctx context.Context, resumeToken []byte) error {
 	if cs.opened {
 		return nil
 	}
-	status, body, err := cs.conn.request(ctx, CmdWatch, EncodeWatch(cs.collection, resumeToken))
+	status, body, err := cs.conn.request(ctx, proto.CmdWatch, proto.EncodeWatch(cs.collection, resumeToken))
 	if err != nil {
 		return err
 	}
-	if status != StatusOK {
+	if status != proto.StatusOK {
 		return fromStatus(status, "Watch", body)
 	}
-	frame, err := DecodeWatchFrame(body)
+	frame, err := proto.DecodeWatchFrame(body)
 	if err != nil {
 		return err
 	}
 	if frame.Kind != "ack" {
-		return fromStatus(StatusProtocolError, "Watch", []byte("expected initial ack"))
+		return fromStatus(proto.StatusProtocolError, "Watch", []byte("expected initial ack"))
 	}
 	cs.opened = true
 	return nil
@@ -74,10 +75,10 @@ func (cs *ChangeStream) Next(ctx context.Context) (*ChangeEvent, error) {
 		if err != nil {
 			return nil, err
 		}
-		if status != StatusOK {
+		if status != proto.StatusOK {
 			return nil, fromStatus(status, "Watch", body)
 		}
-		frame, err := DecodeWatchFrame(body)
+		frame, err := proto.DecodeWatchFrame(body)
 		if err != nil {
 			return nil, err
 		}
@@ -91,16 +92,16 @@ func (cs *ChangeStream) Next(ctx context.Context) (*ChangeEvent, error) {
 			}
 			return ev, nil
 		default:
-			return nil, fromStatus(StatusProtocolError, "Watch", []byte("invalid event frame"))
+			return nil, fromStatus(proto.StatusProtocolError, "Watch", []byte("invalid event frame"))
 		}
 	}
 }
 
-func changeEventFromFrame(frame WatchFrame) (*ChangeEvent, error) {
+func changeEventFromFrame(frame proto.WatchFrame) (*ChangeEvent, error) {
 	token := base64.StdEncoding.EncodeToString(frame.ResumeToken)
 	docID := string(frame.DocID)
 	switch frame.Op {
-	case WatchOpUpsert:
+	case proto.WatchOpUpsert:
 		doc := Document{}
 		if len(frame.Body) > 0 {
 			if err := json.Unmarshal(frame.Body, &doc); err != nil {
@@ -113,7 +114,7 @@ func changeEventFromFrame(frame WatchFrame) (*ChangeEvent, error) {
 			Document:    doc,
 			ResumeToken: token,
 		}, nil
-	case WatchOpDelete:
+	case proto.WatchOpDelete:
 		return &ChangeEvent{
 			Op:          "delete",
 			DocID:       docID,
@@ -121,7 +122,7 @@ func changeEventFromFrame(frame WatchFrame) (*ChangeEvent, error) {
 			ResumeToken: token,
 		}, nil
 	default:
-		return nil, fromStatus(StatusProtocolError, "Watch", []byte(fmt.Sprintf("unknown op 0x%02x", frame.Op)))
+		return nil, fromStatus(proto.StatusProtocolError, "Watch", []byte(fmt.Sprintf("unknown op 0x%02x", frame.Op)))
 	}
 }
 

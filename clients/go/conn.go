@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"github.com/dataparade/zydecodb/clients/go/internal/proto"
 	"io"
 	"net"
 	"time"
@@ -64,11 +65,11 @@ func dial(ctx context.Context, addr string, timeout time.Duration, apiKey string
 }
 
 func (c *conn) sessionInit(ctx context.Context, apiKey string) error {
-	status, payload, err := c.request(ctx, CmdSessionInit, []byte(apiKey))
+	status, payload, err := c.request(ctx, proto.CmdSessionInit, []byte(apiKey))
 	if err != nil {
 		return err
 	}
-	if status != StatusOK {
+	if status != proto.StatusOK {
 		return fromStatus(status, "SessionInit", payload)
 	}
 	return nil
@@ -119,7 +120,7 @@ func (c *conn) writeRequest(ctx context.Context, command byte, payload []byte) e
 		c.close()
 		return &ConnError{Err: err}
 	}
-	frame := append(EncodeHeader(command, uint32(len(payload))), payload...)
+	frame := append(proto.EncodeHeader(command, uint32(len(payload))), payload...)
 	if _, err := c.nc.Write(frame); err != nil {
 		c.close()
 		return &ConnError{Err: fmt.Errorf("write failed: %w", err)}
@@ -135,11 +136,11 @@ func (c *conn) request(ctx context.Context, command byte, payload []byte) (statu
 }
 
 func (c *conn) recv() (byte, []byte, error) {
-	header := make([]byte, HeaderLen)
+	header := make([]byte, proto.HeaderLen)
 	if _, err := io.ReadFull(c.nc, header); err != nil {
 		return 0, nil, &ConnError{Err: fmt.Errorf("read header failed: %w", err)}
 	}
-	if header[0] != ProtoVersion {
+	if header[0] != proto.ProtoVersion {
 		return 0, nil, &ConnError{Err: fmt.Errorf("unexpected protocol version 0x%02x", header[0])}
 	}
 	status := header[1]
@@ -156,6 +157,6 @@ func (c *conn) recv() (byte, []byte, error) {
 
 // ping sends a keepalive and reports whether the server answered OK.
 func (c *conn) ping(ctx context.Context) bool {
-	status, _, err := c.request(ctx, CmdPing, nil)
-	return err == nil && status == StatusOK
+	status, _, err := c.request(ctx, proto.CmdPing, nil)
+	return err == nil && status == proto.StatusOK
 }

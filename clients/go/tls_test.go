@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"github.com/dataparade/zydecodb/clients/go/internal/proto"
 	"io"
 	"math/big"
 	"net"
@@ -50,7 +51,7 @@ func selfSignedCert(t *testing.T, dnsNames ...string) (tls.Certificate, *x509.Ce
 }
 
 // servePings answers protocol frames on a listener: every request gets an
-// empty StatusOK response. Returns after the listener closes.
+// empty proto.StatusOK response. Returns after the listener closes.
 func servePings(ln net.Listener) {
 	for {
 		nc, err := ln.Accept()
@@ -59,7 +60,7 @@ func servePings(ln net.Listener) {
 		}
 		go func(nc net.Conn) {
 			defer nc.Close()
-			header := make([]byte, HeaderLen)
+			header := make([]byte, proto.HeaderLen)
 			for {
 				if _, err := io.ReadFull(nc, header); err != nil {
 					return
@@ -70,9 +71,9 @@ func servePings(ln net.Listener) {
 						return
 					}
 				}
-				resp := make([]byte, HeaderLen)
-				resp[0] = ProtoVersion
-				resp[1] = StatusOK
+				resp := make([]byte, proto.HeaderLen)
+				resp[0] = proto.ProtoVersion
+				resp[1] = proto.StatusOK
 				if _, err := nc.Write(resp); err != nil {
 					return
 				}

@@ -12,7 +12,7 @@ Prefer one full `user_backend` language when learning — ports exist for the ot
 |---------|----------------|
 | [`user_backend/`](user_backend/) | Full HTTP API — users as documents, login + TTL sessions |
 
-Security model: **ZydecoDB handles connection auth; your app handles human login.** See [`docs/SECURITY.md`](../docs/SECURITY.md).
+Security model: **ZydecoDB handles connection auth; your app handles human login.** See [`docs/GUIDE.md`](../docs/GUIDE.md#security).
 
 ---
 

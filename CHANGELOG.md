@@ -2,9 +2,21 @@
 
 All notable changes to the ZydecoDB server and official drivers are recorded
 here. Version numbers are unified across artifacts; see
-[`docs/RELEASES.md`](docs/RELEASES.md).
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md#releases-and-tagging).
 
 ## [Unreleased]
+
+### Compatibility
+
+- Wire `proto_version = 1` freeze language updated for the upcoming 1.x line:
+  unknown opcodes return `ProtocolError` without closing the connection; unused
+  write-flag bits are rejected. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
+  and [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+- Compatibility policy moves from lockstep driver/server minors to a wire-v1
+  matrix (any 1.x driver ↔ any 1.x server) while keeping unified release tags.
+- Go wire codecs moved to `clients/go/internal/proto` (not a public API).
+- Conformance vectors extended with admin/Stats/SchemaDef, Query
+  `include_bodies=false`, and golden status envelopes for every status byte.
 
 ## [0.11.0] - 2026-07-27
 
@@ -13,7 +25,7 @@ here. Version numbers are unified across artifacts; see
 - `zydecodb update`: in-process self-update from GitHub Releases using the same
   asset contract as `scripts/install.sh` (sha256-verified tarball, atomic
   replace). Flags: `--check`, `--version`, `--force`, `--yes`. Binary only —
-  does not update drivers or data dirs. See `docs/RELEASES.md`.
+  does not update drivers or data dirs. See `docs/COMPATIBILITY.md#updating-the-server-binary`.
 
 ### Compatibility
 
@@ -40,11 +52,11 @@ here. Version numbers are unified across artifacts; see
   when body `expires_at` changes.
 - Minimal aggregation (`Aggregate = 0x2B`): optional `$match` + one `$group`
   with `$sum`/`$count`, deterministic ordering, and `[aggregation]` resource
-  limits. Joins/`$lookup`/`$unwind` remain unsupported. See `docs/AGGREGATION.md`.
+  limits. Joins/`$lookup`/`$unwind` remain unsupported. See `docs/PROTOCOL.md#aggregation`.
 - Change streams (`Watch = 0x2C`): primary-only, collection-scoped, dedicated
   connection streaming of fsynced upsert/delete events with durable resume
   tokens backed by a retained WAL archive (`[change_streams]`, off by default).
-  At-least-once delivery; not raw WAL replication. See `docs/CHANGE_STREAMS.md`.
+  At-least-once delivery; not raw WAL replication. See `docs/PROTOCOL.md#change-streams`.
 
 ### Go / Python / TypeScript drivers
 

@@ -1,7 +1,7 @@
 name: Release
 
 # Cut a release by pushing BOTH the root tag and the Go submodule tag at the
-# same commit (see docs/RELEASES.md), e.g.:
+# same commit (see docs/COMPATIBILITY.md#cutting-a-release), e.g.:
 #   ver=0.9.0
 #   git tag "v${ver}"
 #   git tag "clients/go/v${ver}" "$(git rev-parse "v${ver}^{commit}")"
@@ -32,7 +32,7 @@ jobs:
           go_tag="clients/go/v${ver}"
           if ! git rev-parse "refs/tags/${go_tag}" >/dev/null 2>&1; then
             echo "missing Go module tag ${go_tag} — create it at the same commit as ${tag}"
-            echo "see docs/RELEASES.md"
+            echo "see docs/COMPATIBILITY.md#cutting-a-release"
             exit 1
           fi
           root_commit="$(git rev-parse "${tag}^{commit}")"

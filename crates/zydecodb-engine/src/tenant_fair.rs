@@ -10,7 +10,7 @@
 //! **No WAL capacity reservation** — published FairDB/MS negative result; fairness
 //! is enforced at memtable admission, flush attribution, and stall domains.
 //!
-//! Product claims and enablement: `docs/SECURITY.md` (multi-tenant sharing model).
+//! Product claims and enablement: `docs/GUIDE.md` (multi-tenant sharing model).
 
 use crate::errors::{EngineError, EngineResult};
 use std::collections::HashMap;

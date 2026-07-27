@@ -266,8 +266,9 @@ export function encodeQueryIndexRange(
   hi: Buffer,
   cursor: Buffer,
   limit: number,
+  includeBodies: boolean = true,
 ): Buffer {
-  return Buffer.concat([
+  const parts = [
     Buffer.from([QUERY_INDEX_RANGE]),
     lp(utf8(collection)),
     lp(utf8(index)),
@@ -275,7 +276,12 @@ export function encodeQueryIndexRange(
     lp(lo),
     lp(hi),
     lp(cursor),
-  ]);
+  ];
+  // Append-only trailer: omit when true so legacy vectors match.
+  if (!includeBodies) {
+    parts.push(Buffer.from([0]));
+  }
+  return Buffer.concat(parts);
 }
 
 /** One ordering term: a dotted field path and its direction. */

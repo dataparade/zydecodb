@@ -8,7 +8,7 @@
 #
 # Prove isolation on your box (and on CI ubuntu-latest):
 #   ./scripts/tenant-isolation-soak.sh
-# See docs/SECURITY.md#multi-tenant-sharing-model and docs/SOAK.md.
+# See docs/GUIDE.md#multi-tenant-sharing-model and docs/INTERNAL.md#soak-testing.
 
 listen = "127.0.0.1:9470"
 # Optional local control-plane socket (auth still applies):

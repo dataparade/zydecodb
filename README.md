@@ -78,7 +78,7 @@ export ZYDECODB_API_KEY="zdk_..."   # save the key printed once
 python3 examples/user_backend/app.py --seed
 ```
 
-Details: [`docs/SECURITY.md`](docs/SECURITY.md).
+Details: [`docs/GUIDE.md`](docs/GUIDE.md#security).
 
 ### Docker
 
@@ -90,7 +90,7 @@ Details: [`docs/SECURITY.md`](docs/SECURITY.md).
 docker compose up -d --build
 ```
 
-Compose publishes `:9470` only. Metrics stay on loopback inside the container. See [`docs/SECURITY.md`](docs/SECURITY.md#docker).
+Compose publishes `:9470` only. Metrics stay on loopback inside the container. See [`docs/GUIDE.md`](docs/GUIDE.md#docker).
 
 ## Features
 
@@ -110,15 +110,15 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 - *(Engine/Admin only)* Atomic multi-key writes (`write_batch`) — one WAL record, all-or-nothing on crash
 - *(Engine/Admin only)* Ordered range scans and point-in-time snapshots
 - Crash recovery (WAL replay)
-- Optional off-box WAL backup — [`docs/SHIPPING.md`](docs/SHIPPING.md)
+- Optional off-box WAL backup — [`docs/GUIDE.md`](docs/GUIDE.md#wal-shipping-and-restore)
 
 **Operations**
 - API-key auth, tenant isolation, TLS, rate limits, audit logging
 - Durability you choose: `sync` (fsync-on-commit, default) or `periodic` (bounded-loss, higher throughput), plus a per-write `relaxed` flag
 - Prometheus `/metrics` plus `/healthz`/`/readyz` HTTP endpoints; optional per-tenant request counters
 - Exclusive `data_dir` lock (no accidental double-open) and graceful `SIGTERM`/`SIGINT` shutdown that writes a clean-shutdown marker
-- Read replicas via WAL shipping with assisted failover: a liveness heartbeat, a `replica status` health probe, and `replica promote` with a cooperative epoch fence — [`docs/REPLICATION.md`](docs/REPLICATION.md)
-- Base snapshots and point-in-time restore (`admin snapshot` / `admin restore --to-seq|--to-time`) — [`docs/SHIPPING.md`](docs/SHIPPING.md)
+- Read replicas via WAL shipping with assisted failover: a liveness heartbeat, a `replica status` health probe, and `replica promote` with a cooperative epoch fence — [`docs/GUIDE.md`](docs/GUIDE.md#replication-and-failover)
+- Base snapshots and point-in-time restore (`admin snapshot` / `admin restore --to-seq|--to-time`) — [`docs/GUIDE.md`](docs/GUIDE.md#wal-shipping-and-restore)
 
 **Multi-tenant hosting (pods)**
 - One process can host many tenants. Operational levers are `zydecodb admin ...` subcommands an external control plane shells out to:
@@ -128,19 +128,24 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 - Optional Unix-domain-socket listener (`listen_unix`) for local control-plane traffic without a per-instance TCP port
 - A `[runtime] profile = "low_footprint"` that trims cache, open readers, and idle wakeups for dense multi-instance boxes
 
-**Multi-tenant sharing model (read this):** tenants get **namespace isolation** (key prefix, ACLs, byte/RPS quotas, drop-tenant). Write/catalog mutations still serialize on the engine write lock; block cache, fair-share accounting, and WAL fsync are separate domains. δ-fair memtable/cache/stall isolation is **off by default** for local/single-tenant; pods hosts should start from [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) (`[fair] enabled = true`) and follow the one-page runbook [`docs/PODS.md`](docs/PODS.md). Until fair is on and soak-proven, do not assume one tenant’s write storm cannot affect another’s latency. See [`docs/SECURITY.md`](docs/SECURITY.md#multi-tenant-sharing-model).
+**Multi-tenant sharing model (read this):** tenants get **namespace isolation** (key prefix, ACLs, byte/RPS quotas, drop-tenant). Write/catalog mutations still serialize on the engine write lock; block cache, fair-share accounting, and WAL fsync are separate domains. δ-fair memtable/cache/stall isolation is **off by default** for local/single-tenant; pods hosts should start from [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) (`[fair] enabled = true`) and follow the one-page runbook [`docs/GUIDE.md`](docs/GUIDE.md#multi-tenant-pods). Until fair is on and soak-proven, do not assume one tenant’s write storm cannot affect another’s latency. See [`docs/GUIDE.md`](docs/GUIDE.md#multi-tenant-sharing-model).
 
 ## 0.11 scope
 
-**Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). Filters, sort, projection, pagination, partial updates, `count`/`distinct`, bounded `$match`→`$group` aggregation, optional primary-only change streams, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits. See [`docs/AGGREGATION.md`](docs/AGGREGATION.md) and [`docs/CHANGE_STREAMS.md`](docs/CHANGE_STREAMS.md).
+**Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). Filters, sort, projection, pagination, partial updates, `count`/`distinct`, bounded `$match`→`$group` aggregation, optional primary-only change streams, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md#aggregation) and [`docs/PROTOCOL.md`](docs/PROTOCOL.md#change-streams).
 
-**Not yet:** Mongo-compatible aggregation (`$lookup`/`$unwind`/expressions), general MVCC/multi-document transactional queries (bounded by-ID+KV transactions ship), and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). δ-fair multi-tenant isolation clears the simulated pods soak ship bar (steady victim put p99 δ ≤ 50 ms with `[fair]` on) and the FairDB-style ramp-up reclaim gate (≤ 350 ms) but stays **off by default** — enable via [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) and prove on your hardware via `scripts/tenant-isolation-soak.sh` (`MODE=rampup` for reclaim). See [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) for the gap list and roadmap. Field-based TTL indexes (`expireAfterSeconds` on a unix-millis number field) and per-document DocPut `expires_at` are supported in the server and official drivers. TTL compaction reclamation ships for SST expiry drops.
+**Not yet:** Mongo-compatible aggregation (`$lookup`/`$unwind`/expressions), general MVCC/multi-document transactional queries (bounded by-ID+KV transactions ship), and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). δ-fair multi-tenant isolation clears the simulated pods soak ship bar (steady victim put p99 δ ≤ 50 ms with `[fair]` on) and the FairDB-style ramp-up reclaim gate (≤ 350 ms) but stays **off by default** — enable via [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) and prove on your hardware via `scripts/tenant-isolation-soak.sh` (`MODE=rampup` for reclaim). See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the gap list and roadmap. Field-based TTL indexes (`expireAfterSeconds` on a unix-millis number field) and per-document DocPut `expires_at` are supported in the server and official drivers. TTL compaction reclamation ships for SST expiry drops.
 
 ## Expectations, gotchas, advice
 
-- **0.11.0**. Implemented opcodes, write flags, and status bytes are **frozen for 0.11.x** (append-only on `proto_version = 1`; see [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md#wire-protocol)). Reserved opcodes and listed Not-yet features may gain semantics without renumbering. On-disk format changes follow [`docs/UPGRADE.md`](docs/UPGRADE.md).
+- **0.11.0** (pre-1.0). Wire `proto_version = 1` opcodes, write flags, and status
+  bytes are treated as **frozen for the upcoming 1.x line** (append-only; see
+  [`docs/PROTOCOL.md`](docs/PROTOCOL.md#wire-protocol) and
+  [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). Reserved opcodes may gain
+  semantics without renumbering. On-disk format changes follow
+  [`docs/GUIDE.md`](docs/GUIDE.md#upgrading).
 - **BSL license.** Self-hosting (including in production) is free; you may not offer ZydecoDB to third parties as a competing hosted/managed service. Converts to Apache 2.0 on the change date — see [LICENSE](LICENSE).
-- **Security:** run behind your API on localhost or a private network. See [`docs/SECURITY.md`](docs/SECURITY.md). Do not expose `:9470` to the internet without auth.
+- **Security:** run behind your API on localhost or a private network. See [`docs/GUIDE.md`](docs/GUIDE.md#security). Do not expose `:9470` to the internet without auth.
 - **Keys on the wire** are opaque bytes; the server stores them under the user keyspace (`KS_USER` prefix).
 - **Heavy sustained writes** can leave extra small on-disk files. Cosmetic — no data loss.
 
@@ -159,11 +164,8 @@ cargo test --workspace
 - Official drivers: [`clients/python`](clients/python/README.md), [`clients/go`](clients/go/README.md), [`clients/typescript`](clients/typescript/README.md) — each with pooling, retries, and typed errors
 - [`clients/conformance/README.md`](clients/conformance/README.md) — shared wire conformance vectors that keep every driver byte-compatible with the server
 - [`examples/README.md`](examples/README.md) — client and user-backend walkthroughs
-- [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md) — document layer architecture, gaps, and roadmap
-- [`docs/RELEASES.md`](docs/RELEASES.md) — versioning, dual Go tags (`clients/go/vX.Y.Z`), and pinning
+- [`docs/GUIDE.md`](docs/GUIDE.md) — security, pods, replication, WAL shipping/restore, upgrades
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — document layer, wire protocol, aggregation, change streams
+- [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — 1.x semver contract, releases, and pinning
 - [`CHANGELOG.md`](CHANGELOG.md) — server and driver release notes
-- [`docs/SECURITY.md`](docs/SECURITY.md) — auth, TLS, tenants, δ-fair / pods sharing model
-- [`docs/PODS.md`](docs/PODS.md) — multi-tenant host runbook (fair on, soak prove, offboard)
-- [`docs/SOAK.md`](docs/SOAK.md) — engine soak + multi-tenant isolation soak
-- [`docs/SHIPPING.md`](docs/SHIPPING.md) — off-box WAL durability for disaster recovery
-- [`docs/REPLICATION.md`](docs/REPLICATION.md) — read replicas, WAL shipping, and the failover runbook
+- [`docs/INTERNAL.md`](docs/INTERNAL.md) — architecture pillars and soak testing (contributors)

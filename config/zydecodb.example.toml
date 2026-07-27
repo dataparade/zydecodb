@@ -39,7 +39,7 @@ fsync_interval_ms = 100
 
 # Read-replica mode: replay sha256-verified WAL segments a sidecar delivers from
 # a primary's ship_dir. The node serves reads and rejects writes. Give it its
-# own data_dir/wal_dir (not the primary's). See docs/REPLICATION.md.
+# own data_dir/wal_dir (not the primary's). See docs/GUIDE.md#replication-and-failover.
 # Also settable via `serve --replica-from <dir>`. Disabled unless `from` is set.
 # Health probe + assisted promotion (with the replica stopped):
 #   zydecodb replica status  --config this.toml   # lag + liveness, non-zero if stale
@@ -80,7 +80,7 @@ max_bytes_per_tenant = 0
 # profile = "low_footprint"
 
 # δ-fair pods isolation (off by default for single-tenant). See
-# docs/SECURITY.md#multi-tenant-sharing-model and config/zydecodb.pods.example.toml.
+# docs/GUIDE.md#multi-tenant-sharing-model and config/zydecodb.pods.example.toml.
 # Prove with: ./scripts/tenant-isolation-soak.sh (also gated in CI nightly).
 [fair]
 enabled = false
@@ -88,7 +88,7 @@ enabled = false
 # Advanced knobs (delta_*, ramp_up_k, fork_b_*, l0_write_stall_threshold) exist
 # on FairTomlConfig — leave unset unless soak shows you need them.
 
-# Bounded aggregation (`Aggregate = 0x2B`). See docs/AGGREGATION.md.
+# Bounded aggregation (`Aggregate = 0x2B`). See docs/PROTOCOL.md#aggregation.
 [aggregation]
 # max_scan_docs = 100000
 # max_groups = 10000
@@ -97,7 +97,7 @@ enabled = false
 
 # Collection change streams (`Watch = 0x2C`). Disabled by default.
 # Primary-only; uses a retained WAL archive (not shipping/replication).
-# See docs/CHANGE_STREAMS.md.
+# See docs/PROTOCOL.md#change-streams.
 [change_streams]
 enabled = false
 # archive_dir = "/var/lib/zydecodb/change_log"
