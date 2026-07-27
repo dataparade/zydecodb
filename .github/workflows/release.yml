@@ -179,6 +179,8 @@ jobs:
 
   # Resolve the nested Go module tag with GOPROXY=direct so a forgotten or
   # mismatched clients/go/v* tag fails the release before consumers notice.
+  # Retries: tag push → sumdb/GitHub visibility can lag a minute or two when
+  # cutting versions back-to-back.
   verify-go-module:
     needs: create-release
     runs-on: ubuntu-latest
@@ -186,13 +188,33 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
+          cache: false
       - name: Resolve tagged module version
         run: |
+          set -euo pipefail
           ver="${GITHUB_REF_NAME#v}"
+          module="github.com/dataparade/zydecodb/clients/go@v${ver}"
           tmp="$(mktemp -d)"
           cd "$tmp"
           go mod init verify
-          GOPROXY=direct go get "github.com/dataparade/zydecodb/clients/go@v${ver}"
+
+          # Brand-new nested tags are often invisible to go/sumdb for a short
+          # window right after `git push --tags`. Retry with backoff.
+          ok=0
+          for attempt in $(seq 1 12); do
+            echo "attempt ${attempt}/12: GOPROXY=direct go get ${module}"
+            if GOPROXY=direct go get "${module}"; then
+              ok=1
+              break
+            fi
+            echo "go get failed; waiting before retry..."
+            sleep $(( attempt * 10 ))
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "failed to resolve ${module} after retries"
+            exit 1
+          fi
+
           go list -m -json github.com/dataparade/zydecodb/clients/go | tee /tmp/go-mod.json
           grep -q "\"Version\": \"v${ver}\"" /tmp/go-mod.json
           ! grep -q 'v0\.0\.0-' go.mod
