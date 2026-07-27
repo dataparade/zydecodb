@@ -138,3 +138,23 @@ def test_optimistic_concurrency(coll):
         pass
     after = coll.update_by_id_if_match(doc_id, {"$inc": {"n": 1}}, if_match=new_rev)
     assert after > new_rev
+
+
+def test_bounded_transaction(db, coll):
+    # Collection must exist before Begin.
+    coll.insert_one({"_seed": True})
+    key = f"tx-py-{coll.name}".encode("utf-8")
+    with db.transaction() as tx:
+        tx.put(key, b"v1")
+        tx.put_document(coll.name, "u1", {"n": 1})
+        assert tx.get(key) == b"v1"
+    assert db.get(key) == b"v1"
+
+    from zydecodb.transaction import Transaction
+
+    conn = db._pool.acquire()
+    tx = Transaction(db, conn)
+    tx._begin()
+    tx.put(b"tx-rollback", b"nope")
+    tx.rollback()
+    assert db.get(b"tx-rollback") is None

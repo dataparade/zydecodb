@@ -16,17 +16,40 @@ use zydecodb_engine::engine::Engine;
 /// System key for the catalog blob: `KS_SYSTEM` (0x00) + `"doc/catalog"`.
 pub const CATALOG_SYS_KEY: &[u8] = b"\x00doc/catalog";
 
+fn directions_all_ascending(dirs: &[bool]) -> bool {
+    dirs.iter().all(|&d| d)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexMeta {
     pub id: u32,
     pub name: String,
     /// Dotted JSON paths whose values form the (composite) index key, in order.
     pub fields: Vec<String>,
+    /// Per-field ascending flags (same length as `fields`). Empty/`[]` or missing
+    /// in old catalog JSON means all ascending.
+    #[serde(default, skip_serializing_if = "directions_all_ascending")]
+    pub directions: Vec<bool>,
     pub unique: bool,
     /// When set, this is a TTL index: body `expires_at` is derived as
     /// `field_unix_millis + expire_after_seconds * 1000`. At most one per collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expire_after_seconds: Option<u64>,
+}
+
+impl IndexMeta {
+    /// Normalized per-field ascending flags (length == `fields.len()`).
+    pub fn ascending(&self) -> Vec<bool> {
+        if self.directions.is_empty() {
+            vec![true; self.fields.len()]
+        } else if self.directions.len() == self.fields.len() {
+            self.directions.clone()
+        } else {
+            let mut d = self.directions.clone();
+            d.resize(self.fields.len(), true);
+            d
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,9 +144,37 @@ impl Catalog {
         unique: bool,
         expire_after_seconds: Option<u64>,
     ) -> DocResult<IndexMeta> {
+        self.add_index_directed(
+            prefix,
+            collection,
+            name,
+            fields,
+            Vec::new(),
+            unique,
+            expire_after_seconds,
+        )
+    }
+
+    /// Like [`add_index`] with explicit per-field ascending flags. Empty
+    /// `directions` means all ascending. Length must match `fields` when non-empty.
+    pub fn add_index_directed(
+        &mut self,
+        prefix: &[u8],
+        collection: &str,
+        name: &str,
+        fields: Vec<String>,
+        directions: Vec<bool>,
+        unique: bool,
+        expire_after_seconds: Option<u64>,
+    ) -> DocResult<IndexMeta> {
         if fields.is_empty() {
             return Err(DocError::Protocol(
                 "index must have at least one field".into(),
+            ));
+        }
+        if !directions.is_empty() && directions.len() != fields.len() {
+            return Err(DocError::Protocol(
+                "index directions length must match fields".into(),
             ));
         }
         if expire_after_seconds.is_some() && fields.len() != 1 {
@@ -131,12 +182,19 @@ impl Catalog {
                 "TTL index must have exactly one field (unix millis)".into(),
             ));
         }
+        // Persist empty when all-ascending so serde omit/default round-trips cleanly.
+        let directions = if directions.is_empty() || directions.iter().all(|&d| d) {
+            Vec::new()
+        } else {
+            directions
+        };
         let collection_id = self.ensure_collection(prefix, collection);
         let index_id = self.next_index_id;
         let meta = IndexMeta {
             id: index_id,
             name: name.to_string(),
             fields,
+            directions,
             unique,
             expire_after_seconds,
         };

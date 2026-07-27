@@ -10,6 +10,7 @@ use crate::commit::CommitCoordinator;
 use crate::security::keys::KeyRole;
 use crate::security::{SecurityRuntime, SessionState};
 use crate::shared::{SharedCatalog, SharedEngine};
+use zydecodb_document::aggregation::{execute_aggregation, AggregationLimits, AggregationPipeline};
 use zydecodb_document::catalog::Catalog;
 use zydecodb_document::error::{DocError, DocResult};
 use zydecodb_document::filter::Filter;
@@ -149,6 +150,7 @@ pub fn handle_document(
 
     let prefix = tenant_prefix(session, security.legacy_single_tenant);
     let sort_cap = security.max_sort_buffer;
+    let agg_limits = security.aggregation_limits;
 
     match req.command {
         Command::DocPut => doc_put(engine, catalog, commit, &prefix, &req.payload),
@@ -189,6 +191,13 @@ pub fn handle_document(
             &prefix,
             &req.payload,
         )),
+        Command::Aggregate => result(aggregate_cmd(
+            engine,
+            catalog,
+            &prefix,
+            &req.payload,
+            agg_limits,
+        )),
         _ => ResponseEnvelope::error(Status::ProtocolError, "unimplemented"),
     }
 }
@@ -212,6 +221,7 @@ fn collection_for_acl(cmd: Command, payload: &[u8]) -> DocResult<String> {
             wire::CountPayload::Count { collection, .. }
             | wire::CountPayload::Distinct { collection, .. } => Ok(collection),
         },
+        Command::Aggregate => Ok(wire::AggregatePayload::decode(payload)?.collection),
         _ => Err(DocError::Protocol("unimplemented document command".into())),
     }
 }
@@ -438,13 +448,14 @@ fn index_def(
         } else {
             Some(p.expire_after_seconds)
         };
-        let r = store::define_index(
+        let r = store::define_index_directed(
             &mut guard,
             &mut cat,
             prefix,
             &p.collection,
             &p.index_name,
             p.fields,
+            p.directions,
             p.unique,
             ttl,
         );
@@ -703,6 +714,27 @@ fn select_candidates(
                 .collect(),
         )
     }
+}
+
+/// Bounded aggregation (read-only, two-phase). Unavailable inside transactions
+/// because Aggregate is intentionally omitted from `is_transaction_allowed`.
+fn aggregate_cmd(
+    engine: &SharedEngine,
+    catalog: &SharedCatalog,
+    prefix: &[u8],
+    payload: &[u8],
+    limits: AggregationLimits,
+) -> DocResult<ResponseEnvelope> {
+    let p = wire::AggregatePayload::decode(payload)?;
+    let pipeline = AggregationPipeline::parse(&p.pipeline)?;
+    let snap = {
+        let guard = engine.read();
+        guard.snapshot_owned()
+    };
+    let cat = catalog.read().unwrap();
+    let result = execute_aggregation(&snap, &cat, prefix, &p.collection, &pipeline, limits)?;
+    let body = wire::encode_aggregate_response(&result.rows, limits.max_result_bytes)?;
+    Ok(ResponseEnvelope::ok(body))
 }
 
 /// Filter-based count and distinct (read-only, two-phase).

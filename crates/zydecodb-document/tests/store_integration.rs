@@ -197,6 +197,85 @@ fn filtered_write_recheck_skips_stale_candidates() {
 }
 
 #[test]
+fn filtered_positional_set_maintains_indexes() {
+    use zydecodb_document::filter::Filter;
+    use zydecodb_document::query::FindSpec;
+    use zydecodb_document::update::{self, UpdateDoc};
+
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    cat.ensure_collection(PREFIX, "orders");
+    cat.add_index(
+        PREFIX,
+        "orders",
+        "by_status",
+        vec!["status".into()],
+        false,
+        None,
+    )
+    .unwrap();
+    cat.persist(&mut e).unwrap();
+
+    store::upsert(
+        &mut e,
+        &cat,
+        PREFIX,
+        "orders",
+        b"o1",
+        br#"{"status":"open","items":[{"skuId":"A","qty":1},{"skuId":"B","qty":2}]}"#,
+        false,
+    )
+    .unwrap();
+
+    let upd = UpdateDoc::parse_bytes(br#"{"$set":{"items.$[skuId=B].qty":9,"status":"packed"}}"#)
+        .unwrap();
+    assert!(update::apply_to_id(&mut e, &cat, PREFIX, "orders", b"o1", &upd).unwrap());
+
+    let snap = e.snapshot_owned();
+    let page = query::execute_find(
+        &snap,
+        &cat,
+        PREFIX,
+        "orders",
+        &FindSpec {
+            filter: Filter::parse_bytes(br#"{"status":"packed"}"#).unwrap(),
+            sort: vec![],
+            projection: None,
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        query::MAX_SORT_BUFFER,
+    )
+    .unwrap();
+    assert_eq!(page.rows.len(), 1);
+    let body: serde_json::Value =
+        serde_json::from_slice(page.rows[0].body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["items"][1]["qty"], 9);
+    assert_eq!(body["status"], "packed");
+
+    // Old status index entry is gone.
+    let old = query::execute_find(
+        &snap,
+        &cat,
+        PREFIX,
+        "orders",
+        &FindSpec {
+            filter: Filter::parse_bytes(br#"{"status":"open"}"#).unwrap(),
+            sort: vec![],
+            projection: None,
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        query::MAX_SORT_BUFFER,
+    )
+    .unwrap();
+    assert!(old.rows.is_empty());
+}
+
+#[test]
 fn if_match_succeeds_when_revision_current() {
     use zydecodb_document::update::{self, UpdateDoc};
 
@@ -609,4 +688,88 @@ fn oversized_document_batch_is_rejected() {
     assert!(query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn expires_at_change_rewrites_index_keys_for_compaction_reclaim() {
+    use zydecodb_document::filter::Filter;
+    use zydecodb_document::query::FindSpec;
+    use zydecodb_engine::compaction::CompactionConfig;
+
+    let dir = TempDir::new().unwrap();
+    let mut e = Engine::open(EngineConfig {
+        data_dir: dir.path().join("data"),
+        wal_dir: dir.path().join("data/wal"),
+        compaction: {
+            let mut c = CompactionConfig::default();
+            c.l0_trigger = 2;
+            c.target_file_bytes = 512;
+            c
+        },
+        ..Default::default()
+    })
+    .unwrap();
+    let mut cat = Catalog::default();
+    cat.ensure_collection(PREFIX, "sess");
+    cat.add_index(
+        PREFIX,
+        "sess",
+        "by_status",
+        vec!["status".into()],
+        false,
+        None,
+    )
+    .unwrap();
+    cat.persist(&mut e).unwrap();
+
+    let far = 4_000_000_000_000u64; // far future millis
+    store::upsert_with_expiry(
+        &mut e,
+        &cat,
+        PREFIX,
+        "sess",
+        b"s1",
+        br#"{"status":"open"}"#,
+        false,
+        far,
+    )
+    .unwrap();
+    e.force_flush().unwrap();
+
+    // Same indexed fields, shorter expiry — intersection index keys must be rewritten.
+    store::upsert_with_expiry(
+        &mut e,
+        &cat,
+        PREFIX,
+        "sess",
+        b"s1",
+        br#"{"status":"open"}"#,
+        false,
+        1,
+    )
+    .unwrap();
+    e.force_flush().unwrap();
+    e.drain_compaction().unwrap();
+
+    let snap = e.snapshot_owned();
+    assert!(query::get_by_id(&snap, &cat, PREFIX, "sess", b"s1")
+        .unwrap()
+        .is_none());
+    let page = query::execute_find(
+        &snap,
+        &cat,
+        PREFIX,
+        "sess",
+        &FindSpec {
+            filter: Filter::parse_bytes(br#"{"status":"open"}"#).unwrap(),
+            sort: vec![],
+            projection: None,
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        query::MAX_SORT_BUFFER,
+    )
+    .unwrap();
+    assert!(page.rows.is_empty(), "expired body+index must both reclaim");
 }

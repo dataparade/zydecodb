@@ -159,7 +159,11 @@ impl DocDelPayload {
     }
 }
 
-// ---- IndexDef: [collection][index_name][unique u8][field_count u32]{[field]} ----
+// ---- IndexDef: [collection][index_name][unique u8][field_count u32]{[field]}
+//      [optional ttl u64][optional 0x02 + N direction bytes] ----
+
+/// Trailer tag for per-field ascending flags (1=ASC, 0=DESC).
+pub const INDEX_DIR_TAG: u8 = 0x02;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDefPayload {
@@ -167,11 +171,18 @@ pub struct IndexDefPayload {
     pub index_name: String,
     pub fields: Vec<String>,
     pub unique: bool,
-    /// TTL duration in seconds. `0` = not a TTL index (trailer omitted on wire).
+    /// TTL duration in seconds. `0` = not a TTL index (trailer omitted on wire
+    /// unless directions are present).
     pub expire_after_seconds: u64,
+    /// Per-field ascending flags. Empty means all ascending (wire omits DIR_TAG).
+    pub directions: Vec<bool>,
 }
 
 impl IndexDefPayload {
+    fn any_descending(&self) -> bool {
+        self.directions.iter().any(|a| !*a)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_lp(&mut out, self.collection.as_bytes());
@@ -181,8 +192,15 @@ impl IndexDefPayload {
         for f in &self.fields {
             put_lp(&mut out, f.as_bytes());
         }
-        if self.expire_after_seconds != 0 {
+        let write_dirs = self.any_descending() && self.directions.len() == self.fields.len();
+        if self.expire_after_seconds != 0 || write_dirs {
             out.extend_from_slice(&self.expire_after_seconds.to_be_bytes());
+        }
+        if write_dirs {
+            out.push(INDEX_DIR_TAG);
+            for d in &self.directions {
+                out.push(if *d { 1 } else { 0 });
+            }
         }
         out
     }
@@ -192,7 +210,7 @@ impl IndexDefPayload {
         let collection = r.lp_string()?;
         let index_name = r.lp_string()?;
         let unique = r.u8()? != 0;
-        let count = r.u32()?;
+        let count = r.u32()? as usize;
         let mut fields = Vec::with_capacity(count.min(256));
         for _ in 0..count {
             fields.push(r.lp_string()?);
@@ -204,12 +222,24 @@ impl IndexDefPayload {
         } else {
             0
         };
+        let directions =
+            if r.remaining() >= 1 + count && r.buf.get(r.pos).copied() == Some(INDEX_DIR_TAG) {
+                let _tag = r.u8()?;
+                let mut dirs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    dirs.push(r.u8()? != 0);
+                }
+                dirs
+            } else {
+                vec![true; count]
+            };
         Ok(IndexDefPayload {
             collection,
             index_name,
             fields,
             unique,
             expire_after_seconds,
+            directions,
         })
     }
 }
@@ -564,6 +594,178 @@ impl CountPayload {
     }
 }
 
+// ---- Aggregate: [collection][pipeline_json] ----
+// Response: [row_count u32 BE]{[row_json lp]}*
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregatePayload {
+    pub collection: String,
+    /// Full pipeline JSON array bytes (opaque on the wire).
+    pub pipeline: Vec<u8>,
+}
+
+impl AggregatePayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_lp(&mut out, self.collection.as_bytes());
+        put_lp(&mut out, &self.pipeline);
+        out
+    }
+
+    pub fn decode(p: &[u8]) -> DocResult<AggregatePayload> {
+        let mut r = Reader::new(p);
+        Ok(AggregatePayload {
+            collection: r.lp_string()?,
+            pipeline: r.lp()?.to_vec(),
+        })
+    }
+}
+
+/// Encode an Aggregate response while enforcing `max_result_bytes` as each row
+/// is appended. Exceeding the budget returns [`DocError::BadFilter`] without
+/// allocating an oversized buffer.
+pub fn encode_aggregate_response(
+    rows: &[serde_json::Value],
+    max_result_bytes: usize,
+) -> DocResult<Vec<u8>> {
+    if 4 > max_result_bytes {
+        return Err(DocError::BadFilter(format!(
+            "aggregation: result exceeds {max_result_bytes} bytes"
+        )));
+    }
+    let mut out = Vec::with_capacity(4);
+    out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    for row in rows {
+        let json = serde_json::to_vec(row).map_err(|e| DocError::InvalidJson(e.to_string()))?;
+        let added = 4usize
+            .checked_add(json.len())
+            .ok_or_else(|| DocError::BadFilter("aggregation: result size overflow".into()))?;
+        let next = out
+            .len()
+            .checked_add(added)
+            .ok_or_else(|| DocError::BadFilter("aggregation: result size overflow".into()))?;
+        if next > max_result_bytes {
+            return Err(DocError::BadFilter(format!(
+                "aggregation: result exceeds {max_result_bytes} bytes"
+            )));
+        }
+        put_lp(&mut out, &json);
+    }
+    Ok(out)
+}
+
+/// Decode an Aggregate response produced by [`encode_aggregate_response`].
+pub fn decode_aggregate_response(p: &[u8]) -> DocResult<Vec<Vec<u8>>> {
+    let mut r = Reader::new(p);
+    let count = r.u32()?;
+    let mut rows = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        rows.push(r.lp()?.to_vec());
+    }
+    Ok(rows)
+}
+
+// ---- Watch: [collection][resume_token lp] ----
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchPayload {
+    pub collection: String,
+    /// Opaque resume token (empty = start after current durable watermark).
+    pub resume_token: Vec<u8>,
+}
+
+impl WatchPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_lp(&mut out, self.collection.as_bytes());
+        put_lp(&mut out, &self.resume_token);
+        out
+    }
+
+    pub fn decode(p: &[u8]) -> DocResult<WatchPayload> {
+        let mut r = Reader::new(p);
+        Ok(WatchPayload {
+            collection: r.lp_string()?,
+            resume_token: r.lp()?.to_vec(),
+        })
+    }
+}
+
+/// Watch stream frame kinds (first byte of Ok payloads after subscription open).
+pub const WATCH_FRAME_ACK: u8 = 0x01;
+pub const WATCH_FRAME_EVENT: u8 = 0x02;
+pub const WATCH_FRAME_HEARTBEAT: u8 = 0x03;
+
+/// Upsert event op byte.
+pub const WATCH_OP_UPSERT: u8 = 0x01;
+/// Delete event op byte.
+pub const WATCH_OP_DELETE: u8 = 0x02;
+
+/// Encode a Watch ACK: `[WATCH_FRAME_ACK][resume_token lp]`.
+pub fn encode_watch_ack(resume_token: &[u8]) -> Vec<u8> {
+    let mut out = vec![WATCH_FRAME_ACK];
+    put_lp(&mut out, resume_token);
+    out
+}
+
+/// Encode a Watch EVENT:
+/// `[WATCH_FRAME_EVENT][resume_token lp][op u8][doc_id lp][body lp]`.
+pub fn encode_watch_event(
+    resume_token: &[u8],
+    op: u8,
+    doc_id: &[u8],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![WATCH_FRAME_EVENT];
+    put_lp(&mut out, resume_token);
+    out.push(op);
+    put_lp(&mut out, doc_id);
+    put_lp(&mut out, body);
+    out
+}
+
+/// Encode a Watch HEARTBEAT: `[WATCH_FRAME_HEARTBEAT][resume_token lp]`.
+pub fn encode_watch_heartbeat(resume_token: &[u8]) -> Vec<u8> {
+    let mut out = vec![WATCH_FRAME_HEARTBEAT];
+    put_lp(&mut out, resume_token);
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchFrame {
+    Ack {
+        resume_token: Vec<u8>,
+    },
+    Event {
+        resume_token: Vec<u8>,
+        op: u8,
+        doc_id: Vec<u8>,
+        body: Vec<u8>,
+    },
+    Heartbeat {
+        resume_token: Vec<u8>,
+    },
+}
+
+pub fn decode_watch_frame(p: &[u8]) -> DocResult<WatchFrame> {
+    let mut r = Reader::new(p);
+    match r.u8()? {
+        WATCH_FRAME_ACK => Ok(WatchFrame::Ack {
+            resume_token: r.lp()?.to_vec(),
+        }),
+        WATCH_FRAME_EVENT => Ok(WatchFrame::Event {
+            resume_token: r.lp()?.to_vec(),
+            op: r.u8()?,
+            doc_id: r.lp()?.to_vec(),
+            body: r.lp()?.to_vec(),
+        }),
+        WATCH_FRAME_HEARTBEAT => Ok(WatchFrame::Heartbeat {
+            resume_token: r.lp()?.to_vec(),
+        }),
+        m => Err(DocError::Protocol(format!("unknown watch frame 0x{m:02x}"))),
+    }
+}
+
 /// Encode an index-range response page:
 /// `[row_count u32]{[doc_id][body]}* [cursor]` (cursor empty = end of results).
 pub fn encode_query_page(page: &QueryPage) -> Vec<u8> {
@@ -807,16 +1009,43 @@ mod tests {
             fields: vec!["age".into(), "name".into()],
             unique: true,
             expire_after_seconds: 0,
+            directions: vec![true, true],
         };
         assert_eq!(IndexDefPayload::decode(&p.encode()).unwrap(), p);
+        // All-ASC omit direction trailer — wire matches pre-direction encoders.
+        let legacy = {
+            let mut out = Vec::new();
+            put_lp(&mut out, b"users");
+            put_lp(&mut out, b"by_age");
+            out.push(1);
+            out.extend_from_slice(&2u32.to_be_bytes());
+            put_lp(&mut out, b"age");
+            put_lp(&mut out, b"name");
+            out
+        };
+        assert_eq!(IndexDefPayload::decode(&legacy).unwrap(), p);
+
         let ttl = IndexDefPayload {
             collection: "sess".into(),
             index_name: "by_exp".into(),
             fields: vec!["exp".into()],
             unique: false,
             expire_after_seconds: 3600,
+            directions: vec![true],
         };
         assert_eq!(IndexDefPayload::decode(&ttl.encode()).unwrap(), ttl);
+
+        let desc = IndexDefPayload {
+            collection: "events".into(),
+            index_name: "by_owner_ts".into(),
+            fields: vec!["ownerId".into(), "updatedAt".into()],
+            unique: false,
+            expire_after_seconds: 0,
+            directions: vec![true, false],
+        };
+        let round = IndexDefPayload::decode(&desc.encode()).unwrap();
+        assert_eq!(round.directions, vec![true, false]);
+        assert_eq!(round.expire_after_seconds, 0);
     }
 
     #[test]
@@ -927,6 +1156,28 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_round_trip_and_result_budget() {
+        let p = AggregatePayload {
+            collection: "sales".into(),
+            pipeline: br#"[{"$group":{"_id":"$team","n":{"$count":{}}}}]"#.to_vec(),
+        };
+        assert_eq!(AggregatePayload::decode(&p.encode()).unwrap(), p);
+
+        let rows = vec![
+            serde_json::json!({"_id":"a","n":1}),
+            serde_json::json!({"_id":"b","n":2}),
+        ];
+        let encoded = encode_aggregate_response(&rows, 4 * 1024 * 1024).unwrap();
+        let decoded = decode_aggregate_response(&encoded).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&decoded[0]).unwrap(),
+            rows[0]
+        );
+        assert!(encode_aggregate_response(&rows, 4).is_err());
+    }
+
+    #[test]
     fn query_page_round_trips() {
         let page = QueryPage {
             rows: vec![
@@ -986,5 +1237,67 @@ mod tests {
             decode_doc_get_rev_response(&encode_doc_get_rev_response(br#"{"a":1}"#, 11)).unwrap();
         assert_eq!(body, br#"{"a":1}"#);
         assert_eq!(rev, 11);
+
+        let begin = encode_begin_response(7, 42);
+        let (txid, snap) = decode_begin_response(&begin).unwrap();
+        assert_eq!((txid, snap), (7, 42));
+        let commit = encode_commit_response(99);
+        assert_eq!(decode_commit_response(&commit).unwrap(), 99);
+        let stage = encode_stage_ack(3, 12);
+        assert_eq!(decode_stage_ack(&stage).unwrap(), (3, 12));
     }
+}
+
+// ---- Transaction control responses ----
+
+/// Begin response: `[tx_id u64 BE][snapshot_seq u64 BE]`.
+pub fn encode_begin_response(tx_id: u64, snapshot_seq: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&tx_id.to_be_bytes());
+    out.extend_from_slice(&snapshot_seq.to_be_bytes());
+    out
+}
+
+pub fn decode_begin_response(p: &[u8]) -> DocResult<(u64, u64)> {
+    if p.len() != 16 {
+        return Err(DocError::Protocol("Begin response must be 16 bytes".into()));
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&p[..8]);
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[8..]);
+    Ok((u64::from_be_bytes(a), u64::from_be_bytes(b)))
+}
+
+/// Commit response: `[seq u64 BE]`.
+pub fn encode_commit_response(seq: u64) -> Vec<u8> {
+    seq.to_be_bytes().to_vec()
+}
+
+pub fn decode_commit_response(p: &[u8]) -> DocResult<u64> {
+    if p.len() != 8 {
+        return Err(DocError::Protocol("Commit response must be 8 bytes".into()));
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(p);
+    Ok(u64::from_be_bytes(a))
+}
+
+/// Stage acknowledgement: `[logical_ops u32 BE][estimated_keys u32 BE]`.
+pub fn encode_stage_ack(logical_ops: u32, estimated_keys: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&logical_ops.to_be_bytes());
+    out.extend_from_slice(&estimated_keys.to_be_bytes());
+    out
+}
+
+pub fn decode_stage_ack(p: &[u8]) -> DocResult<(u32, u32)> {
+    if p.len() != 8 {
+        return Err(DocError::Protocol("stage ack must be 8 bytes".into()));
+    }
+    let mut a = [0u8; 4];
+    a.copy_from_slice(&p[..4]);
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&p[4..]);
+    Ok((u32::from_be_bytes(a), u32::from_be_bytes(b)))
 }

@@ -16,10 +16,12 @@ import time
 from typing import Any, Iterator, List, Optional, Tuple, Union
 
 from . import _protocol as proto
+from .change_stream import ChangeStream
 from .collection import Collection
 from .errors import ConnectionError as ZConnectionError
 from .errors import ServerBusyError, ZydecoError, from_status
 from .pool import ConnectionPool
+from .transaction import transaction as _transaction_cm
 
 # True enables system-default TLS; pass an SSLContext for custom roots/SNI.
 TlsOption = Union[bool, ssl.SSLContext]
@@ -68,6 +70,10 @@ class Client:
 
     def __exit__(self, *_) -> None:
         self.close()
+
+    def transaction(self):
+        """Open a pinned-connection bounded transaction (context manager)."""
+        return _transaction_cm(self)
 
     # --- core request execution ---
 
@@ -161,6 +167,7 @@ class Client:
         unique: bool = False,
         if_not_exists: bool = True,
         expire_after_seconds: int = 0,
+        directions: Optional[List[bool]] = None,
     ) -> bool:
         payload = proto.encode_index_def(
             collection,
@@ -168,6 +175,7 @@ class Client:
             fields,
             unique=unique,
             expire_after_seconds=expire_after_seconds,
+            directions=directions,
         )
         conn = self._pool.acquire()
         try:
@@ -417,6 +425,22 @@ class Client:
             retryable=True,
         )
         return json.loads(body.decode("utf-8"))
+
+    def aggregate(self, collection: str, pipeline: list) -> List[Any]:
+        body = self._execute(
+            proto.CMD_AGGREGATE,
+            proto.encode_aggregate(collection, pipeline),
+            "Aggregate",
+            retryable=True,
+        )
+        return [
+            json.loads(row.decode("utf-8"))
+            for row in proto.decode_aggregate_response(body)
+        ]
+
+    def watch(self, collection: str, resume_token: Optional[bytes] = None) -> ChangeStream:
+        """Open a dedicated change stream on *collection*."""
+        return ChangeStream(self, collection, resume_token=resume_token)
 
     # --- handle factory ---
 

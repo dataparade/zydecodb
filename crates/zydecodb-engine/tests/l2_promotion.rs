@@ -80,6 +80,7 @@ fn l1_to_l2_overlap_promotion_packs_outputs() {
         &next_id,
         0,
         false,
+        u64::MAX / 2,
     )
     .expect("execute_compaction");
 

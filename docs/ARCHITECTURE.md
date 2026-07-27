@@ -75,13 +75,19 @@ graph LR
     WAL -.->|Ack| C3
 ```
 
+Change streams observe the same durable watermark: subscribers never see writes
+before Caravan fsync completes. Retained history is a separate local WAL archive
+(not the shipping directory); see [`CHANGE_STREAMS.md`](CHANGE_STREAMS.md).
+Bounded aggregation reuses Straightline match visiting with hard scan/group/
+memory/result ceilings; see [`AGGREGATION.md`](AGGREGATION.md).
+
 ---
 
 ## Pillar 3: Tidewalker (Dynamic LSM Compaction)
 
 To maintain predictable read amplification under heavy write loads, ZEngine employs a dynamic, leveled compaction strategy (L0 → L1 → L2).
 
-As the Memtable flushes to L0 SSTables, the **Tidewalker** background worker (`CompactionPlanner`) evaluates per-level scores. When a level exceeds its dynamic byte target, the worker performs a k-way merge of overlapping files into the next level. This process continuously garbage-collects deleted or overwritten data in the background without blocking foreground query execution.
+As the Memtable flushes to L0 SSTables, the **Tidewalker** background worker (`CompactionPlanner`) evaluates per-level scores. When a level exceeds its dynamic byte target, the worker performs a k-way merge of overlapping files into the next level. This process continuously garbage-collects deleted, overwritten, and wall-clock-expired data in the background without blocking foreground query execution. Expired newest versions also suppress older versions of the same user key so compaction cannot resurrect a prior live value.
 
 ---
 

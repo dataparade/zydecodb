@@ -94,7 +94,7 @@ func (c *conn) deadline(ctx context.Context) time.Time {
 // request sends one framed request and reads the framed response. Any transport
 // failure closes the connection and returns a *ConnError (the pool discards it;
 // the client may retry idempotent calls on a fresh connection).
-func (c *conn) request(ctx context.Context, command byte, payload []byte) (status byte, body []byte, err error) {
+func (c *conn) recvCtx(ctx context.Context) (byte, []byte, error) {
 	if c.nc == nil {
 		return 0, nil, &ConnError{Err: fmt.Errorf("not connected")}
 	}
@@ -102,18 +102,36 @@ func (c *conn) request(ctx context.Context, command byte, payload []byte) (statu
 		c.close()
 		return 0, nil, &ConnError{Err: err}
 	}
-	frame := append(EncodeHeader(command, uint32(len(payload))), payload...)
-	if _, err := c.nc.Write(frame); err != nil {
-		c.close()
-		return 0, nil, &ConnError{Err: fmt.Errorf("write failed: %w", err)}
-	}
-	status, body, err = c.recv()
+	status, body, err := c.recv()
 	if err != nil {
 		c.close()
 		return 0, nil, err
 	}
 	c.lastUsed = time.Now()
 	return status, body, nil
+}
+
+func (c *conn) writeRequest(ctx context.Context, command byte, payload []byte) error {
+	if c.nc == nil {
+		return &ConnError{Err: fmt.Errorf("not connected")}
+	}
+	if err := c.nc.SetDeadline(c.deadline(ctx)); err != nil {
+		c.close()
+		return &ConnError{Err: err}
+	}
+	frame := append(EncodeHeader(command, uint32(len(payload))), payload...)
+	if _, err := c.nc.Write(frame); err != nil {
+		c.close()
+		return &ConnError{Err: fmt.Errorf("write failed: %w", err)}
+	}
+	return nil
+}
+
+func (c *conn) request(ctx context.Context, command byte, payload []byte) (status byte, body []byte, err error) {
+	if err := c.writeRequest(ctx, command, payload); err != nil {
+		return 0, nil, err
+	}
+	return c.recvCtx(ctx)
 }
 
 func (c *conn) recv() (byte, []byte, error) {

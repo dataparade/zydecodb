@@ -301,3 +301,58 @@ func TestLiveOptimisticConcurrency(t *testing.T) {
 		t.Fatalf("expected newer revision after update, got %d", after)
 	}
 }
+
+func TestLiveBoundedTransaction(t *testing.T) {
+	c := liveClient(t)
+	defer c.Close()
+	ctx := context.Background()
+	collName := uniqueCollection()
+	coll := c.Collection(collName)
+	if _, err := coll.InsertOne(ctx, Document{"_seed": true}, false, 0); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+
+	kvKey := []byte("tx-go-" + collName)
+	seq, err := c.WithTransaction(ctx, func(tx *Tx) error {
+		if err := tx.Put(ctx, kvKey, []byte("v1"), 0); err != nil {
+			return err
+		}
+		if err := tx.PutDocument(ctx, collName, "u1", Document{"n": 1.0}); err != nil {
+			return err
+		}
+		got, err := tx.Get(ctx, kvKey)
+		if err != nil {
+			return err
+		}
+		if string(got) != "v1" {
+			t.Fatalf("read-your-writes: got %q", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("transaction: %v", err)
+	}
+	if seq == 0 {
+		t.Fatal("expected non-zero commit seq")
+	}
+	val, err := c.Get(ctx, kvKey)
+	if err != nil || string(val) != "v1" {
+		t.Fatalf("committed kv: %v %q", err, val)
+	}
+
+	// Rollback path
+	tx, err := c.BeginTx(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := tx.Put(ctx, []byte("tx-rollback"), []byte("nope"), 0); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	gone, err := c.Get(ctx, []byte("tx-rollback"))
+	if err != nil || gone != nil {
+		t.Fatalf("rollback must leave nothing: %v %q", err, gone)
+	}
+}

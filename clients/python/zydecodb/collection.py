@@ -14,6 +14,7 @@ from . import _protocol as proto
 from .errors import ConfigError
 
 if TYPE_CHECKING:
+    from .change_stream import ChangeStream
     from .client import Client
 
 
@@ -30,7 +31,7 @@ class Collection:
 
     def create_index(
         self,
-        fields: List[str],
+        fields: List,
         *,
         unique: bool = False,
         name: Optional[str] = None,
@@ -38,14 +39,28 @@ class Collection:
     ) -> bool:
         """Create a secondary index over one or more dotted field paths. Returns
         False if it already existed. ``expire_after_seconds`` marks a TTL index
-        (field value = unix millis); ``0`` means not a TTL index."""
-        index_name = name or "by_" + "_".join(f.replace(".", "_") for f in fields)
+        (field value = unix millis); ``0`` means not a TTL index.
+
+        ``fields`` may be ``list[str]`` (all ascending) or
+        ``list[tuple[str, bool]]`` where the bool is ascending (False = DESC).
+        """
+        paths: List[str] = []
+        dirs: List[bool] = []
+        for f in fields:
+            if isinstance(f, (tuple, list)) and len(f) == 2:
+                paths.append(str(f[0]))
+                dirs.append(bool(f[1]))
+            else:
+                paths.append(str(f))
+                dirs.append(True)
+        index_name = name or "by_" + "_".join(p.replace(".", "_") for p in paths)
         return self._c.define_index(
             self._name,
             index_name,
-            fields,
+            paths,
             unique=unique,
             expire_after_seconds=expire_after_seconds,
+            directions=dirs,
         )
 
     # --- writes ---
@@ -202,6 +217,14 @@ class Collection:
 
     def distinct(self, field: str, filt: Optional[dict] = None) -> List[Any]:
         return self._c.distinct(self._name, field, filt)
+
+    def aggregate(self, pipeline: list) -> List[Any]:
+        """Run a bounded aggregation pipeline and return result documents."""
+        return self._c.aggregate(self._name, pipeline)
+
+    def watch(self, resume_token: Optional[bytes] = None) -> ChangeStream:
+        """Open a dedicated change stream on this collection."""
+        return self._c.watch(self._name, resume_token=resume_token)
 
 
 def _encode_projection(

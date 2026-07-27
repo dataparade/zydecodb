@@ -12,6 +12,7 @@ Quick start::
             print(u)
 """
 
+from .change_stream import ChangeEvent, ChangeStream
 from .client import Client, generate_id
 from .collection import Collection
 from .errors import (
@@ -26,12 +27,17 @@ from .errors import (
     UnsupportedFormatError,
     ZydecoError,
 )
+from .transaction import Transaction, UnknownCommitError
 
-__version__ = "0.9.0b7"
+__version__ = "0.10.0"
 
 __all__ = [
     "Client",
     "Collection",
+    "ChangeEvent",
+    "ChangeStream",
+    "Transaction",
+    "UnknownCommitError",
     "generate_id",
     "ZydecoError",
     "ConfigError",

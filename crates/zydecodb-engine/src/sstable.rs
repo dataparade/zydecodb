@@ -638,6 +638,29 @@ impl SstableReader {
         })
     }
 
+    /// Reverse range iterator over `[lo, hi)`. Yields user keys descending;
+    /// within each user key, highest seq first. Materializes the matching
+    /// entries from this table (acceptable for bounded index-prefix scans).
+    pub fn range_iter_rev(
+        self: Arc<Self>,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+    ) -> EngineResult<SstableRevIter> {
+        let mut fwd = self.range_iter(lo, hi)?;
+        let mut pairs = Vec::new();
+        while let Some(pair) = crate::iter::EntryIterator::next(&mut fwd)? {
+            pairs.push(pair);
+        }
+        pairs.sort_by(|a, b| {
+            b.0.user_key
+                .cmp(&a.0.user_key)
+                .then_with(|| b.0.seq.cmp(&a.0.seq))
+        });
+        Ok(SstableRevIter {
+            pending: pairs.into_iter(),
+        })
+    }
+
     /// Iterator over every entry in the SSTable in InternalKey order.
     pub fn full_iter(self: Arc<Self>) -> EngineResult<SstableRangeIter> {
         let index = self.index_arc();
@@ -746,6 +769,17 @@ impl crate::iter::EntryIterator for SstableRangeIter {
         let pair = self.current[self.cursor].clone();
         self.cursor += 1;
         Ok(Some(pair))
+    }
+}
+
+/// Reverse SSTable range iterator (see [`SstableReader::range_iter_rev`]).
+pub struct SstableRevIter {
+    pending: std::vec::IntoIter<(InternalKey, Entry)>,
+}
+
+impl crate::iter::EntryIterator for SstableRevIter {
+    fn next(&mut self) -> EngineResult<Option<(InternalKey, Entry)>> {
+        Ok(self.pending.next())
     }
 }
 

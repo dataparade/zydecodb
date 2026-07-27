@@ -97,7 +97,13 @@ fn execute(client: &mut Client, dump: &pgdump::Dump, plan: &Plan) -> MigrateResu
 /// collection server-side (the only command that does).
 fn create_indexes(client: &mut Client, coll: &CollectionPlan) -> MigrateResult<()> {
     for idx in &coll.indexes {
-        client.define_index(&coll.name, &idx.name, &idx.fields, idx.unique)?;
+        client.define_index(
+            &coll.name,
+            &idx.name,
+            &idx.fields,
+            &idx.directions,
+            idx.unique,
+        )?;
     }
     Ok(())
 }

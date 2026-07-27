@@ -38,6 +38,11 @@ pub enum AccessPath {
         /// Index field paths, in order — lets the executor decide whether the
         /// scan order already satisfies a requested sort (key-cursor mode).
         fields: Vec<String>,
+        /// Per-field ascending flags matching `fields`.
+        directions: Vec<bool>,
+        /// Equality-prefix length used for this scan (sort matching may elide
+        /// these leading fields).
+        eq_prefix_len: usize,
     },
     /// Full scan over the collection's document range.
     CollectionScan,
@@ -135,6 +140,7 @@ fn build_index_scan(
     constraints: &HashMap<String, Constraint>,
 ) -> AccessPath {
     let iprefix = keys::index_prefix(prefix, collection_id, idx.id);
+    let directions = idx.ascending();
 
     // base = iprefix + encode(eq values for the leading fields)
     let eq_vals: Vec<Value> = idx.fields[..eq_len]
@@ -142,25 +148,46 @@ fn build_index_scan(
         .map(|f| constraints[f].eq.clone().unwrap())
         .collect();
     let mut base = iprefix.clone();
-    base.extend_from_slice(&encoding::encode_fields(&eq_vals));
+    base.extend_from_slice(&encoding::encode_fields_with_directions(
+        &eq_vals,
+        &directions[..eq_len],
+    ));
 
     let range = idx.fields.get(eq_len).and_then(|f| constraints.get(f));
+    let field_asc = directions.get(eq_len).copied().unwrap_or(true);
 
     let (lo, hi) = match range {
         Some(c) if c.has_range() => {
-            let mut lo = base.clone();
-            if let Some(lv) = &c.lo {
-                encoding::encode_value(lv, &mut lo);
-            }
-            let hi = match &c.hi {
-                Some(hv) => {
-                    let mut h = base.clone();
-                    encoding::encode_value(hv, &mut h);
-                    keys::prefix_upper_bound(&h)
+            if field_asc {
+                let mut lo = base.clone();
+                if let Some(lv) = &c.lo {
+                    encoding::encode_value(lv, &mut lo);
                 }
-                None => keys::prefix_upper_bound(&base),
-            };
-            (lo, hi)
+                let hi = match &c.hi {
+                    Some(hv) => {
+                        let mut h = base.clone();
+                        encoding::encode_value(hv, &mut h);
+                        keys::prefix_upper_bound(&h)
+                    }
+                    None => keys::prefix_upper_bound(&base),
+                };
+                (lo, hi)
+            } else {
+                // DESC field: logical lower/upper bounds swap in byte space.
+                let mut lo = base.clone();
+                if let Some(hv) = &c.hi {
+                    encoding::encode_value_desc(hv, &mut lo);
+                }
+                let hi = match &c.lo {
+                    Some(lv) => {
+                        let mut h = base.clone();
+                        encoding::encode_value_desc(lv, &mut h);
+                        keys::prefix_upper_bound(&h)
+                    }
+                    None => keys::prefix_upper_bound(&base),
+                };
+                (lo, hi)
+            }
         }
         _ => (base.clone(), keys::prefix_upper_bound(&base)),
     };
@@ -169,6 +196,8 @@ fn build_index_scan(
         lo,
         hi,
         fields: idx.fields.clone(),
+        directions,
+        eq_prefix_len: eq_len,
     }
 }
 
@@ -192,6 +221,7 @@ mod tests {
             id,
             name: name.into(),
             fields: fields.iter().map(|s| s.to_string()).collect(),
+            directions: vec![true; fields.len()],
             unique: false,
             expire_after_seconds: None,
         }
@@ -223,7 +253,7 @@ mod tests {
     fn single_field_equality_uses_index() {
         let coll = coll_with(vec![idx(0, "by_age", &["age"])]);
         match plan_for(json!({"age": 30}), &coll) {
-            AccessPath::IndexScan { lo, hi, fields } => {
+            AccessPath::IndexScan { lo, hi, fields, .. } => {
                 assert!(lo < hi);
                 assert_eq!(fields, vec!["age".to_string()]);
             }

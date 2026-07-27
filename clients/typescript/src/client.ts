@@ -4,11 +4,15 @@ import type { TlsOption } from "./connection.ts";
 import { Collection } from "./collection.ts";
 import { ConnectionError, fromStatus, ServerBusyError, ZydecoError } from "./errors.ts";
 import { ConnectionPool } from "./pool.ts";
+import { ChangeStream } from "./watch.ts";
+import type { Connection } from "./connection.ts";
 import {
   Cmd,
   decodeDocGetRevResponse,
   decodePage,
   decodePageWithRevision,
+  decodeAggregateResponse,
+  encodeAggregate,
   encodeCount,
   encodeDelete,
   encodeDistinct,
@@ -27,6 +31,7 @@ import {
   type Projection,
   type SortKey,
 } from "./protocol.ts";
+import { Transaction } from "./transaction.ts";
 
 export interface ClientOptions {
   apiKey?: string;
@@ -95,6 +100,29 @@ export class Client {
 
   close(): void {
     this.pool.close();
+  }
+
+  /**
+   * Run `fn` inside a pinned-connection bounded transaction. Commits on
+   * success; rolls back on error. Commit transport failures throw
+   * `UnknownCommitError`.
+   */
+  async withTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<{ result: T; seq: bigint }> {
+    const conn = await this.pool.acquireExclusive();
+    const tx = new Transaction(this.pool, conn);
+    try {
+      await tx.begin();
+      const result = await fn(tx);
+      const seq = await tx.commit();
+      return { result, seq };
+    } catch (err) {
+      try {
+        await tx.rollback();
+      } catch {
+        // already finished or transport dead
+      }
+      throw err;
+    }
   }
 
   private backoff(attempt: number): number {
@@ -187,8 +215,16 @@ export class Client {
     unique: boolean,
     ifNotExists = true,
     expireAfterSeconds: number | bigint = 0,
+    directions?: boolean[],
   ): Promise<boolean> {
-    const payload = encodeIndexDef(collection, index, fields, unique, expireAfterSeconds);
+    const payload = encodeIndexDef(
+      collection,
+      index,
+      fields,
+      unique,
+      expireAfterSeconds,
+      directions,
+    );
     const conn = await this.pool.acquire();
     let res;
     try {
@@ -404,8 +440,36 @@ export class Client {
     return JSON.parse(body!.toString("utf8")) as unknown[];
   }
 
+  async aggregate(collection: string, pipeline: Buffer): Promise<Buffer[]> {
+    const body = await this.execute(
+      Cmd.Aggregate,
+      encodeAggregate(collection, pipeline),
+      "Aggregate",
+      { retryable: true },
+    );
+    return decodeAggregateResponse(body!);
+  }
+
   collection(name: string): Collection {
     return new Collection(this, name);
+  }
+
+  /** Open a dedicated (non-pooled) connection for streaming APIs. */
+  async openDedicatedConnection(): Promise<Connection> {
+    return this.pool.acquireExclusive();
+  }
+
+  /** Release a dedicated connection opened via {@link openDedicatedConnection}. */
+  releaseDedicatedConnection(conn: Connection): void {
+    this.pool.discard(conn);
+  }
+
+  watch(
+    collection: string,
+    resumeToken?: Buffer,
+    signal?: AbortSignal,
+  ): ChangeStream {
+    return new ChangeStream(this, collection, resumeToken ?? Buffer.alloc(0), signal);
   }
 }
 

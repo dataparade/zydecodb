@@ -76,6 +76,21 @@ values. Stale/missing documents throw `ConflictError`. Against an older server
 these methods fail with a protocol error instead of silently becoming
 unconditional writes.
 
+## Bounded transactions
+
+```ts
+const { seq } = await db.withTransaction(async (tx) => {
+  await tx.put(Buffer.from("session"), Buffer.from("active"));
+  await tx.putDocument("users", "u1", { n: 1 });
+});
+```
+
+Uses an exclusively checked-out connection (not multiplexed). No automatic
+retries. Collections must already exist. Filter queries/updates and DDL are
+rejected inside a transaction. Commit transport failure throws
+`UnknownCommitError` — reconcile by re-reading keys. Older servers reject
+`Begin` with a protocol error.
+
 ## Durability
 
 Writes are durable (fsync-on-commit) by default. For latency-sensitive,
@@ -86,6 +101,12 @@ the fsync.
 await users.insertOne(doc, true);
 await users.updateOne({ _id: "ada" }, { $inc: { hits: 1 } }, true);
 ```
+
+Filtered positional `$set` (exactly one array match) uses the same update APIs
+with a path like `items.$[skuId=ABC].qty` — no new client methods.
+
+Directional indexes: pass `{ path, ascending: false }` objects to `createIndex`
+for DESC fields (string fields remain all-ascending).
 
 ## Examples
 

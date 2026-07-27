@@ -22,16 +22,17 @@ Go modules in a subdirectory do not inherit root `v*` tags. Without
 
 | Server | Drivers | Wire |
 |--------|---------|------|
+| `0.10.x` | Python / npm / Go `0.10.x*` | `proto_version = 1` |
 | `0.9.x` | Python / npm / Go `0.9.x*` | `proto_version = 1` |
 
-- Drivers tagged `v0.9.x` target server `0.9.x` with the frozen 0.9 wire
+- Drivers tagged `v0.10.x` target server `0.10.x` with the frozen wire
   (see [`DOCUMENT_STORE.md`](DOCUMENT_STORE.md#wire-protocol)).
 - Applications should pin an explicit driver version, not `@latest`, until the
   release train is routine.
-- Append-only opcodes and status bytes may appear in later `0.9.x` minors;
-  older drivers ignore unknown opcodes by never sending them. New conditional
-  write opcodes fail closed (`ProtocolError`) on older servers rather than
-  degrading to unconditional writes.
+- Append-only opcodes and status bytes may appear in later minors on the same
+  major.minor line; older drivers ignore unknown opcodes by never sending them.
+  New opcodes fail closed (`ProtocolError`) on older servers rather than
+  degrading silently.
 
 ## Cutting a release
 
@@ -41,7 +42,7 @@ Bump versions in `Cargo.toml`, `clients/python/pyproject.toml`, and
 tags at that commit and push them together:
 
 ```bash
-ver=0.9.0   # or 0.9.0-beta.8
+ver=0.10.0   # or 0.10.0-beta.1
 git tag "v${ver}"
 git tag "clients/go/v${ver}" "$(git rev-parse "v${ver}^{commit}")"
 git push origin "v${ver}" "clients/go/v${ver}"
@@ -62,13 +63,13 @@ The release workflow then:
 
 ```bash
 # Go — pin the module version (not @latest)
-go get github.com/dataparade/zydecodb/clients/go@v0.9.0
+go get github.com/dataparade/zydecodb/clients/go@v0.10.0
 
 # Python
-pip install zydecodb==0.9.0
+pip install zydecodb==0.10.0
 
 # TypeScript
-npm install zydecodb@0.9.0
+npm install zydecodb@0.10.0
 ```
 
-Keep the server binary and drivers on the same `0.9.x` minor line.
+Keep the server binary and drivers on the same `0.10.x` minor line.

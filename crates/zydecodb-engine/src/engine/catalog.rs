@@ -173,7 +173,9 @@ impl Engine {
         Ok(existed)
     }
 
-    /// Lazy-expiry sweep over the active memtable: tombstone expired entries.
+    /// Lazy-expiry sweep over the active memtable: insert non-durable tombstones
+    /// for expired entries. Does **not** append WAL — SST reclaim is compaction's
+    /// job; this is memtable hygiene only (lost on crash; lazy read still hides).
     pub fn sweep_expired(&mut self) -> EngineResult<usize> {
         let now = Self::now_ms();
         let mut expired_keys: Vec<Vec<u8>> = Vec::new();
@@ -185,7 +187,7 @@ impl Engine {
         // Deduplicate (a key may appear with multiple seqs).
         expired_keys.sort();
         expired_keys.dedup();
-        let count = expired_keys.len();
+        let mut count = 0usize;
         for key in expired_keys {
             // Only tombstone if the latest version is still an expired value.
             if let Some((_, entry)) = self.active.get_latest(&key) {
@@ -193,7 +195,13 @@ impl Engine {
                     let seq = self.seq.next();
                     let ik = InternalKey::new(key.clone(), seq, EntryKind::Tombstone);
                     self.active_mut().insert(ik, Entry::tombstone());
+                    count += 1;
                 }
+            }
+        }
+        if count > 0 {
+            if let Some(m) = &self.metrics {
+                m.ttl_sweep_tombstones_total.inc_by(count as u64);
             }
         }
         Ok(count)

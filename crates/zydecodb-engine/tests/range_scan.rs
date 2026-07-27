@@ -24,6 +24,11 @@ fn collect_scan(e: &Engine, lo: Vec<u8>, hi: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)>
     e.scan(lo, hi).unwrap().map(|r| r.unwrap()).collect()
 }
 
+fn collect_scan_rev(e: &Engine, lo: Vec<u8>, hi: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let snap = e.snapshot_owned();
+    snap.scan_rev(lo, hi).unwrap().map(|r| r.unwrap()).collect()
+}
+
 #[test]
 fn scan_yields_keys_in_user_key_order() {
     let dir = TempDir::new().unwrap();
@@ -133,4 +138,32 @@ fn empty_range_yields_no_entries() {
     e.put(uk(b"z"), b"2".to_vec(), 0).unwrap();
     let got = collect_scan(&e, uk(b"m"), uk(b"q"));
     assert!(got.is_empty());
+}
+
+#[test]
+fn scan_rev_is_reverse_of_forward_scan() {
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    for i in 0..30u32 {
+        e.put(
+            uk(format!("k{:02}", i).as_bytes()),
+            format!("v{i}").into_bytes(),
+            0,
+        )
+        .unwrap();
+    }
+    e.force_flush().unwrap();
+    for i in 10..20u32 {
+        e.put(
+            uk(format!("k{:02}", i).as_bytes()),
+            format!("new{i}").into_bytes(),
+            0,
+        )
+        .unwrap();
+    }
+
+    let fwd = collect_scan(&e, uk(b"k05"), uk(b"k25"));
+    let mut rev = collect_scan_rev(&e, uk(b"k05"), uk(b"k25"));
+    rev.reverse();
+    assert_eq!(fwd, rev);
 }

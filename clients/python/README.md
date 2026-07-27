@@ -73,6 +73,19 @@ integers. Stale/missing documents raise `ConflictError`. Against an older
 server these methods fail with a protocol error instead of silently becoming
 unconditional writes.
 
+## Bounded transactions
+
+```python
+with db.transaction() as tx:
+    tx.put(b"session", b"active")
+    tx.put_document("users", "u1", {"n": 1})
+```
+
+Pins one connection for the duration; no automatic retries. Collections must
+already exist. Filter queries/updates and DDL are rejected inside a transaction.
+Commit transport failure raises `UnknownCommitError` — reconcile by re-reading
+keys. Older servers reject `Begin` with a protocol error.
+
 ## Durability
 
 Writes are durable (fsync-on-commit) by default. For latency-sensitive,
@@ -85,6 +98,12 @@ users.insert_one(doc, relaxed=True)
 users.update_one({"_id": "ada"}, {"$inc": {"hits": 1}}, relaxed=True)
 users.delete_many({"stale": True}, relaxed=True)
 ```
+
+Filtered positional `$set` (exactly one array match) uses the same update APIs
+with a path like `items.$[skuId=ABC].qty` — no new client methods.
+
+Directional indexes: pass `("field", False)` tuples in `create_index` for DESC
+(e.g. `[("ownerId", True), ("updatedAt", False)]`).
 
 ## Running the tests
 

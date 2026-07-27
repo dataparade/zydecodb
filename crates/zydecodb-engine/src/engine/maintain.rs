@@ -258,6 +258,7 @@ impl Engine {
             self.next_sstable_id_atomic.clone(),
             self.compaction_gc_watermark(),
             drop_tombstones,
+            Self::now_ms(),
         )
     }
 
@@ -309,6 +310,7 @@ impl Engine {
             bytes_written,
             versions_dropped,
             tombstones_dropped,
+            expired_dropped,
             worker_elapsed,
         } = result;
 
@@ -333,6 +335,7 @@ impl Engine {
                     bytes_written,
                     versions_dropped,
                     tombstones_dropped,
+                    expired_dropped,
                     worker_elapsed,
                 }),
             })
@@ -459,6 +462,9 @@ impl Engine {
                     .compaction_tombstones_dropped_total
                     .inc_by(c.tombstones_dropped);
                 metrics
+                    .compaction_expired_dropped_total
+                    .inc_by(c.expired_dropped);
+                metrics
                     .compaction_duration_seconds
                     .observe(c.worker_elapsed.as_secs_f64());
                 metrics
@@ -552,6 +558,7 @@ impl Engine {
             &self.next_sstable_id_atomic,
             self.compaction_gc_watermark(),
             drop_tombstones,
+            Self::now_ms(),
         )?;
         self.submit_compaction_apply(result)?;
         self.finish_pending_applies()?;
@@ -584,6 +591,18 @@ impl Engine {
         let segments = wal::list_segments(&self.cfg.wal_dir)?;
         for (id, path) in segments {
             if id <= up_to_id && id < self.active_wal_id {
+                if !self.wal_segment_safe_to_unlink(id) {
+                    // Retry archive; leave the live WAL until confirmed.
+                    let max_seq = self.sealed_segment_max_seq.get(&id).copied().unwrap_or(0);
+                    self.archive_sealed_segment(id, max_seq);
+                    if !self.wal_segment_safe_to_unlink(id) {
+                        tracing::warn!(
+                            segment = id,
+                            "deferring WAL unlink until change_log archive succeeds"
+                        );
+                        continue;
+                    }
+                }
                 tracing::info!(segment = %path.display(), "unlinking covered WAL segment");
                 let _ = std::fs::remove_file(&path);
                 self.sealed_segment_max_seq.remove(&id);
@@ -640,9 +659,10 @@ impl Engine {
         }
         self.sync_wal()?;
         let sealed_id = self.active_wal_id;
-        self.sealed_segment_max_seq
-            .insert(sealed_id, self.wal_sync.buffered_seq());
+        let sealed_max = self.wal_sync.buffered_seq();
+        self.sealed_segment_max_seq.insert(sealed_id, sealed_max);
         self.ship_sealed_segment(sealed_id);
+        self.archive_sealed_segment(sealed_id, sealed_max);
         self.active_wal_id += 1;
         self.open_new_wal_segment()
     }

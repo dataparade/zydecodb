@@ -18,6 +18,9 @@ HEADER_LEN = 6
 CMD_PUT = 0x01
 CMD_GET = 0x02
 CMD_DEL = 0x03
+CMD_BEGIN = 0x10
+CMD_COMMIT = 0x11
+CMD_ROLLBACK = 0x12
 CMD_QUERY = 0x20
 CMD_DOC_PUT = 0x21
 CMD_DOC_DEL = 0x22
@@ -29,6 +32,8 @@ CMD_DOC_GET_REV = 0x27
 CMD_FIND_REV = 0x28
 CMD_DOC_PUT_IF_MATCH = 0x29
 CMD_DOC_UPDATE_IF_MATCH = 0x2A
+CMD_AGGREGATE = 0x2B
+CMD_WATCH = 0x2C
 CMD_INDEX_DEF = 0x30
 CMD_SESSION_INIT = 0x40
 CMD_PING = 0xF0
@@ -49,7 +54,13 @@ PROJ_EXCLUDE = 0x02
 FLAG_RELAXED = 0x01
 FLAG_UPSERT = 0x02
 
-# --- status codes (response header byte 1) ---
+# --- watch stream frame kinds (first byte of Ok payloads) ---
+WATCH_FRAME_ACK = 0x01
+WATCH_FRAME_EVENT = 0x02
+WATCH_FRAME_HEARTBEAT = 0x03
+
+WATCH_OP_UPSERT = 0x01
+WATCH_OP_DELETE = 0x02
 STATUS_OK = 0x00
 STATUS_NOT_FOUND = 0x01
 STATUS_ERROR = 0x02
@@ -123,6 +134,9 @@ def encode_key(
     )
 
 
+INDEX_DIR_TAG = 0x02
+
+
 def encode_index_def(
     collection: str,
     index: str,
@@ -130,14 +144,20 @@ def encode_index_def(
     *,
     unique: bool,
     expire_after_seconds: int = 0,
+    directions: Optional[List[bool]] = None,
 ) -> bytes:
     out = _lp(collection.encode()) + _lp(index.encode())
     out += bytes([1 if unique else 0])
     out += struct.pack(">I", len(fields))
     for field in fields:
         out += _lp(field.encode())
-    if expire_after_seconds:
+    dirs = list(directions) if directions is not None else []
+    any_desc = len(dirs) == len(fields) and any(not d for d in dirs)
+    if expire_after_seconds or any_desc:
         out += struct.pack(">Q", int(expire_after_seconds))
+    if any_desc:
+        out += bytes([INDEX_DIR_TAG])
+        out += bytes([1 if d else 0 for d in dirs])
     return out
 
 
@@ -302,6 +322,63 @@ def encode_distinct(collection: str, field: str, filt: Optional[dict]) -> bytes:
     )
 
 
+def encode_aggregate(collection: str, pipeline: list) -> bytes:
+    """Aggregate request: [collection lp][pipeline_json lp]."""
+    return _lp(collection.encode()) + _lp(_json_bytes(pipeline))
+
+
+def encode_watch(collection: str, resume_token: bytes = b"") -> bytes:
+    """Watch request: [collection lp][resume_token lp]."""
+    return _lp(collection.encode()) + _lp(resume_token)
+
+
+def decode_watch_frame(buf: bytes) -> Tuple[str, bytes, Optional[int], Optional[bytes], Optional[bytes]]:
+    """Decode one Watch stream frame.
+
+    Returns ``(kind, resume_token, op, doc_id, body)`` where *kind* is
+    ``"ack"``, ``"event"``, or ``"heartbeat"``; *op*/*doc_id*/*body* are set
+    only for events.
+    """
+    if not buf:
+        raise ValueError("empty watch frame")
+    kind_byte = buf[0]
+    off = 1
+    (tlen,) = struct.unpack_from(">I", buf, off)
+    off += 4
+    resume_token = buf[off : off + tlen]
+    off += tlen
+    if kind_byte == WATCH_FRAME_ACK:
+        return "ack", resume_token, None, None, None
+    if kind_byte == WATCH_FRAME_HEARTBEAT:
+        return "heartbeat", resume_token, None, None, None
+    if kind_byte == WATCH_FRAME_EVENT:
+        op = buf[off]
+        off += 1
+        (idlen,) = struct.unpack_from(">I", buf, off)
+        off += 4
+        doc_id = buf[off : off + idlen]
+        off += idlen
+        (blen,) = struct.unpack_from(">I", buf, off)
+        off += 4
+        body = buf[off : off + blen]
+        return "event", resume_token, op, doc_id, body
+    raise ValueError(f"unknown watch frame 0x{kind_byte:02x}")
+
+
+def decode_aggregate_response(buf: bytes) -> List[bytes]:
+    """Decode Aggregate response into raw row JSON byte strings."""
+    off = 0
+    (count,) = struct.unpack_from(">I", buf, off)
+    off += 4
+    rows: List[bytes] = []
+    for _ in range(count):
+        (n,) = struct.unpack_from(">I", buf, off)
+        off += 4
+        rows.append(buf[off : off + n])
+        off += n
+    return rows
+
+
 def decode_page(buf: bytes) -> Tuple[List[Tuple[bytes, bytes]], bytes]:
     """Decode a query/find response page into `(rows, next_cursor)`.
 
@@ -348,6 +425,29 @@ def decode_doc_get_rev_response(buf: bytes) -> Tuple[bytes, int]:
     body = buf[4 : 4 + blen]
     (revision,) = struct.unpack_from(">Q", buf, 4 + blen)
     return body, revision
+
+
+def decode_begin_response(buf: bytes) -> Tuple[int, int]:
+    """Decode Begin response: `(tx_id, snapshot_seq)`."""
+    if len(buf) != 16:
+        raise ValueError("Begin response must be 16 bytes")
+    tx_id, snapshot_seq = struct.unpack(">QQ", buf)
+    return tx_id, snapshot_seq
+
+
+def decode_commit_response(buf: bytes) -> int:
+    """Decode Commit response sequence number."""
+    if len(buf) != 8:
+        raise ValueError("Commit response must be 8 bytes")
+    (seq,) = struct.unpack(">Q", buf)
+    return seq
+
+
+def decode_stage_ack(buf: bytes) -> Tuple[int, int]:
+    """Decode stage ack: `(logical_ops, estimated_keys)`."""
+    if len(buf) != 8:
+        raise ValueError("stage ack must be 8 bytes")
+    return struct.unpack(">II", buf)
 
 
 def status_name(status: int) -> str:

@@ -50,6 +50,10 @@ func (p *pool) isClosed() bool {
 	return p.closed
 }
 
+func (p *pool) openDedicated(ctx context.Context) (*conn, error) {
+	return dial(ctx, p.addr, p.timeout, p.apiKey, p.tlsConf)
+}
+
 // acquire checks out a healthy connection, creating one if capacity allows or
 // waiting for one to be returned otherwise. It honors ctx cancellation.
 func (p *pool) acquire(ctx context.Context) (*conn, error) {

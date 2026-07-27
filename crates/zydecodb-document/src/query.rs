@@ -115,9 +115,10 @@ pub fn build_index_scan_spec(
 
     let iprefix = keys::index_prefix(prefix, coll.id, idx.id);
 
+    let dirs = idx.ascending();
     let mut lo = iprefix.clone();
     if let Some(j) = lo_json {
-        lo.extend_from_slice(&encode_bound(j)?);
+        lo.extend_from_slice(&encode_bound_directed(j, &dirs)?);
     }
     // A cursor resumes strictly after the last row of the previous page. The
     // leading seq prefix is consumed by the caller (to re-pin the snapshot); the
@@ -131,7 +132,7 @@ pub fn build_index_scan_spec(
     let hi = match hi_json {
         Some(j) => {
             let mut h = iprefix.clone();
-            h.extend_from_slice(&encode_bound(j)?);
+            h.extend_from_slice(&encode_bound_directed(j, &dirs)?);
             h
         }
         None => keys::prefix_upper_bound(&iprefix),
@@ -146,10 +147,10 @@ pub fn build_index_scan_spec(
     })
 }
 
-fn encode_bound(json: &[u8]) -> DocResult<Vec<u8>> {
+fn encode_bound_directed(json: &[u8], directions: &[bool]) -> DocResult<Vec<u8>> {
     let vals: Vec<Value> =
         serde_json::from_slice(json).map_err(|e| DocError::InvalidJson(e.to_string()))?;
-    Ok(encoding::encode_fields(&vals))
+    Ok(encoding::encode_fields_with_directions(&vals, directions))
 }
 
 /// Execute an index range scan against a snapshot, lock-free. Returns up to
@@ -291,17 +292,63 @@ fn decode_cursor(c: &[u8]) -> DocResult<Cursor> {
     }
 }
 
-/// Does the index's field order already satisfy the requested sort (so we can
-/// stream by key instead of buffering)? True when there is no sort, or the sort
-/// is a leading ascending prefix of the index fields.
-fn sort_matches_index(sort: &[(String, bool)], fields: &[String]) -> bool {
+/// How a requested sort relates to an index's physical order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortIndexMatch {
+    /// No sort, or sort matches index order (stream forward).
+    Forward,
+    /// Sort is the exact reverse of index order (stream reverse).
+    Reverse,
+}
+
+/// Does the index's field/direction order already satisfy the requested sort
+/// (so we can stream by key instead of buffering)?
+///
+/// `eq_prefix_len` is the planner equality prefix: those leading fields may be
+/// omitted from `sort` (client only sorts the remaining suffix).
+fn sort_matches_index(
+    sort: &[(String, bool)],
+    fields: &[String],
+    directions: &[bool],
+    eq_prefix_len: usize,
+) -> Option<SortIndexMatch> {
     if sort.is_empty() {
-        return true;
+        return Some(SortIndexMatch::Forward);
     }
-    if sort.len() > fields.len() {
-        return false;
+    let dirs = if directions.is_empty() {
+        vec![true; fields.len()]
+    } else {
+        directions.to_vec()
+    };
+    let physical: Vec<(String, bool)> = fields
+        .iter()
+        .zip(dirs.iter())
+        .map(|(f, d)| (f.clone(), *d))
+        .collect();
+
+    let suffix = &physical[eq_prefix_len.min(physical.len())..];
+    if sort_eq(sort, suffix) || sort_eq(sort, &physical) {
+        return Some(SortIndexMatch::Forward);
     }
-    sort.iter().zip(fields).all(|((p, asc), f)| *asc && p == f)
+    let rev_suffix: Vec<(String, bool)> =
+        suffix.iter().rev().map(|(f, a)| (f.clone(), !*a)).collect();
+    let rev_full: Vec<(String, bool)> = physical
+        .iter()
+        .rev()
+        .map(|(f, a)| (f.clone(), !*a))
+        .collect();
+    if sort_eq(sort, &rev_suffix) || sort_eq(sort, &rev_full) {
+        return Some(SortIndexMatch::Reverse);
+    }
+    None
+}
+
+fn sort_eq(sort: &[(String, bool)], expected: &[(String, bool)]) -> bool {
+    sort.len() == expected.len()
+        && sort
+            .iter()
+            .zip(expected)
+            .all(|((p, a), (f, ea))| p == f && a == ea)
 }
 
 /// Parse a stored body and make `_id` a virtual always-present field equal to
@@ -626,23 +673,35 @@ pub fn execute_find_coll(
                 next_cursor: None,
             })
         }
-        AccessPath::IndexScan { lo, hi, fields }
-            if spec.skip == 0
-                && sort_matches_index(&spec.sort, fields)
-                && matches!(
-                    spec.cursor.as_deref().map(decode_cursor),
-                    None | Some(Ok(Cursor::Key(_)))
-                ) =>
+        AccessPath::IndexScan {
+            lo,
+            hi,
+            fields,
+            directions,
+            eq_prefix_len,
+        } if spec.skip == 0
+            && matches!(
+                spec.cursor.as_deref().map(decode_cursor),
+                None | Some(Ok(Cursor::Key(_)))
+            ) =>
         {
-            key_mode_page(snap, spec, &doc_prefix, lo, hi, limit)
+            match sort_matches_index(&spec.sort, fields, directions, *eq_prefix_len) {
+                Some(SortIndexMatch::Forward) => {
+                    key_mode_page(snap, spec, &doc_prefix, lo, hi, limit, false)
+                }
+                Some(SortIndexMatch::Reverse) => {
+                    key_mode_page(snap, spec, &doc_prefix, lo, hi, limit, true)
+                }
+                None => offset_mode_page(snap, spec, &path, &doc_prefix, limit, max_sort_buffer),
+            }
         }
         _ => offset_mode_page(snap, spec, &path, &doc_prefix, limit, max_sort_buffer),
     }
 }
 
-/// Key-streaming pagination over an index range: resume strictly after the last
-/// returned row's index key. Used when the scan order already satisfies the
-/// sort and no `skip` is requested.
+/// Key-streaming pagination over an index range: resume strictly after (forward)
+/// or before (reverse) the last returned row's index key. Used when the scan
+/// order already satisfies the sort and no `skip` is requested.
 fn key_mode_page(
     snap: &SnapshotHandle,
     spec: &FindSpec,
@@ -650,23 +709,34 @@ fn key_mode_page(
     lo: &[u8],
     hi: &[u8],
     limit: usize,
+    reverse: bool,
 ) -> DocResult<QueryPage> {
-    let start = match spec.cursor.as_deref() {
+    let (scan_lo, scan_hi) = match spec.cursor.as_deref() {
         Some(c) => match decode_cursor(c)? {
-            Cursor::Key(mut k) => {
-                k.push(0x00);
-                k
+            Cursor::Key(k) => {
+                if reverse {
+                    // Resume strictly before the last key: scan `[lo, k)`.
+                    (lo.to_vec(), k)
+                } else {
+                    let mut start = k;
+                    start.push(0x00);
+                    (start, hi.to_vec())
+                }
             }
             Cursor::Offset(_) => return Err(DocError::Protocol("cursor mode changed".into())),
         },
-        None => lo.to_vec(),
+        None => (lo.to_vec(), hi.to_vec()),
     };
 
     let mut rows = Vec::new();
     let mut next_cursor = None;
     let mut last_match_key: Option<Vec<u8>> = None;
 
-    let iter = snap.scan(start, hi.to_vec())?;
+    let iter = if reverse {
+        snap.scan_rev(scan_lo, scan_hi)?
+    } else {
+        snap.scan(scan_lo, scan_hi)?
+    };
     for item in iter {
         let (ikey, doc_id) = item?;
         let mut dk = doc_prefix.to_vec();
@@ -714,25 +784,55 @@ fn offset_mode_page(
     }
 }
 
-/// Visit every candidate document for `path`, applying the residual `filter`,
-/// and call `f(doc_id, body)` for each match (return `false` to stop early).
-/// Bodies that fail to parse are skipped. `ById` is materialized as a single
-/// point lookup so callers (count/distinct/find_ids) work for every path.
-fn for_each_match<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
+/// Counts observed while streaming a planned query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MatchVisitStats {
+    /// Candidate documents considered before residual filter evaluation.
+    pub candidates: usize,
+    /// Documents that passed the complete residual filter.
+    pub matches: usize,
+}
+
+/// Visit every candidate document for `path`, counting each candidate before
+/// applying the residual `filter`, then call `f(doc_id, body)` for each match
+/// (return `false` to stop early). The visitor never buffers matches.
+///
+/// `max_candidates` bounds planner output rather than matches, so an
+/// unselective indexed predicate cannot evade scan limits through a selective
+/// residual predicate. `ById` counts one candidate only when the document
+/// exists.
+fn for_each_match_bounded<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
     snap: &SnapshotHandle,
     filter: &Filter,
     path: &AccessPath,
     doc_prefix: &[u8],
     prefix_len: usize,
+    max_candidates: usize,
     mut f: F,
-) -> DocResult<()> {
+) -> DocResult<MatchVisitStats> {
+    let mut stats = MatchVisitStats::default();
+    let count_candidate = |stats: &mut MatchVisitStats| -> DocResult<()> {
+        stats.candidates = stats
+            .candidates
+            .checked_add(1)
+            .ok_or_else(|| DocError::BadFilter("query candidate count overflow".into()))?;
+        if stats.candidates > max_candidates {
+            return Err(DocError::BadFilter(format!(
+                "query scan exceeds {max_candidates} candidate documents"
+            )));
+        }
+        Ok(())
+    };
+
     match path {
         AccessPath::ById(id) => {
             let mut dk = doc_prefix.to_vec();
             dk.extend_from_slice(id);
             if let Some(stored) = snap.get(&dk)? {
+                count_candidate(&mut stats)?;
                 if check_filter(&stored, filter, id) {
-                    f(id.clone(), &stored)?;
+                    stats.matches += 1;
+                    let _ = f(id.clone(), &stored)?;
                 }
             }
         }
@@ -740,12 +840,14 @@ fn for_each_match<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
             let iter = snap.scan(lo.clone(), hi.clone())?;
             for item in iter {
                 let (_ikey, doc_id) = item?;
+                count_candidate(&mut stats)?;
                 let mut dk = doc_prefix.to_vec();
                 dk.extend_from_slice(&doc_id);
                 if let Some(stored) = snap.get(&dk)? {
                     if check_filter(&stored, filter, &doc_id) {
+                        stats.matches += 1;
                         if !f(doc_id, &stored)? {
-                            return Ok(());
+                            return Ok(stats);
                         }
                     }
                 }
@@ -756,16 +858,29 @@ fn for_each_match<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
             let iter = snap.scan(doc_prefix.to_vec(), hi)?;
             for item in iter {
                 let (doc_key, stored) = item?;
+                count_candidate(&mut stats)?;
                 let doc_id = keys::doc_id_from_doc_key(prefix_len, &doc_key);
                 if check_filter(&stored, filter, &doc_id) {
+                    stats.matches += 1;
                     if !f(doc_id, &stored)? {
-                        return Ok(());
+                        return Ok(stats);
                     }
                 }
             }
         }
     }
-    Ok(())
+    Ok(stats)
+}
+
+fn for_each_match<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
+    snap: &SnapshotHandle,
+    filter: &Filter,
+    path: &AccessPath,
+    doc_prefix: &[u8],
+    prefix_len: usize,
+    f: F,
+) -> DocResult<()> {
+    for_each_match_bounded(snap, filter, path, doc_prefix, prefix_len, usize::MAX, f).map(|_| ())
 }
 
 /// `(planned path, doc_prefix, prefix_len)` for a collection + filter.
@@ -781,6 +896,29 @@ fn plan_scan(
     let path = planner::plan(filter, prefix, coll);
     let doc_prefix = keys::doc_prefix(prefix, coll.id);
     Ok((path, doc_prefix, prefix.len()))
+}
+
+/// Stream matches for a planner-selected access path with a hard bound on
+/// candidates examined before residual filtering.
+pub(crate) fn visit_planned_matches_bounded<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
+    snap: &SnapshotHandle,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    filter: &Filter,
+    max_candidates: usize,
+    f: F,
+) -> DocResult<MatchVisitStats> {
+    let (path, doc_prefix, prefix_len) = plan_scan(catalog, prefix, collection, filter)?;
+    for_each_match_bounded(
+        snap,
+        filter,
+        &path,
+        &doc_prefix,
+        prefix_len,
+        max_candidates,
+        f,
+    )
 }
 
 /// Collect the ids of all documents matching `filter` (bounded by

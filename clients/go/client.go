@@ -207,9 +207,14 @@ func (c *Client) Delete(ctx context.Context, key []byte) (bool, error) {
 
 // DefineIndex creates a secondary index. With ifNotExists, an existing index
 // returns (false, nil) instead of an error. expireAfterSeconds marks a TTL
-// index (field = unix millis); 0 means not a TTL index.
+// index (field = unix millis); 0 means not a TTL index. All fields are ascending.
 func (c *Client) DefineIndex(ctx context.Context, collection, index string, fields []string, unique, ifNotExists bool, expireAfterSeconds uint64) (bool, error) {
-	payload := EncodeIndexDef(collection, index, fields, unique, expireAfterSeconds)
+	return c.DefineIndexDirected(ctx, collection, index, fields, nil, unique, ifNotExists, expireAfterSeconds)
+}
+
+// DefineIndexDirected is DefineIndex with per-field ascending flags (nil = all ASC).
+func (c *Client) DefineIndexDirected(ctx context.Context, collection, index string, fields []string, directions []bool, unique, ifNotExists bool, expireAfterSeconds uint64) (bool, error) {
+	payload := EncodeIndexDefDirected(collection, index, fields, directions, unique, expireAfterSeconds)
 	conn, err := c.pool.acquire(ctx)
 	if err != nil {
 		return false, err
@@ -434,6 +439,29 @@ func (c *Client) Distinct(ctx context.Context, collection, field string, filter 
 	var out []any
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("zydecodb: decode distinct: %w", err)
+	}
+	return out, nil
+}
+
+// Aggregate runs a bounded aggregation pipeline and returns result documents.
+func (c *Client) Aggregate(ctx context.Context, collection string, pipeline []byte) ([]Document, error) {
+	body, err := c.execute(ctx, CmdAggregate, EncodeAggregate(collection, pipeline), "Aggregate", execOptions{retryable: true})
+	if err != nil {
+		return nil, err
+	}
+	rows, err := DecodeAggregateResponse(body)
+	if err != nil {
+		return nil, fmt.Errorf("zydecodb: decode aggregate: %w", err)
+	}
+	out := make([]Document, 0, len(rows))
+	for _, row := range rows {
+		doc := Document{}
+		if len(row) > 0 {
+			if err := json.Unmarshal(row, &doc); err != nil {
+				return nil, fmt.Errorf("zydecodb: decode aggregate row: %w", err)
+			}
+		}
+		out = append(out, doc)
 	}
 	return out, nil
 }

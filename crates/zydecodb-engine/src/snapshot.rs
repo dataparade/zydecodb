@@ -34,7 +34,9 @@
 
 use crate::entry::Entry;
 use crate::errors::EngineResult;
-use crate::iter::{EntryIterator, MemtableIter, MergeMode, MergingIterator};
+use crate::iter::{
+    EntryIterator, MemtableIter, MemtableRevIter, MergeMode, MergingIterator, ScanDirection,
+};
 use crate::keys::{EntryKind, InternalKey};
 use std::sync::Arc;
 
@@ -62,6 +64,15 @@ impl<'a> SnapshotView<'a> {
     pub fn scan(&self, lo: Vec<u8>, hi: Vec<u8>) -> EngineResult<RangeIter<'a>> {
         let now_ms = current_time_ms();
         let inner = self.engine.build_merging_iterator(self.seq_upper, lo, hi)?;
+        Ok(RangeIter { inner, now_ms })
+    }
+
+    /// Like [`scan`] but yields `(user_key, value)` pairs in user-key DESC order.
+    pub fn scan_rev(&self, lo: Vec<u8>, hi: Vec<u8>) -> EngineResult<RangeIter<'a>> {
+        let now_ms = current_time_ms();
+        let inner = self
+            .engine
+            .build_merging_iterator_rev(self.seq_upper, lo, hi)?;
         Ok(RangeIter { inner, now_ms })
     }
 
@@ -160,6 +171,35 @@ pub(crate) fn build_sources<'a>(
     }
 
     MergingIterator::new(sources, MergeMode::Dedup)
+}
+
+/// Like [`build_sources`] but yields user keys in descending order.
+pub(crate) fn build_sources_rev<'a>(
+    active: &'a crate::memtable::Memtable,
+    immutable: impl Iterator<Item = &'a crate::memtable::Memtable>,
+    sstables: &[Arc<crate::sstable::SstableReader>],
+    seq_upper: u64,
+    lo: Vec<u8>,
+    hi: Vec<u8>,
+) -> EngineResult<MergingIterator<'a>> {
+    let mut sources: Vec<Box<dyn EntryIterator + 'a>> = Vec::new();
+
+    sources.push(Box::new(SeqFilter::new(
+        MemtableRevIter::range(active, &lo, &hi),
+        seq_upper,
+    )));
+    for mt in immutable {
+        sources.push(Box::new(SeqFilter::new(
+            MemtableRevIter::range(mt, &lo, &hi),
+            seq_upper,
+        )));
+    }
+    for sst in sstables {
+        let it = sst.clone().range_iter_rev(lo.clone(), hi.clone())?;
+        sources.push(Box::new(SeqFilter::new(it, seq_upper)));
+    }
+
+    MergingIterator::new_directed(sources, MergeMode::Dedup, ScanDirection::Reverse)
 }
 
 /// Wraps a source iterator and drops any entry whose `seq > seq_upper`.

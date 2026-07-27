@@ -59,6 +59,8 @@ pub fn base_config(tmp: &TempDir, listen: SocketAddr) -> Config {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
+        aggregation: Default::default(),
+        change_streams: Default::default(),
     }
 }
 

@@ -189,6 +189,11 @@ pub struct Engine {
     /// Optional HMAC key authenticating each `shipped.log` entry so a writable
     /// ship directory cannot forge segments plus matching manifest lines.
     ship_hmac_key: Option<Vec<u8>>,
+    /// Retained WAL archive for change streams. When set, sealed segments are
+    /// archived before the live WAL may unlink them.
+    change_log: Option<crate::change_log::ChangeLogConfig>,
+    /// In-memory view of the change-log manifest (None when change_log disabled).
+    change_log_manifest: Option<crate::change_log::ChangeLogManifest>,
     manifest_file: Arc<Mutex<File>>,
     metrics: Option<Arc<crate::metrics::Metrics>>,
     /// Shared block cache for all SSTable readers. Constructed at engine

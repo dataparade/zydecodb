@@ -12,8 +12,15 @@ import { test } from "node:test";
 import {
   Cmd,
   decodeDocGetRevResponse,
+  decodeBeginResponse,
+  decodeCommitResponse,
+  decodeStageAck,
+  decodeAggregateResponse,
+  decodeWatchFrame,
   decodePage,
   decodePageWithRevision,
+  encodeAggregate,
+  encodeWatch,
   encodeCount,
   encodeDelete,
   encodeDistinct,
@@ -54,6 +61,16 @@ interface RespVector {
     next_cursor_hex?: string | null;
     body_json?: string;
     revision?: number;
+    tx_id?: number;
+    snapshot_seq?: number;
+    seq?: number;
+    logical_ops?: number;
+    estimated_keys?: number;
+    rows_json?: string[];
+    resume_token_hex?: string;
+    op?: string;
+    doc_id?: string;
+    body_json?: string;
   };
 }
 
@@ -91,14 +108,17 @@ function encodeRequest(v: ReqVector): Buffer {
       );
     case "DocDel":
       return encodeDocDel(s(i, "collection"), Buffer.from(s(i, "doc_id"), "utf8"));
-    case "IndexDef":
+    case "IndexDef": {
+      const dirs = i["directions"];
       return encodeIndexDef(
         s(i, "collection"),
         s(i, "index_name"),
         arr(i, "fields"),
         b(i, "unique"),
         (i["expire_after_seconds"] as number | undefined) ?? 0,
+        Array.isArray(dirs) ? (dirs as boolean[]) : undefined,
       );
+    }
     case "QueryById":
       return encodeQueryById(s(i, "collection"), Buffer.from(s(i, "doc_id"), "utf8"));
     case "QueryIndexRange":
@@ -152,6 +172,10 @@ function encodeRequest(v: ReqVector): Buffer {
         b(i, "relaxed"),
         BigInt(n(i, "if_match")),
       );
+    case "Begin":
+    case "Commit":
+    case "Rollback":
+      return Buffer.alloc(0);
     case "Update":
       return encodeUpdate(
         s(i, "collection"),
@@ -167,6 +191,10 @@ function encodeRequest(v: ReqVector): Buffer {
       return encodeCount(s(i, "collection"), optBytes(s(i, "filter_json")));
     case "Distinct":
       return encodeDistinct(s(i, "collection"), optBytes(s(i, "filter_json")), s(i, "field"));
+    case "Aggregate":
+      return encodeAggregate(s(i, "collection"), optBytes(s(i, "pipeline_json")));
+    case "Watch":
+      return encodeWatch(s(i, "collection"), fromHex(s(i, "resume_token_hex")));
     case "SessionInit":
       return Buffer.from(s(i, "api_key"), "utf8");
     case "Ping":
@@ -230,6 +258,48 @@ for (const v of vectors.responses) {
       assert.equal(got.revision, BigInt(v.decoded.revision!));
       return;
     }
+    if (v.kind === "BeginResponse") {
+      const got = decodeBeginResponse(fromHex(v.bytes_hex));
+      assert.equal(got.txId, BigInt(v.decoded.tx_id!));
+      assert.equal(got.snapshotSeq, BigInt(v.decoded.snapshot_seq!));
+      return;
+    }
+    if (v.kind === "CommitResponse") {
+      const seq = decodeCommitResponse(fromHex(v.bytes_hex));
+      assert.equal(seq, BigInt(v.decoded.seq!));
+      return;
+    }
+    if (v.kind === "StageAck") {
+      const got = decodeStageAck(fromHex(v.bytes_hex));
+      assert.equal(got.logicalOps, v.decoded.logical_ops);
+      assert.equal(got.estimatedKeys, v.decoded.estimated_keys);
+      return;
+    }
+    if (v.kind === "AggregateResponse") {
+      const rows = decodeAggregateResponse(fromHex(v.bytes_hex));
+      assert.equal(rows.length, v.decoded.rows_json!.length);
+      rows.forEach((row, idx) => {
+        assert.equal(row.toString("utf8"), v.decoded.rows_json![idx]);
+      });
+      return;
+    }
+    if (v.kind === "WatchFrameAck" || v.kind === "WatchFrameHeartbeat") {
+      const frame = decodeWatchFrame(fromHex(v.bytes_hex));
+      const wantKind = v.kind === "WatchFrameAck" ? "ack" : "heartbeat";
+      assert.equal(frame.kind, wantKind);
+      assert.equal(frame.resumeToken.toString("hex"), v.decoded.resume_token_hex);
+      return;
+    }
+    if (v.kind === "WatchFrameEvent") {
+      const frame = decodeWatchFrame(fromHex(v.bytes_hex));
+      assert.equal(frame.kind, "event");
+      assert.equal(frame.resumeToken.toString("hex"), v.decoded.resume_token_hex);
+      assert.equal(frame.docId?.toString("utf8"), v.decoded.doc_id);
+      assert.equal(frame.body?.toString("utf8") ?? "", v.decoded.body_json);
+      const wantOp = v.decoded.op === "upsert" ? 0x01 : 0x02;
+      assert.equal(frame.op, wantOp);
+      return;
+    }
     throw new Error(`unhandled response kind: ${v.kind}`);
   });
 }
@@ -244,6 +314,11 @@ test("command and status codes match vectors", () => {
   assert.equal(vectors.commands["FindRev"], Cmd.FindRev);
   assert.equal(vectors.commands["DocPutIfMatch"], Cmd.DocPutIfMatch);
   assert.equal(vectors.commands["DocUpdateIfMatch"], Cmd.DocUpdateIfMatch);
+  assert.equal(vectors.commands["Aggregate"], Cmd.Aggregate);
+  assert.equal(vectors.commands["Watch"], Cmd.Watch);
+  assert.equal(vectors.commands["Begin"], Cmd.Begin);
+  assert.equal(vectors.commands["Commit"], Cmd.Commit);
+  assert.equal(vectors.commands["Rollback"], Cmd.Rollback);
   assert.equal(vectors.commands["IndexDef"], Cmd.IndexDef);
   assert.equal(vectors.commands["SessionInit"], Cmd.SessionInit);
   assert.equal(vectors.statuses["Ok"], Status.Ok);

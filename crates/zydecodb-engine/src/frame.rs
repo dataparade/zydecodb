@@ -8,10 +8,10 @@
 //! ```
 //!
 //! The engine owns the envelope byte layout and the command/status enumerations.
-//! Document opcodes (`0x20`–`0x2A`, `0x30`) are interpreted by the server document
+//! Document opcodes (`0x20`–`0x2C`, `0x30`) are interpreted by the server document
 //! layer; session/admin opcodes (`0x40`–`0x42`) by the server security/admin path.
-//! Reserved slots (`Begin`/`Commit`/`Rollback`, `SchemaDef`) parse but reject with
-//! `ProtocolError` until a future minor line assigns semantics.
+//! `Begin`/`Commit`/`Rollback` are bounded per-connection transactions.
+//! `SchemaDef` remains reserved and rejects with `ProtocolError`.
 
 use crate::errors::{EngineError, Status};
 
@@ -19,7 +19,7 @@ pub const PROTO_VERSION: u8 = 0x01;
 pub const ENVELOPE_HEADER_LEN: usize = 6;
 
 /// Command codes for the 0.9 wire. Implemented opcodes and this numbering are
-/// frozen for 0.9.x; reserved slots may gain semantics later without renumbering.
+/// frozen for 0.10.x; reserved slots may gain semantics later without renumbering.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -51,6 +51,10 @@ pub enum Command {
     DocPutIfMatch = 0x29,
     /// Conditional by-id partial update (`ifMatch` revision required).
     DocUpdateIfMatch = 0x2A,
+    /// Bounded aggregation (`$match` + `$group` with `$sum` / `$count`).
+    Aggregate = 0x2B,
+    /// Collection change-stream subscription (dedicated connection).
+    Watch = 0x2C,
     IndexDef = 0x30,
     SchemaDef = 0x31,
     /// Reserved byte for caller-defined session establishment. The engine parses
@@ -89,6 +93,8 @@ impl Command {
             0x28 => Command::FindRev,
             0x29 => Command::DocPutIfMatch,
             0x2A => Command::DocUpdateIfMatch,
+            0x2B => Command::Aggregate,
+            0x2C => Command::Watch,
             0x30 => Command::IndexDef,
             0x31 => Command::SchemaDef,
             0x40 => Command::SessionInit,
@@ -131,7 +137,31 @@ impl Command {
                 | Command::FindRev
                 | Command::DocPutIfMatch
                 | Command::DocUpdateIfMatch
+                | Command::Aggregate
+                | Command::Watch
                 | Command::IndexDef
+        )
+    }
+
+    /// Per-connection transaction control commands.
+    pub fn is_transaction_command(self) -> bool {
+        matches!(self, Command::Begin | Command::Commit | Command::Rollback)
+    }
+
+    /// Commands that may be staged or read inside an open transaction.
+    pub fn is_transaction_allowed(self) -> bool {
+        matches!(
+            self,
+            Command::Put
+                | Command::Get
+                | Command::Del
+                | Command::DocPut
+                | Command::DocDel
+                | Command::DocGetRev
+                | Command::DocPutIfMatch
+                | Command::DocUpdateIfMatch
+                | Command::Ping
+                | Command::Stats
         )
     }
 }
@@ -340,7 +370,7 @@ mod tests {
     fn command_round_trips() {
         for b in [
             0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
-            0x28, 0x29, 0x2A, 0x30, 0x31, 0x40, 0x41, 0xF0, 0xF1,
+            0x28, 0x29, 0x2A, 0x2B, 0x30, 0x31, 0x40, 0x41, 0xF0, 0xF1,
         ] {
             let c = Command::from_u8(b).unwrap();
             assert_eq!(c.as_u8(), b);

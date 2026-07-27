@@ -13,6 +13,7 @@
 //! so a FlatBuffer extractor (`0x01`) can be added later without touching the
 //! encoding, key layout, or storage.
 
+pub mod aggregation;
 pub mod binary;
 pub mod catalog;
 pub mod encoding;

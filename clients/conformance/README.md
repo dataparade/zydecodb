@@ -76,7 +76,9 @@ of scope here. Fields suffixed `_hex` (`cursor_hex`) carry raw bytes as hex.
 - **DocDel** — `collection`, `doc_id`
 - **IndexDef** — `collection`, `index_name`, `fields` (string[]), `unique`,
   optional `expire_after_seconds` (u64; omit/`0` = not a TTL index; trailer only
-  when non-zero)
+  when non-zero or when any field is descending), optional `directions`
+  (bool[]; `true`=ASC; when any `false`, wire adds TTL u64 then `0x02` + N
+  direction bytes)
 - **QueryById** — `collection`, `doc_id`
 - **QueryIndexRange** — `collection`, `index_name`, `lo_json`, `hi_json`,
   `cursor_hex`, `limit`

@@ -82,6 +82,8 @@ pub struct JoinDissolve {
 pub struct IndexPlan {
     pub name: String,
     pub fields: Vec<String>,
+    /// Per-field ascending flags (empty = all ascending).
+    pub directions: Vec<bool>,
     pub unique: bool,
 }
 
@@ -215,6 +217,7 @@ pub fn classify(dump: &Dump, graph: &Graph) -> Plan {
                     coll.indexes.push(IndexPlan {
                         name: index_name(&rel.fk_columns),
                         fields: rel.fk_columns.clone(),
+                        directions: Vec::new(),
                         unique: false,
                     });
                 }
@@ -222,9 +225,15 @@ pub fn classify(dump: &Dump, graph: &Graph) -> Plan {
         }
 
         // Recreate Postgres indexes (the "queried by these columns" signal).
-        for cols in &t.indexed_columns {
-            if all_top_level(t, cols) {
-                push_unique_index(&mut coll.indexes, index_name(cols), cols.clone(), false);
+        for idx_cols in &t.indexed_columns {
+            if all_top_level(t, &idx_cols.fields) {
+                push_unique_index(
+                    &mut coll.indexes,
+                    index_name(&idx_cols.fields),
+                    idx_cols.fields.clone(),
+                    idx_cols.directions.clone(),
+                    false,
+                );
             }
         }
 
@@ -232,7 +241,13 @@ pub fn classify(dump: &Dump, graph: &Graph) -> Plan {
         // top-level scalar fields; otherwise report them as dropped.
         for u in &t.unique {
             if all_top_level(t, u) {
-                push_unique_index(&mut coll.indexes, unique_index_name(u), u.clone(), true);
+                push_unique_index(
+                    &mut coll.indexes,
+                    unique_index_name(u),
+                    u.clone(),
+                    Vec::new(),
+                    true,
+                );
                 plan.dropped
                     .preserved_unique
                     .push((t.name.clone(), u.clone()));
@@ -362,7 +377,8 @@ fn referenced_by_count(graph: &Graph, table: &str) -> usize {
 /// foreign key nor its primary key — i.e. the application queries it by its own
 /// fields, so it must stay separately queryable.
 fn has_independent_index(t: &Table) -> bool {
-    for cols in &t.indexed_columns {
+    for idx_cols in &t.indexed_columns {
+        let cols = &idx_cols.fields;
         let is_pk = sorted(cols) == sorted(&t.primary_key);
         let is_fk = t
             .foreign_keys
@@ -438,6 +454,7 @@ fn ensure_creatable_indexes(plan: &mut Plan) {
             coll.indexes.push(IndexPlan {
                 name: "by__id".to_string(),
                 fields: vec!["_id".to_string()],
+                directions: Vec::new(),
                 unique: false,
             });
         }
@@ -492,7 +509,13 @@ fn all_top_level(t: &Table, cols: &[String]) -> bool {
     cols.iter().all(|c| t.column(c).is_some())
 }
 
-fn push_unique_index(into: &mut Vec<IndexPlan>, name: String, fields: Vec<String>, unique: bool) {
+fn push_unique_index(
+    into: &mut Vec<IndexPlan>,
+    name: String,
+    fields: Vec<String>,
+    directions: Vec<bool>,
+    unique: bool,
+) {
     if into.iter().any(|i| i.fields == fields) {
         // Upgrade an existing non-unique index to unique if needed.
         if unique {
@@ -505,6 +528,7 @@ fn push_unique_index(into: &mut Vec<IndexPlan>, name: String, fields: Vec<String
     into.push(IndexPlan {
         name,
         fields,
+        directions,
         unique,
     });
 }

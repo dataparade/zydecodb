@@ -42,6 +42,15 @@ type respVector struct {
 		NextCursorHex *string `json:"next_cursor_hex"`
 		BodyJSON      string  `json:"body_json"`
 		Revision      *uint64 `json:"revision"`
+		TxID          uint64  `json:"tx_id"`
+		SnapshotSeq   uint64  `json:"snapshot_seq"`
+		Seq           uint64  `json:"seq"`
+		LogicalOps    uint32   `json:"logical_ops"`
+		EstimatedKeys uint32   `json:"estimated_keys"`
+		RowsJSON      []string `json:"rows_json"`
+		ResumeTokenHex string  `json:"resume_token_hex"`
+		Op             string  `json:"op"`
+		DocID          string  `json:"doc_id"`
 	} `json:"decoded"`
 }
 
@@ -124,9 +133,10 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 			Fields             []string `json:"fields"`
 			Unique             bool     `json:"unique"`
 			ExpireAfterSeconds uint64   `json:"expire_after_seconds"`
+			Directions         []bool   `json:"directions"`
 		}
 		mustInput(t, v.Input, &in)
-		return EncodeIndexDef(in.Collection, in.IndexName, in.Fields, in.Unique, in.ExpireAfterSeconds)
+		return EncodeIndexDefDirected(in.Collection, in.IndexName, in.Fields, in.Directions, in.Unique, in.ExpireAfterSeconds)
 	case "QueryById":
 		var in struct {
 			Collection string `json:"collection"`
@@ -201,6 +211,8 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 		}
 		mustInput(t, v.Input, &in)
 		return EncodeDocUpdateIfMatch(in.Collection, []byte(in.DocID), optBytes(in.UpdateJSON), in.Relaxed, in.IfMatch)
+	case "Begin", "Commit", "Rollback":
+		return nil
 	case "Update":
 		var in struct {
 			Collection string `json:"collection"`
@@ -236,6 +248,20 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 		}
 		mustInput(t, v.Input, &in)
 		return EncodeDistinct(in.Collection, optBytes(in.FilterJSON), in.Field)
+	case "Aggregate":
+		var in struct {
+			Collection   string `json:"collection"`
+			PipelineJSON string `json:"pipeline_json"`
+		}
+		mustInput(t, v.Input, &in)
+		return EncodeAggregate(in.Collection, optBytes(in.PipelineJSON))
+	case "Watch":
+		var in struct {
+			Collection     string `json:"collection"`
+			ResumeTokenHex string `json:"resume_token_hex"`
+		}
+		mustInput(t, v.Input, &in)
+		return EncodeWatch(in.Collection, mustHex(t, in.ResumeTokenHex))
 	case "SessionInit":
 		var in struct {
 			APIKey string `json:"api_key"`
@@ -337,6 +363,79 @@ func TestResponseVectors(t *testing.T) {
 				if v.Decoded.Revision == nil || rev != *v.Decoded.Revision {
 					t.Errorf("revision: got %d want %v", rev, v.Decoded.Revision)
 				}
+			case "BeginResponse":
+				txID, snap, err := DecodeBeginResponse(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if txID != uint64(v.Decoded.TxID) || snap != uint64(v.Decoded.SnapshotSeq) {
+					t.Errorf("begin: got (%d,%d) want (%d,%d)", txID, snap, v.Decoded.TxID, v.Decoded.SnapshotSeq)
+				}
+			case "CommitResponse":
+				seq, err := DecodeCommitResponse(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if seq != uint64(v.Decoded.Seq) {
+					t.Errorf("commit seq: got %d want %d", seq, v.Decoded.Seq)
+				}
+			case "StageAck":
+				ops, keys, err := DecodeStageAck(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if ops != uint32(v.Decoded.LogicalOps) || keys != uint32(v.Decoded.EstimatedKeys) {
+					t.Errorf("stage ack: got (%d,%d) want (%d,%d)", ops, keys, v.Decoded.LogicalOps, v.Decoded.EstimatedKeys)
+				}
+			case "AggregateResponse":
+				rows, err := DecodeAggregateResponse(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if len(rows) != len(v.Decoded.RowsJSON) {
+					t.Fatalf("row count: got %d want %d", len(rows), len(v.Decoded.RowsJSON))
+				}
+				for i, exp := range v.Decoded.RowsJSON {
+					if string(rows[i]) != exp {
+						t.Errorf("row %d: got %q want %q", i, rows[i], exp)
+					}
+				}
+			case "WatchFrameAck", "WatchFrameHeartbeat":
+				frame, err := DecodeWatchFrame(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				wantKind := map[string]string{
+					"WatchFrameAck":       "ack",
+					"WatchFrameHeartbeat": "heartbeat",
+				}[v.Kind]
+				if frame.Kind != wantKind {
+					t.Errorf("kind: got %q want %q", frame.Kind, wantKind)
+				}
+				if got := hex.EncodeToString(frame.ResumeToken); got != v.Decoded.ResumeTokenHex {
+					t.Errorf("resume token: got %s want %s", got, v.Decoded.ResumeTokenHex)
+				}
+			case "WatchFrameEvent":
+				frame, err := DecodeWatchFrame(mustHex(t, v.BytesHex))
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if frame.Kind != "event" {
+					t.Fatalf("kind: got %q want event", frame.Kind)
+				}
+				if got := hex.EncodeToString(frame.ResumeToken); got != v.Decoded.ResumeTokenHex {
+					t.Errorf("resume token: got %s want %s", got, v.Decoded.ResumeTokenHex)
+				}
+				wantOp := map[string]byte{"upsert": WatchOpUpsert, "delete": WatchOpDelete}[v.Decoded.Op]
+				if frame.Op != wantOp {
+					t.Errorf("op: got 0x%02x want 0x%02x", frame.Op, wantOp)
+				}
+				if string(frame.DocID) != v.Decoded.DocID {
+					t.Errorf("doc_id: got %q want %q", frame.DocID, v.Decoded.DocID)
+				}
+				if string(frame.Body) != v.Decoded.BodyJSON {
+					t.Errorf("body: got %q want %q", frame.Body, v.Decoded.BodyJSON)
+				}
 			default:
 				t.Fatalf("unhandled response kind: %s", v.Kind)
 			}
@@ -356,6 +455,11 @@ func TestCommandAndStatusCodes(t *testing.T) {
 		"FindRev":          CmdFindRev,
 		"DocPutIfMatch":    CmdDocPutIfMatch,
 		"DocUpdateIfMatch": CmdDocUpdateIfMatch,
+		"Aggregate":        CmdAggregate,
+		"Watch":            CmdWatch,
+		"Begin":            CmdBegin,
+		"Commit":           CmdCommit,
+		"Rollback":         CmdRollback,
 		"IndexDef":         CmdIndexDef,
 		"SessionInit":      CmdSessionInit,
 	}

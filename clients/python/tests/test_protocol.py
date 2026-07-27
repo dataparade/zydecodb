@@ -83,6 +83,37 @@ def test_projection_encoding():
     assert _encode_projection({"secret": 0}) == (proto.PROJ_EXCLUDE, ["secret"])
 
 
+def test_watch_encode_decode_roundtrip():
+    payload = proto.encode_watch("users", b"")
+    assert payload == proto.encode_watch("users", bytes.fromhex(""))
+
+    token = bytes.fromhex("01020304")
+    ack = bytes([proto.WATCH_FRAME_ACK]) + struct.pack(">I", len(token)) + token
+    kind, got_token, op, doc_id, body = proto.decode_watch_frame(ack)
+    assert kind == "ack" and got_token == token and op is None
+
+    doc_body = b'{"_id":"u1","age":30}'
+    event = (
+        bytes([proto.WATCH_FRAME_EVENT])
+        + struct.pack(">I", len(token))
+        + token
+        + bytes([proto.WATCH_OP_UPSERT])
+        + struct.pack(">I", len(b"u1"))
+        + b"u1"
+        + struct.pack(">I", len(doc_body))
+        + doc_body
+    )
+    kind, got_token, op, doc_id, body = proto.decode_watch_frame(event)
+    assert kind == "event"
+    assert op == proto.WATCH_OP_UPSERT
+    assert doc_id == b"u1"
+    assert body == doc_body
+
+    hb = bytes([proto.WATCH_FRAME_HEARTBEAT]) + struct.pack(">I", len(token)) + token
+    kind, got_token, _, _, _ = proto.decode_watch_frame(hb)
+    assert kind == "heartbeat" and got_token == token
+
+
 def test_projection_rejects_mixed():
     with pytest.raises(Exception):
         _encode_projection({"a": 1, "b": 0})

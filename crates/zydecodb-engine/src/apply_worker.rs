@@ -67,6 +67,7 @@ pub struct CompactionApplyMetrics {
     pub bytes_written: u64,
     pub versions_dropped: u64,
     pub tombstones_dropped: u64,
+    pub expired_dropped: u64,
     pub worker_elapsed: Duration,
 }
 

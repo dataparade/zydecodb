@@ -32,7 +32,7 @@ fn index_keys_for(
                 .iter()
                 .map(|f| encoding::extract_path(doc, f))
                 .collect();
-            let enc = encoding::encode_fields(&vals);
+            let enc = encoding::encode_fields_with_directions(&vals, &idx.ascending());
             keys::index_key(prefix, coll.id, idx.id, &enc, doc_id)
         })
         .collect()
@@ -48,7 +48,11 @@ fn index_keys_for_view(
     coll.indexes
         .iter()
         .map(|idx| {
-            let enc = encoding::encode_fields_from_view(view, &idx.fields);
+            let enc = encoding::encode_fields_from_view_with_directions(
+                view,
+                &idx.fields,
+                &idx.ascending(),
+            );
             keys::index_key(prefix, coll.id, idx.id, &enc, doc_id)
         })
         .collect()
@@ -154,7 +158,7 @@ fn enforce_unique(
             .iter()
             .map(|f| encoding::extract_path(new_doc, f))
             .collect();
-        encoding::encode_fields(&vals)
+        encoding::encode_fields_with_directions(&vals, &idx.ascending())
     })
 }
 
@@ -166,7 +170,7 @@ fn enforce_unique_view(
     view: &crate::binary::ValueView<'_>,
 ) -> DocResult<()> {
     enforce_unique_enc(engine, coll, prefix, doc_id, |idx| {
-        encoding::encode_fields_from_view(view, &idx.fields)
+        encoding::encode_fields_from_view_with_directions(view, &idx.fields, &idx.ascending())
     })
 }
 
@@ -206,6 +210,45 @@ pub fn upsert_ops_with_old(
     expires_at: u64,
     old_doc: Option<&Value>,
 ) -> DocResult<Vec<BatchOp>> {
+    upsert_ops_with_old_inner(
+        engine, catalog, prefix, collection, doc_id, payload, is_zdoc, expires_at, old_doc, true,
+    )
+}
+
+/// Like [`upsert_ops_with_old`], but skips unique-index enforcement.
+///
+/// Used by bounded transactions after they have already validated uniqueness
+/// across the whole staged set (including ownership transfers).
+pub fn upsert_ops_without_unique(
+    engine: &mut Engine,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+    payload: &[u8],
+    is_zdoc: bool,
+    expires_at: u64,
+    old_doc: Option<&Value>,
+) -> DocResult<Vec<BatchOp>> {
+    upsert_ops_with_old_inner(
+        engine, catalog, prefix, collection, doc_id, payload, is_zdoc, expires_at, old_doc, false,
+    )
+}
+
+/// Like [`upsert_ops`], with an optional pre-loaded prior document.
+#[allow(clippy::too_many_arguments)]
+fn upsert_ops_with_old_inner(
+    engine: &mut Engine,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+    payload: &[u8],
+    is_zdoc: bool,
+    expires_at: u64,
+    old_doc: Option<&Value>,
+    check_unique: bool,
+) -> DocResult<Vec<BatchOp>> {
     let coll = catalog
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
@@ -216,7 +259,9 @@ pub fn upsert_ops_with_old(
     // full serde_json tree for the new body under the engine lock.
     let (expires_at, old_keys, new_keys) = if is_zdoc {
         let view = crate::binary::ValueView::new(payload);
-        enforce_unique_view(engine, coll, prefix, doc_id, &view)?;
+        if check_unique {
+            enforce_unique_view(engine, coll, prefix, doc_id, &view)?;
+        }
         let expires_at = if let Some(ttl) = coll.ttl_index() {
             derive_ttl_expires_at_view(&view, ttl)
         } else {
@@ -236,7 +281,9 @@ pub fn upsert_ops_with_old(
     } else {
         let new_doc: Value =
             serde_json::from_slice(payload).map_err(|e| DocError::InvalidJson(e.to_string()))?;
-        enforce_unique(engine, coll, prefix, doc_id, &new_doc)?;
+        if check_unique {
+            enforce_unique(engine, coll, prefix, doc_id, &new_doc)?;
+        }
         let expires_at = if let Some(ttl) = coll.ttl_index() {
             derive_ttl_expires_at(&new_doc, ttl)
         } else {
@@ -265,12 +312,13 @@ pub fn upsert_ops_with_old(
         expires_at,
     });
     // Stale entries (old - new) are removed; fresh entries (new - old) are
-    // added. The two sets are disjoint, and doc keys ('d') never collide with
-    // index keys ('i'), so the batch has no duplicate keys.
+    // added. Unchanged keys (intersection) are rewritten so index `expires_at`
+    // stays aligned with the body when only expiry (or TTL derivation) changes.
+    // Doc keys ('d') never collide with index keys ('i').
     for k in old_keys.difference(&new_keys) {
         ops.push(BatchOp::Del { key: k.clone() });
     }
-    for k in new_keys.difference(&old_keys) {
+    for k in new_keys.iter() {
         ops.push(BatchOp::Put {
             key: k.clone(),
             value: doc_id.to_vec(),
@@ -473,6 +521,80 @@ pub(crate) fn commit_batches(engine: &mut Engine, per_doc: Vec<Vec<BatchOp>>) ->
     Ok(())
 }
 
+/// Encoded unique-index field values claimed by `doc` (one entry per unique index).
+/// Returns `(index_name, collection_id, index_id, encoded_fields)`.
+#[allow(clippy::type_complexity)]
+pub fn unique_encodings_for_doc(
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc: &Value,
+) -> DocResult<Vec<(String, u32, u32, Vec<u8>)>> {
+    let coll = catalog
+        .collection(prefix, collection)
+        .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
+    let mut out = Vec::new();
+    for idx in coll.indexes.iter().filter(|i| i.unique) {
+        let vals: Vec<Value> = idx
+            .fields
+            .iter()
+            .map(|f| encoding::extract_path(doc, f))
+            .collect();
+        let enc = encoding::encode_fields_with_directions(&vals, &idx.ascending());
+        out.push((idx.name.clone(), coll.id, idx.id, enc));
+    }
+    Ok(out)
+}
+
+/// Scan a unique index for the current committed owner of `encoded_fields`.
+/// Returns `Some(doc_id)` when an entry exists.
+pub fn unique_owner(
+    engine: &Engine,
+    prefix: &[u8],
+    collection_id: u32,
+    index_id: u32,
+    encoded_fields: &[u8],
+) -> DocResult<Option<Vec<u8>>> {
+    let snap = engine.snapshot_owned();
+    let mut lo = keys::index_prefix(prefix, collection_id, index_id);
+    lo.extend_from_slice(encoded_fields);
+    let hi = keys::prefix_upper_bound(&lo);
+    let mut rows = snap.scan(lo, hi)?;
+    if let Some(item) = rows.next() {
+        let (_key, existing_doc_id) = item?;
+        return Ok(Some(existing_doc_id));
+    }
+    Ok(None)
+}
+
+/// Decode the current committed JSON body for a document, if present.
+pub fn current_json_body(
+    engine: &Engine,
+    catalog: &Catalog,
+    prefix: &[u8],
+    collection: &str,
+    doc_id: &[u8],
+) -> DocResult<Option<Value>> {
+    let coll = catalog
+        .collection(prefix, collection)
+        .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
+    let dk = keys::doc_key(prefix, coll.id, doc_id);
+    match engine.get(&dk)? {
+        Some(stored) if !stored.is_empty() => {
+            let payload = strip_value_kind(&stored);
+            if stored[0] == VK_ZDOC {
+                Ok(Some(crate::binary::ValueView::new(payload).to_value()))
+            } else {
+                Ok(Some(
+                    serde_json::from_slice(payload)
+                        .map_err(|e| DocError::InvalidJson(e.to_string()))?,
+                ))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Define an index on a collection and backfill it over existing documents.
 ///
 /// Ordering is deliberate for crash safety: the index entries are written
@@ -493,14 +615,40 @@ pub fn define_index(
     unique: bool,
     expire_after_seconds: Option<u64>,
 ) -> DocResult<()> {
-    // Work on a copy so the live catalog is mutated only after the backfill and
-    // persist both succeed.
-    let mut working = catalog.clone();
-    let meta = working.add_index(
+    define_index_directed(
+        engine,
+        catalog,
         prefix,
         collection,
         index_name,
         fields,
+        Vec::new(),
+        unique,
+        expire_after_seconds,
+    )
+}
+
+/// Like [`define_index`] with per-field ascending flags (`directions` empty = all ASC).
+pub fn define_index_directed(
+    engine: &mut Engine,
+    catalog: &mut Catalog,
+    prefix: &[u8],
+    collection: &str,
+    index_name: &str,
+    fields: Vec<String>,
+    directions: Vec<bool>,
+    unique: bool,
+    expire_after_seconds: Option<u64>,
+) -> DocResult<()> {
+    // Work on a copy so the live catalog is mutated only after the backfill and
+    // persist both succeed.
+    let mut working = catalog.clone();
+    let meta = working.add_index_directed(
+        prefix,
+        collection,
+        index_name,
+        fields,
+        directions,
         unique,
         expire_after_seconds,
     )?;
@@ -580,10 +728,11 @@ fn backfill_index(
     for item in rows.by_ref() {
         let (doc_key, stored) = item?;
         let doc_id = keys::doc_id_from_doc_key(prefix_len, &doc_key);
+        let dirs = idx.ascending();
         let (enc, expires_at) = if stored[0] == VK_ZDOC {
             let view = crate::binary::ValueView::new(strip_value_kind(&stored));
             (
-                encoding::encode_fields_from_view(&view, &idx.fields),
+                encoding::encode_fields_from_view_with_directions(&view, &idx.fields, &dirs),
                 derive_ttl_expires_at_view(&view, idx),
             )
         } else {
@@ -597,7 +746,7 @@ fn backfill_index(
                 .map(|f| encoding::extract_path(&doc, f))
                 .collect();
             (
-                encoding::encode_fields(&vals),
+                encoding::encode_fields_with_directions(&vals, &dirs),
                 derive_ttl_expires_at(&doc, idx),
             )
         };

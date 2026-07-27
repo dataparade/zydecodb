@@ -466,6 +466,7 @@ fn doc_and_kv_prefix_acl() {
         fields: vec!["n".into()],
         unique: false,
         expire_after_seconds: 0,
+        directions: vec![true],
     };
     write_request(
         &mut stream,
@@ -521,6 +522,7 @@ fn sort_buffer_cap_configurable() {
         fields: vec!["n".into()],
         unique: false,
         expire_after_seconds: 0,
+        directions: vec![true],
     };
     write_request(
         &mut stream,

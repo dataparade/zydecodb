@@ -31,6 +31,7 @@ fn test_filter_complexity_exhaustion() {
         fields: vec!["a".to_string()],
         unique: false,
         expire_after_seconds: 0,
+        directions: vec![true],
     };
     write_request(
         &mut stream,

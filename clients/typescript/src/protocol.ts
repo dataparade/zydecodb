@@ -13,6 +13,9 @@ export const Cmd = {
   Put: 0x01,
   Get: 0x02,
   Del: 0x03,
+  Begin: 0x10,
+  Commit: 0x11,
+  Rollback: 0x12,
   Query: 0x20,
   DocPut: 0x21,
   DocDel: 0x22,
@@ -24,6 +27,8 @@ export const Cmd = {
   FindRev: 0x28,
   DocPutIfMatch: 0x29,
   DocUpdateIfMatch: 0x2a,
+  Aggregate: 0x2b,
+  Watch: 0x2c,
   IndexDef: 0x30,
   SessionInit: 0x40,
   Ping: 0xf0,
@@ -46,6 +51,15 @@ export const Proj = {
 // Bits of the optional trailing flags byte on write payloads.
 const FLAG_RELAXED = 0x01;
 const FLAG_UPSERT = 0x02;
+
+const WATCH_FRAME_ACK = 0x01;
+const WATCH_FRAME_EVENT = 0x02;
+const WATCH_FRAME_HEARTBEAT = 0x03;
+
+export const WatchOp = {
+  Upsert: 0x01,
+  Delete: 0x02,
+} as const;
 
 // Status codes (response envelope byte 1).
 export const Status = {
@@ -204,21 +218,33 @@ export function encodeDocDel(collection: string, docId: Buffer): Buffer {
   return Buffer.concat([lp(utf8(collection)), lp(docId)]);
 }
 
-/** IndexDef payload: [collection][index][unique u8][field_count u32]{[field]}[optional expire_after_seconds u64]. */
+/** Trailer tag for per-field IndexDef directions (1=ASC, 0=DESC). */
+export const INDEX_DIR_TAG = 0x02;
+
+/** IndexDef payload: [collection][index][unique u8][field_count u32]{[field]}
+ * [optional expire_after_seconds u64][optional 0x02 + N direction bytes]. */
 export function encodeIndexDef(
   collection: string,
   index: string,
   fields: string[],
   unique: boolean,
   expireAfterSeconds: number | bigint = 0,
+  directions?: boolean[],
 ): Buffer {
   const parts = [lp(utf8(collection)), lp(utf8(index)), boolByte(unique), u32(fields.length)];
   for (const f of fields) parts.push(lp(utf8(f)));
+  const dirs = directions ?? [];
+  const anyDesc =
+    dirs.length === fields.length && fields.length > 0 && dirs.some((d) => !d);
   const exp = BigInt(expireAfterSeconds);
-  if (exp !== 0n) {
+  if (exp !== 0n || anyDesc) {
     const e = Buffer.allocUnsafe(8);
     e.writeBigUInt64BE(exp, 0);
     parts.push(e);
+  }
+  if (anyDesc) {
+    parts.push(Buffer.from([INDEX_DIR_TAG]));
+    parts.push(Buffer.from(dirs.map((d) => (d ? 1 : 0))));
   }
   return Buffer.concat(parts);
 }
@@ -331,6 +357,92 @@ export function encodeDistinct(collection: string, filter: Buffer, field: string
   ]);
 }
 
+/** Aggregate payload: [collection][pipeline_json]. */
+export function encodeAggregate(collection: string, pipeline: Buffer): Buffer {
+  return Buffer.concat([lp(utf8(collection)), lp(pipeline)]);
+}
+
+/** Watch request: [collection lp][resume_token lp]. */
+export function encodeWatch(collection: string, resumeToken: Buffer = Buffer.alloc(0)): Buffer {
+  return Buffer.concat([lp(utf8(collection)), lp(resumeToken)]);
+}
+
+export interface WatchFrame {
+  kind: "ack" | "event" | "heartbeat";
+  resumeToken: Buffer;
+  op?: number;
+  docId?: Buffer;
+  body?: Buffer;
+}
+
+/** Decode one Watch stream frame from an Ok response payload. */
+export function decodeWatchFrame(buf: Buffer): WatchFrame {
+  if (buf.length === 0) throw new Error("zydecodb: empty watch frame");
+  let off = 0;
+  const kindByte = buf.readUInt8(off);
+  off += 1;
+  const need = (n: number): void => {
+    if (off + n > buf.length) throw new Error("zydecodb: payload truncated");
+  };
+  need(4);
+  const tlen = buf.readUInt32BE(off);
+  off += 4;
+  need(tlen);
+  const resumeToken = buf.subarray(off, off + tlen);
+  off += tlen;
+  if (kindByte === WATCH_FRAME_ACK) {
+    return { kind: "ack", resumeToken: Buffer.from(resumeToken) };
+  }
+  if (kindByte === WATCH_FRAME_HEARTBEAT) {
+    return { kind: "heartbeat", resumeToken: Buffer.from(resumeToken) };
+  }
+  if (kindByte === WATCH_FRAME_EVENT) {
+    need(1);
+    const op = buf.readUInt8(off);
+    off += 1;
+    need(4);
+    const idlen = buf.readUInt32BE(off);
+    off += 4;
+    need(idlen);
+    const docId = buf.subarray(off, off + idlen);
+    off += idlen;
+    need(4);
+    const blen = buf.readUInt32BE(off);
+    off += 4;
+    need(blen);
+    const body = buf.subarray(off, off + blen);
+    return {
+      kind: "event",
+      resumeToken: Buffer.from(resumeToken),
+      op,
+      docId: Buffer.from(docId),
+      body: Buffer.from(body),
+    };
+  }
+  throw new Error(`zydecodb: unknown watch frame 0x${kindByte.toString(16).padStart(2, "0")}`);
+}
+
+/** Decode Aggregate response: [row_count u32]{[row_json lp]}*. */
+export function decodeAggregateResponse(buf: Buffer): Buffer[] {
+  let off = 0;
+  const need = (n: number): void => {
+    if (off + n > buf.length) throw new Error("zydecodb: payload truncated");
+  };
+  need(4);
+  const count = buf.readUInt32BE(off);
+  off += 4;
+  const rows: Buffer[] = [];
+  for (let i = 0; i < count; i++) {
+    need(4);
+    const n = buf.readUInt32BE(off);
+    off += 4;
+    need(n);
+    rows.push(buf.subarray(off, off + n));
+    off += n;
+  }
+  return rows;
+}
+
 /** One decoded row from a query/find response page. */
 export interface Row {
   docId: Buffer;
@@ -401,4 +513,22 @@ export function decodeDocGetRevResponse(buf: Buffer): { body: Buffer; revision: 
   const body = buf.subarray(4, 4 + blen);
   const revision = buf.readBigUInt64BE(4 + blen);
   return { body, revision };
+}
+
+/** Decode Begin response: [tx_id u64 BE][snapshot_seq u64 BE]. */
+export function decodeBeginResponse(buf: Buffer): { txId: bigint; snapshotSeq: bigint } {
+  if (buf.length !== 16) throw new Error("zydecodb: Begin response must be 16 bytes");
+  return { txId: buf.readBigUInt64BE(0), snapshotSeq: buf.readBigUInt64BE(8) };
+}
+
+/** Decode Commit response: [seq u64 BE]. */
+export function decodeCommitResponse(buf: Buffer): bigint {
+  if (buf.length !== 8) throw new Error("zydecodb: Commit response must be 8 bytes");
+  return buf.readBigUInt64BE(0);
+}
+
+/** Decode stage ack: [logical_ops u32 BE][estimated_keys u32 BE]. */
+export function decodeStageAck(buf: Buffer): { logicalOps: number; estimatedKeys: number } {
+  if (buf.length !== 8) throw new Error("zydecodb: stage ack must be 8 bytes");
+  return { logicalOps: buf.readUInt32BE(0), estimatedKeys: buf.readUInt32BE(4) };
 }

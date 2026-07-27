@@ -57,6 +57,10 @@ class ConnectionPool:
         conn.connect()
         return conn
 
+    def open_dedicated(self) -> Connection:
+        """Open a fresh connection that is not drawn from the pool."""
+        return self._new_connection()
+
     def acquire(self) -> Connection:
         """Check out a healthy connection, creating one if capacity allows or
         waiting for one to be returned otherwise."""

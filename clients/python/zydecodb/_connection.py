@@ -76,6 +76,18 @@ class Connection:
                 pass
             self._sock = None
 
+    def recv(self) -> Tuple[int, bytes]:
+        """Read the next framed response without sending a request."""
+        if self._sock is None:
+            raise ZConnectionError("not connected")
+        try:
+            status, body = self._recv()
+        except (OSError, ZConnectionError) as exc:
+            self.close()
+            raise ZConnectionError(f"recv failed: {exc}")
+        self.last_used = time.monotonic()
+        return status, body
+
     def request(self, command: int, payload: bytes = b"") -> Tuple[int, bytes]:
         """Send one framed request and read the framed response. Raises
         `ConnectionError` on any transport failure (the pool discards the

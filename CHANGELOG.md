@@ -6,6 +6,55 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-27
+
+### Server
+
+- Bounded per-connection transactions (`Begin`/`Commit`/`Rollback`): stage
+  by-ID document and raw-KV ops, validate revisions/uniques at commit, persist
+  one durable WAL batch (≤1024 keys). Not general MVCC.
+- Filtered positional array `$set`: paths like `items.$[skuId=ABC].qty` update
+  exactly one matching element (0 or >1 matches → `BadUpdate`). `$set` only;
+  Mongo `$` / `$[]` / `arrayFilters` rejected. No new wire opcodes.
+- Directional indexes and reverse index scans: per-field ASC/DESC on `IndexDef`
+  (optional `0x02` direction trailer), DESC key encoding, engine `scan_rev`,
+  planner streams `{ownerId}` + `updatedAt DESC` from a matching index without
+  the sort buffer.
+- TTL compaction reclamation: Tidewalker drops wall-clock-expired SST entries
+  (and older versions of that key) during merge; metrics
+  `compaction_expired_dropped_total` / `ttl_sweep_tombstones_total`. Memtable
+  sweeper remains non-WAL hygiene. Document upserts rewrite index-key expiry
+  when body `expires_at` changes.
+- Minimal aggregation (`Aggregate = 0x2B`): optional `$match` + one `$group`
+  with `$sum`/`$count`, deterministic ordering, and `[aggregation]` resource
+  limits. Joins/`$lookup`/`$unwind` remain unsupported. See `docs/AGGREGATION.md`.
+- Change streams (`Watch = 0x2C`): primary-only, collection-scoped, dedicated
+  connection streaming of fsynced upsert/delete events with durable resume
+  tokens backed by a retained WAL archive (`[change_streams]`, off by default).
+  At-least-once delivery; not raw WAL replication. See `docs/CHANGE_STREAMS.md`.
+
+### Go / Python / TypeScript drivers
+
+- Pinned-connection transaction APIs (`WithTransaction` / `transaction()` /
+  `withTransaction`); no retries inside an open transaction; commit transport
+  failure surfaces as unknown commit result
+- Filtered positional `$set` works through existing update APIs (opaque update
+  JSON); no driver codec changes
+- Directional `create_index` / `CreateIndexFields` (ASC default preserved for
+  string-only field lists)
+- `aggregate(...)` APIs for bounded pipelines
+- Dedicated-connection `watch(...)` / `ChangeStream` APIs with opaque base64
+  resume tokens (Python / Go / TypeScript)
+
+### Compatibility
+
+- Requires server `0.10.x`, wire `proto_version = 1` (append-only opcodes)
+- Existing unconditional replace/update/find/get opcodes are unchanged
+- New opcodes (`Begin`, `Aggregate`, `Watch`, conditional writes) fail with
+  `ProtocolError` against older servers (never silently degrade)
+
+## [0.9.0] - 2026-07-26
+
 ### Server
 
 - Opaque document revisions (`InternalKey.seq`) exposed on revision-aware reads

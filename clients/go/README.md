@@ -9,7 +9,7 @@ Pin an explicit module version (do not use `@latest` — that can resolve to a
 pseudo-version when the nested Go tag is missing):
 
 ```bash
-go get github.com/dataparade/zydecodb/clients/go@v0.9.0
+go get github.com/dataparade/zydecodb/clients/go@v0.10.0
 ```
 
 Requires Go 1.23+. The Go module is tagged as `clients/go/vX.Y.Z` at the same
@@ -21,7 +21,7 @@ commit as the server release `vX.Y.Z`. See
 
 | Server | Go driver tag | Wire |
 |--------|---------------|------|
-| `0.9.x` | `clients/go/v0.9.x*` | `proto_version = 1` |
+| `0.10.x` | `clients/go/v0.10.x*` | `proto_version = 1` |
 
 ## Quick start
 
@@ -104,6 +104,25 @@ Also available: `FindWithRevision`, `UpdateByIDIfMatch`. Revisions are opaque
 `Conflict`. Against an older server these methods fail with `ProtocolError`
 instead of silently becoming unconditional writes.
 
+## Bounded transactions
+
+Pin one connection and commit related document + KV writes atomically:
+
+```go
+seq, err := db.WithTransaction(ctx, func(tx *zydecodb.Tx) error {
+	if err := tx.Put(ctx, []byte("session"), []byte("active"), 0); err != nil {
+		return err
+	}
+	return tx.PutDocument(ctx, "users", "u1", zydecodb.Document{"n": 1})
+})
+```
+
+Collections must already exist. Filter queries/updates, DDL, and nested begins
+are rejected. Operations are never retried inside a transaction. If `Commit`
+fails at the transport layer, treat the result as unknown (`ErrUnknownCommitResult`)
+and reconcile by re-reading keys. Older servers reject `Begin` with
+`ProtocolError`.
+
 ## Durability
 
 Writes are durable (fsync-on-commit) by default. For latency-sensitive,
@@ -115,6 +134,12 @@ users.InsertOne(ctx, doc, true)
 users.UpdateOne(ctx, zydecodb.Document{"_id": "ada"},
 	zydecodb.Document{"$inc": zydecodb.Document{"hits": 1}}, true, false)
 ```
+
+Filtered positional `$set` (exactly one array match) uses the same update APIs
+with a path like `items.$[skuId=ABC].qty` — no new client methods.
+
+Directional indexes: `CreateIndex` is all-ascending; use `CreateIndexFields` with
+`IndexField{Path, Ascending}` for DESC fields (e.g. `ownerId` ASC + `updatedAt` DESC).
 
 ## Examples
 

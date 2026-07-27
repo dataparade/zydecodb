@@ -54,6 +54,10 @@ pub struct Metrics {
     pub compaction_worker_busy: IntGauge,
     pub compaction_versions_dropped_total: IntCounter,
     pub compaction_tombstones_dropped_total: IntCounter,
+    /// Expired values (and older versions of those keys) dropped during compaction.
+    pub compaction_expired_dropped_total: IntCounter,
+    /// Non-durable memtable TTL sweeper tombstones inserted (active table only).
+    pub ttl_sweep_tombstones_total: IntCounter,
     pub compaction_repack_total: IntCounter,
     pub compaction_rejected_no_progress: IntCounter,
     /// Compaction jobs applied, labeled by `input_level` (0, 1, 2, …).
@@ -89,6 +93,17 @@ pub struct Metrics {
     /// 1 if the engine booted from a clean shutdown marker (no WAL replay
     /// needed), 0 if it recovered from an unclean stop. Set once at open.
     pub last_shutdown_clean: IntGauge,
+
+    // ---- Change streams ----
+    pub change_stream_subscriptions: IntGauge,
+    pub change_stream_events_total: IntCounter,
+    pub change_stream_heartbeats_total: IntCounter,
+    pub change_stream_disconnects_total: IntCounterVec,
+    pub change_log_archive_segments: IntGauge,
+    pub change_log_archive_bytes: IntGauge,
+    pub change_log_earliest_seq: IntGauge,
+    pub change_log_latest_seq: IntGauge,
+
     #[allow(dead_code)]
     errors_total: IntCounterVec,
 }
@@ -242,6 +257,16 @@ impl Metrics {
             "Tombstones dropped during compaction GC",
         ))
         .unwrap();
+        let compaction_expired_dropped_total = IntCounter::with_opts(Opts::new(
+            "zydecodb_compaction_expired_dropped_total",
+            "Expired values (and older versions of those keys) dropped during compaction",
+        ))
+        .unwrap();
+        let ttl_sweep_tombstones_total = IntCounter::with_opts(Opts::new(
+            "zydecodb_ttl_sweep_tombstones_total",
+            "Non-durable memtable TTL sweeper tombstones inserted (active table only)",
+        ))
+        .unwrap();
         let compaction_repack_total = IntCounter::with_opts(Opts::new(
             "zydecodb_compaction_repack_total",
             "Deprecated; whole-level repack removed (always 0)",
@@ -364,6 +389,49 @@ impl Metrics {
             "1 if last boot followed a clean shutdown (no WAL replay), else 0",
         ))
         .unwrap();
+        let change_stream_subscriptions = IntGauge::with_opts(Opts::new(
+            "zydecodb_change_stream_subscriptions",
+            "Active change-stream subscriptions",
+        ))
+        .unwrap();
+        let change_stream_events_total = IntCounter::with_opts(Opts::new(
+            "zydecodb_change_stream_events_total",
+            "Change-stream events delivered",
+        ))
+        .unwrap();
+        let change_stream_heartbeats_total = IntCounter::with_opts(Opts::new(
+            "zydecodb_change_stream_heartbeats_total",
+            "Change-stream heartbeats delivered",
+        ))
+        .unwrap();
+        let change_stream_disconnects_total = IntCounterVec::new(
+            Opts::new(
+                "zydecodb_change_stream_disconnects_total",
+                "Change-stream disconnects by reason",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+        let change_log_archive_segments = IntGauge::with_opts(Opts::new(
+            "zydecodb_change_log_archive_segments",
+            "Retained change-log archive segments",
+        ))
+        .unwrap();
+        let change_log_archive_bytes = IntGauge::with_opts(Opts::new(
+            "zydecodb_change_log_archive_bytes",
+            "Retained change-log archive bytes",
+        ))
+        .unwrap();
+        let change_log_earliest_seq = IntGauge::with_opts(Opts::new(
+            "zydecodb_change_log_earliest_seq",
+            "Earliest retained change-log sequence",
+        ))
+        .unwrap();
+        let change_log_latest_seq = IntGauge::with_opts(Opts::new(
+            "zydecodb_change_log_latest_seq",
+            "Latest retained change-log sequence",
+        ))
+        .unwrap();
         let errors_total = IntCounterVec::new(
             Opts::new("zydecodb_errors_total", "Errors by status code"),
             &["code"],
@@ -429,6 +497,12 @@ impl Metrics {
             .unwrap();
         registry
             .register(Box::new(compaction_tombstones_dropped_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(compaction_expired_dropped_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ttl_sweep_tombstones_total.clone()))
             .unwrap();
         registry
             .register(Box::new(compaction_repack_total.clone()))
@@ -503,6 +577,30 @@ impl Metrics {
         registry
             .register(Box::new(last_shutdown_clean.clone()))
             .unwrap();
+        registry
+            .register(Box::new(change_stream_subscriptions.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(change_stream_events_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(change_stream_heartbeats_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(change_stream_disconnects_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(change_log_archive_segments.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(change_log_archive_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(change_log_earliest_seq.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(change_log_latest_seq.clone()))
+            .unwrap();
         registry.register(Box::new(errors_total.clone())).unwrap();
 
         Metrics {
@@ -527,6 +625,8 @@ impl Metrics {
             compaction_worker_busy,
             compaction_versions_dropped_total,
             compaction_tombstones_dropped_total,
+            compaction_expired_dropped_total,
+            ttl_sweep_tombstones_total,
             compaction_repack_total,
             compaction_rejected_no_progress,
             compaction_jobs_by_input_level,
@@ -551,6 +651,14 @@ impl Metrics {
             space_amplification,
             last_durable_seq,
             last_shutdown_clean,
+            change_stream_subscriptions,
+            change_stream_events_total,
+            change_stream_heartbeats_total,
+            change_stream_disconnects_total,
+            change_log_archive_segments,
+            change_log_archive_bytes,
+            change_log_earliest_seq,
+            change_log_latest_seq,
             errors_total,
         }
     }

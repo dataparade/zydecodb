@@ -47,13 +47,21 @@ pub struct Table {
     pub foreign_keys: Vec<ForeignKey>,
     /// Column sets that Postgres had a (non-unique or unique) index on. The
     /// strongest available signal for "the app queries by these columns".
-    pub indexed_columns: Vec<Vec<String>>,
+    pub indexed_columns: Vec<IndexedColumns>,
     /// Number of CHECK constraints (counted for the dropped-constraints report).
     pub check_constraints: usize,
     /// Column order used by this table's `COPY` block.
     pub copy_columns: Vec<String>,
     /// Data rows, aligned to `copy_columns`. `None` = SQL NULL.
     pub rows: Vec<Vec<Option<String>>>,
+}
+
+/// One Postgres index: field paths plus per-field ascending flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedColumns {
+    pub fields: Vec<String>,
+    /// Parallel to `fields`; `true` = ASC, `false` = DESC.
+    pub directions: Vec<bool>,
 }
 
 impl Table {
@@ -303,7 +311,7 @@ fn parse_create_table(stmt: &str) -> MigrateResult<Option<Table>> {
                 table.check_constraints += 1;
             }
             if let Some(cols) = upper.find("PRIMARY KEY").and(extract_paren_cols(def)) {
-                table.primary_key = cols;
+                table.primary_key = cols.fields;
             }
             continue;
         }
@@ -438,7 +446,7 @@ fn apply_alter_table(stmt: &str, tables: &mut [Table], index_of: &HashMap<String
 
     if let Some(p) = upper.find("PRIMARY KEY") {
         if let Some(cols) = extract_paren_cols(&stmt[p..]) {
-            t.primary_key = cols;
+            t.primary_key = cols.fields;
         }
     } else if let Some(p) = upper.find("FOREIGN KEY") {
         if let Some(fk) = parse_foreign_key(&stmt[p..]) {
@@ -446,7 +454,7 @@ fn apply_alter_table(stmt: &str, tables: &mut [Table], index_of: &HashMap<String
         }
     } else if let Some(p) = upper.find("UNIQUE") {
         if let Some(cols) = extract_paren_cols(&stmt[p..]) {
-            t.unique.push(cols);
+            t.unique.push(cols.fields);
         }
     } else if upper[add..].contains("CHECK") {
         t.check_constraints += 1;
@@ -455,13 +463,15 @@ fn apply_alter_table(stmt: &str, tables: &mut [Table], index_of: &HashMap<String
 
 /// Parse `FOREIGN KEY (a, b) REFERENCES public.other(x, y)`.
 fn parse_foreign_key(s: &str) -> Option<ForeignKey> {
-    let columns = extract_paren_cols(s)?;
+    let columns = extract_paren_cols(s)?.fields;
     let upper = s.to_ascii_uppercase();
     let refpos = upper.find("REFERENCES")?;
     let after = &s[refpos + "REFERENCES".len()..];
     let open = after.find('(')?;
     let ref_table = norm_ident(&after[..open]);
-    let ref_columns = extract_paren_cols(after).unwrap_or_default();
+    let ref_columns = extract_paren_cols(after)
+        .map(|c| c.fields)
+        .unwrap_or_default();
     Some(ForeignKey {
         columns,
         ref_table,
@@ -492,9 +502,9 @@ fn apply_create_index(stmt: &str, tables: &mut [Table], index_of: &HashMap<Strin
     };
     // Only record plain-column indexes; expression indexes (containing a call)
     // are not a usable field signal.
-    if let Some(cols) = extract_paren_cols(after_on) {
-        if !cols.is_empty() && cols.iter().all(|c| is_plain_ident(c)) {
-            tables[idx].indexed_columns.push(cols);
+    if let Some(idx_cols) = extract_paren_cols(after_on) {
+        if !idx_cols.fields.is_empty() && idx_cols.fields.iter().all(|c| is_plain_ident(c)) {
+            tables[idx].indexed_columns.push(idx_cols);
         }
     }
 }
@@ -570,25 +580,36 @@ fn is_plain_ident(s: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '"')
 }
 
-/// Extract the comma-separated identifiers from the first parenthesized group.
-fn extract_paren_cols(s: &str) -> Option<Vec<String>> {
+/// Extract the comma-separated identifiers (and ASC/DESC) from the first
+/// parenthesized group.
+fn extract_paren_cols(s: &str) -> Option<IndexedColumns> {
     let open = s.find('(')?;
     let close = matching_paren(s, open)?;
     let inner = &s[open + 1..close];
-    let cols: Vec<String> = inner
-        .split(',')
-        .map(|c| {
-            // Drop a trailing sort qualifier like "col DESC".
-            let c = c.trim();
-            let token = c.split_whitespace().next().unwrap_or(c);
-            norm_ident(token)
-        })
-        .filter(|c| !c.is_empty())
-        .collect();
-    if cols.is_empty() {
+    let mut fields = Vec::new();
+    let mut directions = Vec::new();
+    for c in inner.split(',') {
+        let c = c.trim();
+        if c.is_empty() {
+            continue;
+        }
+        let mut parts = c.split_whitespace();
+        let token = parts.next().unwrap_or(c);
+        let name = norm_ident(token);
+        if name.is_empty() {
+            continue;
+        }
+        let ascending = match parts.next() {
+            Some(dir) if dir.eq_ignore_ascii_case("DESC") => false,
+            _ => true,
+        };
+        fields.push(name);
+        directions.push(ascending);
+    }
+    if fields.is_empty() {
         None
     } else {
-        Some(cols)
+        Some(IndexedColumns { fields, directions })
     }
 }
 
@@ -720,7 +741,10 @@ CREATE INDEX idx_orders_customer ON public.orders USING btree (customer_id);
         assert_eq!(fk.ref_columns, vec!["id".to_string()]);
         assert_eq!(
             orders.indexed_columns,
-            vec![vec!["customer_id".to_string()]]
+            vec![IndexedColumns {
+                fields: vec!["customer_id".to_string()],
+                directions: vec![true],
+            }]
         );
     }
 

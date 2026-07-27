@@ -220,6 +220,8 @@ impl Engine {
             ship_dir: None,
             ship_mode: crate::shipping::ShipMode::Hardlink,
             ship_hmac_key: None,
+            change_log: None,
+            change_log_manifest: None,
             manifest_file,
             metrics: None,
             block_cache,
@@ -270,6 +272,11 @@ impl Engine {
         self
     }
 
+    /// Shared metrics registry, if attached.
+    pub fn metrics(&self) -> Option<&Arc<crate::metrics::Metrics>> {
+        self.metrics.as_ref()
+    }
+
     /// Shared WAL durability handle, so a commit coordinator can `fsync` the WAL
     /// without taking the engine mutex. See [`crate::wal_sync::WalSync`].
     pub fn wal_sync(&self) -> Arc<crate::wal_sync::WalSync> {
@@ -308,6 +315,91 @@ impl Engine {
     pub fn with_shipping_hmac_key(mut self, key: Option<Vec<u8>>) -> Self {
         self.ship_hmac_key = key;
         self
+    }
+
+    /// Enable retained WAL archiving for change streams. Reconciles any sealed
+    /// WAL segments into the archive before returning.
+    pub fn with_change_log(
+        mut self,
+        cfg: crate::change_log::ChangeLogConfig,
+    ) -> EngineResult<Self> {
+        let db_id = crate::change_log::database_id_from_data_dir(&self.cfg.data_dir);
+        let mut manifest = crate::change_log::open_manifest(&cfg, db_id)?;
+        // All on-disk WAL segments except the just-opened active one are sealed.
+        let active = Some(self.active_wal_id);
+        crate::change_log::reconcile_sealed_wal(&cfg, &mut manifest, &self.cfg.wal_dir, active)?;
+        let _ = crate::change_log::prune(&cfg, &mut manifest)?;
+        self.change_log = Some(cfg);
+        self.change_log_manifest = Some(manifest);
+        Ok(self)
+    }
+
+    /// Archive a sealed WAL segment into the change-log (no-op when disabled).
+    /// Failures are logged and leave the live WAL in place so unlink is blocked.
+    pub(crate) fn archive_sealed_segment(&mut self, segment_id: u64, max_seq: u64) {
+        let Some(cfg) = self.change_log.clone() else {
+            return;
+        };
+        let Some(manifest) = self.change_log_manifest.as_mut() else {
+            return;
+        };
+        match crate::change_log::archive_segment(
+            &cfg,
+            manifest,
+            &self.cfg.wal_dir,
+            segment_id,
+            max_seq,
+        ) {
+            Ok(()) => {
+                let _ = crate::change_log::prune(&cfg, manifest);
+                if let Some(m) = &self.metrics {
+                    m.change_log_archive_segments
+                        .set(manifest.segments.len() as i64);
+                    m.change_log_archive_bytes
+                        .set(manifest.total_bytes() as i64);
+                    if let Some(earliest) = manifest.earliest_seq() {
+                        m.change_log_earliest_seq.set(earliest as i64);
+                    }
+                    if let Some(latest) = manifest.latest_seq() {
+                        m.change_log_latest_seq.set(latest as i64);
+                    }
+                }
+                tracing::info!(
+                    segment = segment_id,
+                    "archived sealed WAL segment for change streams"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, segment = segment_id, "change_log archive failed");
+            }
+        }
+    }
+
+    /// Whether a covered WAL segment may be unlinked (archived when change_log on).
+    pub(crate) fn wal_segment_safe_to_unlink(&self, segment_id: u64) -> bool {
+        match &self.change_log_manifest {
+            None => true,
+            Some(m) => crate::change_log::is_archived(m, segment_id),
+        }
+    }
+
+    /// Accessors for change-stream readers.
+    pub fn change_log_config(&self) -> Option<&crate::change_log::ChangeLogConfig> {
+        self.change_log.as_ref()
+    }
+
+    pub fn change_log_manifest(&self) -> Option<&crate::change_log::ChangeLogManifest> {
+        self.change_log_manifest.as_ref()
+    }
+
+    pub fn active_wal_path(&self) -> PathBuf {
+        self.cfg
+            .wal_dir
+            .join(wal::segment_filename(self.active_wal_id))
+    }
+
+    pub fn database_id_for_change_log(&self) -> [u8; 16] {
+        crate::change_log::database_id_from_data_dir(&self.cfg.data_dir)
     }
 
     /// Whether group commit is enabled (writers buffer; a coordinator fsyncs).
@@ -523,9 +615,10 @@ impl Engine {
             // it's the highest seq appended, and the segment is non-empty
             // (should_roll requires current_size > 0). Cache it so subsequent
             // flushes can decide WAL coverage without re-reading the file.
-            self.sealed_segment_max_seq
-                .insert(sealed_id, self.wal_sync.buffered_seq());
+            let sealed_max = self.wal_sync.buffered_seq();
+            self.sealed_segment_max_seq.insert(sealed_id, sealed_max);
             self.ship_sealed_segment(sealed_id);
+            self.archive_sealed_segment(sealed_id, sealed_max);
             self.active_wal_id += 1;
             self.open_new_wal_segment()?;
             self.refresh_topology_gauges();

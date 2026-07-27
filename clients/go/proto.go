@@ -24,6 +24,9 @@ const (
 	CmdPut              byte = 0x01
 	CmdGet              byte = 0x02
 	CmdDel              byte = 0x03
+	CmdBegin            byte = 0x10
+	CmdCommit           byte = 0x11
+	CmdRollback         byte = 0x12
 	CmdQuery            byte = 0x20
 	CmdDocPut           byte = 0x21
 	CmdDocDel           byte = 0x22
@@ -35,6 +38,8 @@ const (
 	CmdFindRev          byte = 0x28
 	CmdDocPutIfMatch    byte = 0x29
 	CmdDocUpdateIfMatch byte = 0x2A
+	CmdAggregate        byte = 0x2B
+	CmdWatch            byte = 0x2C
 	CmdIndexDef         byte = 0x30
 	CmdSessionInit      byte = 0x40
 	CmdPing             byte = 0xF0
@@ -64,7 +69,18 @@ const (
 	flagUpsert  byte = 0x02
 )
 
-// Status codes (response envelope byte 1).
+// Watch stream frame kinds (first byte of Ok payloads after subscription open).
+const (
+	WatchFrameAck       byte = 0x01
+	WatchFrameEvent     byte = 0x02
+	WatchFrameHeartbeat byte = 0x03
+)
+
+// Watch event op bytes.
+const (
+	WatchOpUpsert byte = 0x01
+	WatchOpDelete byte = 0x02
+)
 const (
 	StatusOK                byte = 0x00
 	StatusNotFound          byte = 0x01
@@ -248,10 +264,21 @@ func EncodeKey(key []byte) []byte {
 	return buf.Bytes()
 }
 
+// IndexDirTag marks an optional per-field direction trailer on IndexDef.
+const IndexDirTag byte = 0x02
+
 // EncodeIndexDef builds an IndexDef payload:
-// [collection][index_name][unique u8][field_count u32]{[field]}[optional expire_after_seconds u64].
-// expireAfterSeconds 0 omits the trailer (not a TTL index).
+// [collection][index_name][unique u8][field_count u32]{[field]}
+// [optional expire_after_seconds u64][optional 0x02 + N direction bytes].
+// expireAfterSeconds 0 omits the TTL trailer unless any field is descending.
+// directions nil/empty or all-true omits the direction trailer (all ascending).
 func EncodeIndexDef(collection, index string, fields []string, unique bool, expireAfterSeconds uint64) []byte {
+	return EncodeIndexDefDirected(collection, index, fields, nil, unique, expireAfterSeconds)
+}
+
+// EncodeIndexDefDirected is EncodeIndexDef with per-field ascending flags
+// (true=ASC, false=DESC). Length must match fields when non-empty.
+func EncodeIndexDefDirected(collection, index string, fields []string, directions []bool, unique bool, expireAfterSeconds uint64) []byte {
 	var buf bytes.Buffer
 	putLP(&buf, []byte(collection))
 	putLP(&buf, []byte(index))
@@ -260,10 +287,25 @@ func EncodeIndexDef(collection, index string, fields []string, unique bool, expi
 	for _, f := range fields {
 		putLP(&buf, []byte(f))
 	}
-	if expireAfterSeconds != 0 {
+	anyDesc := false
+	if len(directions) == len(fields) && len(fields) > 0 {
+		for _, d := range directions {
+			if !d {
+				anyDesc = true
+				break
+			}
+		}
+	}
+	if expireAfterSeconds != 0 || anyDesc {
 		var e [8]byte
 		binary.BigEndian.PutUint64(e[:], expireAfterSeconds)
 		buf.Write(e[:])
+	}
+	if anyDesc {
+		buf.WriteByte(IndexDirTag)
+		for _, d := range directions {
+			buf.WriteByte(boolByte(d))
+		}
 	}
 	return buf.Bytes()
 }
@@ -374,6 +416,93 @@ func EncodeDistinct(collection string, filter []byte, field string) []byte {
 	return buf.Bytes()
 }
 
+// EncodeAggregate builds an Aggregate payload: [collection][pipeline_json].
+func EncodeAggregate(collection string, pipeline []byte) []byte {
+	var buf bytes.Buffer
+	putLP(&buf, []byte(collection))
+	putLP(&buf, pipeline)
+	return buf.Bytes()
+}
+
+// EncodeWatch builds a Watch payload: [collection][resume_token lp].
+func EncodeWatch(collection string, resumeToken []byte) []byte {
+	var buf bytes.Buffer
+	putLP(&buf, []byte(collection))
+	putLP(&buf, resumeToken)
+	return buf.Bytes()
+}
+
+// WatchFrame is one decoded Watch stream frame.
+type WatchFrame struct {
+	Kind         string // "ack", "event", "heartbeat"
+	ResumeToken  []byte
+	Op           byte
+	DocID        []byte
+	Body         []byte
+}
+
+// DecodeWatchFrame decodes [kind u8][resume_token lp][event fields...].
+func DecodeWatchFrame(buf []byte) (WatchFrame, error) {
+	if len(buf) == 0 {
+		return WatchFrame{}, fmt.Errorf("zydecodb: empty watch frame")
+	}
+	r := &reader{buf: buf}
+	kind, err := r.take(1)
+	if err != nil {
+		return WatchFrame{}, err
+	}
+	token, err := r.lp()
+	if err != nil {
+		return WatchFrame{}, err
+	}
+	switch kind[0] {
+	case WatchFrameAck:
+		return WatchFrame{Kind: "ack", ResumeToken: token}, nil
+	case WatchFrameHeartbeat:
+		return WatchFrame{Kind: "heartbeat", ResumeToken: token}, nil
+	case WatchFrameEvent:
+		opb, err := r.take(1)
+		if err != nil {
+			return WatchFrame{}, err
+		}
+		docID, err := r.lp()
+		if err != nil {
+			return WatchFrame{}, err
+		}
+		body, err := r.lp()
+		if err != nil {
+			return WatchFrame{}, err
+		}
+		return WatchFrame{
+			Kind:        "event",
+			ResumeToken: token,
+			Op:          opb[0],
+			DocID:       docID,
+			Body:        body,
+		}, nil
+	default:
+		return WatchFrame{}, fmt.Errorf("zydecodb: unknown watch frame 0x%02x", kind[0])
+	}
+}
+
+// DecodeAggregateResponse decodes [row_count u32]{[row_json lp]}*.
+func DecodeAggregateResponse(buf []byte) (rows [][]byte, err error) {
+	r := &reader{buf: buf}
+	count, err := r.u32()
+	if err != nil {
+		return nil, err
+	}
+	rows = make([][]byte, 0, min(count, 4096))
+	for i := uint32(0); i < count; i++ {
+		row, err := r.lp()
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
 // Row is one decoded row from a query/find response page.
 type Row struct {
 	DocID    []byte
@@ -440,6 +569,30 @@ func DecodeDocGetRevResponse(buf []byte) (body []byte, revision uint64, err erro
 		return nil, 0, err
 	}
 	return body, binary.BigEndian.Uint64(rb), nil
+}
+
+// DecodeBeginResponse decodes [tx_id u64 BE][snapshot_seq u64 BE].
+func DecodeBeginResponse(buf []byte) (txID, snapshotSeq uint64, err error) {
+	if len(buf) != 16 {
+		return 0, 0, fmt.Errorf("zydecodb: Begin response must be 16 bytes")
+	}
+	return binary.BigEndian.Uint64(buf[:8]), binary.BigEndian.Uint64(buf[8:]), nil
+}
+
+// DecodeCommitResponse decodes [seq u64 BE].
+func DecodeCommitResponse(buf []byte) (uint64, error) {
+	if len(buf) != 8 {
+		return 0, fmt.Errorf("zydecodb: Commit response must be 8 bytes")
+	}
+	return binary.BigEndian.Uint64(buf), nil
+}
+
+// DecodeStageAck decodes [logical_ops u32 BE][estimated_keys u32 BE].
+func DecodeStageAck(buf []byte) (logicalOps, estimatedKeys uint32, err error) {
+	if len(buf) != 8 {
+		return 0, 0, fmt.Errorf("zydecodb: stage ack must be 8 bytes")
+	}
+	return binary.BigEndian.Uint32(buf[:4]), binary.BigEndian.Uint32(buf[4:]), nil
 }
 
 type reader struct {

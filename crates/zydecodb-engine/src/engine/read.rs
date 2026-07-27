@@ -268,6 +268,27 @@ impl Engine {
         )
     }
 
+    pub(crate) fn build_merging_iterator_rev(
+        &self,
+        seq_upper: u64,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+    ) -> EngineResult<crate::iter::MergingIterator<'_>> {
+        crate::snapshot::build_sources_rev(
+            self.active.as_ref(),
+            self.immutable.iter().map(|m| m.as_ref()),
+            &self
+                .sstables
+                .iter()
+                .filter(|s| Self::sstable_overlaps_range(&s.meta, &lo, &hi))
+                .map(|s| s.reader.clone())
+                .collect::<Vec<_>>(),
+            seq_upper,
+            lo,
+            hi,
+        )
+    }
+
     pub(crate) fn sstable_might_hold_key(meta: &SstableMeta, key: &[u8]) -> bool {
         key >= meta.min_key.as_slice() && key <= meta.max_key.as_slice()
     }

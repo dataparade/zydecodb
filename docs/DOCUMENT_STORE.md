@@ -88,6 +88,14 @@ is queryable whether it is indexed or not.
   read view via `Engine::snapshot_at`. Later pages never shift under concurrent
   writes. Index-ordered pages key-stream; otherwise a bounded offset applies,
   capped by `MAX_SORT_BUFFER`.
+- **When sort streams from an index vs the sort buffer:**
+  - Streams (key-cursor) when the requested sort matches the chosen index’s
+    field directions (or the exact reverse — then the engine reverse-scans),
+    including omitting equality-covered leading fields. Example: index
+    `[ownerId ASC, updatedAt ASC]` or `[ownerId ASC, updatedAt DESC]` with
+    filter `{ownerId}` and `sort: updatedAt DESC` key-streams without buffering.
+  - Uses the sort buffer when sort is neither the index order nor its reverse
+    (still capped by `max_sort_buffer`).
 - `count` and `distinct`.
 - `find_one` is a `find` with `limit = 1`.
 
@@ -97,6 +105,23 @@ is queryable whether it is indexed or not.
   (non-`$`) update documents are rejected. `$setOnInsert` applies only when an
   upsert inserts; normal updates ignore it. On insert, `$setOnInsert` runs
   before regular ops so `$set`/`$inc`/`$unset`/`$push` win on path conflicts.
+- **Filtered positional `$set`:** update exactly one array element by identity
+  without replacing the whole document. Path form:
+  `items.$[skuId=ABC].qty` (bare token = string), `items.$[skuId="ABC"].qty`
+  (JSON string/number/bool literal), or `items.$[skuId=ABC]` (replace the whole
+  element). Rules:
+  - **`$set` only** — filtered paths on `$inc` / `$unset` / `$push` /
+    `$setOnInsert` are rejected (`BadUpdate`).
+  - Exactly **one** matching element required; zero or multiple matches →
+    `BadUpdate`.
+  - At most one `$[field=value]` segment per path; the prefix must resolve to
+    an array.
+  - **Rejected (non-goals):** bare `$`, `$[]`, `$[<identifier>]` /
+    `arrayFilters`, multi-segment `$[…]` in one path, and Mongo-style
+    “update all matches” semantics.
+  - No new wire opcodes: clients send the path inside existing opaque update
+    JSON (`Update` / `DocUpdateIfMatch`). Index maintenance stays the usual
+    atomic body+index batch.
 - `update_one` / `update_many`, `delete_one` / `delete_many`: candidate ids come
   from a lock-free snapshot, then **each matched document is rewritten in one
   atomic `write_batch`** (body + all of its index keys). Per-document writes are
@@ -122,6 +147,13 @@ is queryable whether it is indexed or not.
   the document body and every affected index key move in a single
   `Engine::write_batch` (one WAL record, one CRC), so a crash can never leave an
   index disagreeing with its document.
+- **Directional indexes:** each field may be ascending or descending. DESC fields
+  use an order-reversed encoding so forward LSM order matches the declared
+  logical order. `IndexDef` wire: optional trailer after TTL —
+  `0x02` + N direction bytes (`1`=ASC, `0`=DESC). All-ASC indexes omit the
+  trailer (identical to pre-direction payloads). Clients: Go
+  `CreateIndexFields`, Python `create_index([("f", False)])`, TypeScript
+  `createIndex([{ path, ascending: false }])`.
 - **Compound indexes** supported; the planner can use an equality prefix plus one
   trailing range.
 - **Unique indexes** (`create_index(..., unique=True)`) are enforced server-side;
@@ -131,7 +163,24 @@ is queryable whether it is indexed or not.
 - **TTL indexes** (`create_index(..., expire_after_seconds=N)`): at most one per
   collection; single field whose value is unix millis; body and index-key
   `expires_at` become `field_ms + N * 1000` on write/update. Missing/invalid
-  field → no expiry. Wire trailer `0`/omitted = not a TTL index.
+  field → no expiry. Wire trailer `0`/omitted = not a TTL index. Upserts that
+  change only `expires_at` rewrite every current index key so body and secondary
+  keys stay aligned for reclaim.
+
+### TTL visibility and disk reclaim
+
+Expiry is **wall-clock at observation time** (same rule as `get` / `scan`). Live
+snapshots do **not** keep expired keys readable; a key that has passed
+`expires_at` is invisible even under a pinned snapshot.
+
+- **Lazy hide:** reads filter expired entries without requiring a prior delete.
+- **Memtable sweeper (~30s):** inserts non-durable tombstones in the active
+  memtable only (no WAL). Metric: `ttl_sweep_tombstones_total`. Crash loses those
+  tombstones; invisibility still holds via lazy read after reopen.
+- **SST reclaim:** Tidewalker compaction drops expired newest values and all
+  older versions of that user key (so an older non-expired version cannot
+  resurrect). Metric: `compaction_expired_dropped_total`. Disk space returns only
+  after expired data has flushed to SST **and** been compacted.
 - **Order-preserving encoding** (`encoding.rs`): scalar field values encode so
   that lexicographic byte order equals logical order, and encodings are
   prefix-free, so composite keys and the trailing doc-id suffix never disturb
@@ -173,19 +222,23 @@ indexer.
 | `0x28` | `FindRev` | Implemented (find page rows include opaque revision) |
 | `0x29` | `DocPutIfMatch` | Implemented (conditional replace; stale/missing → `Conflict`) |
 | `0x2A` | `DocUpdateIfMatch` | Implemented (conditional by-id update; stale/missing → `Conflict`) |
+| `0x2B` | `Aggregate` | Implemented (optional `$match` + one `$group`; see [`AGGREGATION.md`](AGGREGATION.md)) |
+| `0x2C` | `Watch` | Implemented (primary-only collection change stream; see [`CHANGE_STREAMS.md`](CHANGE_STREAMS.md)) |
 | `0x30` | `IndexDef` | Implemented (index create + backfill; optional TTL `expire_after_seconds` trailer) |
 | `0x40` | `SessionInit` | Implemented (API-key auth handshake) |
 | `0x41` | `SetContext` | Implemented (admin tenant switch) |
 | `0x42` | `AdminDropTenant` | Implemented (live tenant offboard; admin path) |
 | `0xF0` | `Ping` | Implemented |
 | `0xF1` | `Stats` | Implemented |
-| `0x10`–`0x12` | `Begin`/`Commit`/`Rollback` | Reserved (parseable; `ProtocolError` until transactions) |
+| `0x10` | `Begin` | Implemented (start bounded per-connection transaction) |
+| `0x11` | `Commit` | Implemented (validate + one atomic WAL batch) |
+| `0x12` | `Rollback` | Implemented (discard staged ops) |
 | `0x31` | `SchemaDef` | Reserved (parseable; `ProtocolError` until schemas) |
 
 **0.9 freeze:** implemented opcodes above, write flags (`FLAG_RELAXED=0x01`,
 `FLAG_UPSERT=0x02`; unused flag bits must be zero), and status bytes in
 `zydecodb-engine::errors` (including `PolicyRejected` / `UnsupportedFormat`) are
-**frozen for 0.9.x** — append-only, no renumbering. Reserved slots and the
+**frozen for 0.10.x** — append-only, no renumbering. Reserved slots and the
 Not-yet list may gain semantics later without changing existing codes. On-disk
 format upgrades follow [`UPGRADE.md`](UPGRADE.md). Official drivers expose DocPut
 `expires_at` and IndexDef `expire_after_seconds` (TTL indexes); other admin
@@ -249,11 +302,39 @@ break the total order that crash recovery, snapshots, and pagination all rely
 on. Sharding into multiple independent write lanes is explicitly out of scope
 for the single-node product.
 
-The payoff of one lane is that **multi-document transactions** (opcodes
-`0x10`–`0x12`, reserved) become tractable later: stage N operations under the
-lock and commit them as one atomic WAL batch (the engine's existing
-all-or-nothing `WAL_BATCH` primitive), with no cross-shard coordination to
-reason about.
+The payoff of one lane is that **bounded multi-document transactions**
+(opcodes `0x10`–`0x12`) stage N operations in connection memory and commit them
+as one atomic WAL batch (the engine's existing all-or-nothing `WAL_BATCH`
+primitive), with no cross-shard coordination.
+
+### Bounded transactions
+
+Per-connection `Begin` / `Commit` / `Rollback` provide atomic multi-key writes
+across documents (by ID) and raw KV without claiming general-purpose MVCC.
+
+**Isolation:** at `Begin` the connection captures an owned engine snapshot.
+Direct gets merge that snapshot with a staged overlay (read-your-writes). Other
+connections see nothing until `Commit`. Commit re-checks every touched key's
+revision/existence against live state and validates unique indexes across the
+whole staged set, then persists body + index + KV ops in **one** `write_batch`
+(≤ 1,024 physical keys).
+
+**Allowed in a transaction:** `Put`/`Get`/`Del`, `DocPut`/`DocDel`/`DocGetRev`,
+`DocPutIfMatch`/`DocUpdateIfMatch`, plus `Ping`/`Stats`. Collections must already
+exist (no implicit create). Relaxed durability is rejected inside a transaction;
+transaction commits are always durable.
+
+**Rejected in a transaction:** filter `Find`/`Update`/`Delete`/`Count`,
+`IndexDef`, auth/tenant/admin context changes, nested `Begin`.
+
+**Limits:** one open transaction per connection; 30s lifetime; 256 logical
+staged ops; 32 MiB staged bodies; 1,024 physical batch keys. Disconnect, idle
+close, timeout, or protocol abort drops staging with nothing persisted.
+
+**Not provided:** serializable isolation, query overlays, long-running
+transactions, cross-connection transactions, or historical MVCC reads. If
+`Commit`'s transport fails after the request may have reached the server,
+clients surface an unknown-commit-result error — reconcile by re-reading keys.
 
 ### Durability is per-write
 
@@ -295,13 +376,16 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 
 ## Not yet
 
-- Aggregation pipeline (`$group` / `$lookup` / `$unwind`)
+- Full Mongo aggregation compatibility (`$lookup`, joins, `$unwind`, expressions, multi-stage pipelines beyond `$match`→`$group` — see [`AGGREGATION.md`](AGGREGATION.md) for the supported subset)
 - Projection pushdown / covered queries (the body is always fetched)
 - Other upsert edge-case Mongo parity beyond `$setOnInsert`
-- SST compaction dropping expired values (lazy read expiry + ~30s memtable
-  sweeper ship; expired keys can linger on disk until overwritten)
-- MVCC / multi-document transactions (opcodes `0x10`–`0x12` reserved; `seq` is
-  ordering only)
+- Mongo `arrayFilters`, bare `$` / `$[]` / `$[<id>]`, multi-match positional
+  updates, and filtered `$inc`/`$unset`/`$push` (v1 is `$set` + exactly-one)
+- Arbitrary mixed sorts that are neither index order nor the exact reverse of
+  index order (those still use the bounded sort buffer)
+- General MVCC / serializable isolation / transactional queries (bounded
+  by-ID+KV transactions ship; `seq` remains ordering + opaque revision, not
+  multi-version history)
 - Enforced collection schemas (`SchemaDef`, `0x31`, reserved)
 - Marketed multi-tenant p99 SLA as a universal default (simulated soak ship bar
   δ≤50 ms clears with `[fair]` on; CI gates on ubuntu-latest via

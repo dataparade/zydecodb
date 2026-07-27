@@ -23,7 +23,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::error;
 use zydecodb_engine::engine_handle::EngineHandle;
 use zydecodb_engine::wal_sync::WalSync;
@@ -102,6 +102,60 @@ impl CommitCoordinator {
             DurabilityMode::Sync if !relaxed => self.await_durable(seq),
             _ => {}
         }
+    }
+
+    /// Highest sequence known fsynced (change streams must not emit beyond this).
+    pub fn durable_seq(&self) -> u64 {
+        self.state.lock().unwrap().synced_seq.max(self.wal_sync.synced_seq())
+    }
+
+    /// Block until `seq` is fsynced, or `timeout` elapses, or shutdown.
+    /// Returns true if `seq` is durable.
+    pub fn wait_durable(&self, seq: u64, timeout: Duration) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if st.synced_seq.max(self.wal_sync.synced_seq()) >= seq {
+            return true;
+        }
+        if seq > st.requested_seq {
+            st.requested_seq = seq;
+        }
+        self.work.notify_one();
+        let deadline = Instant::now() + timeout;
+        while st.synced_seq.max(self.wal_sync.synced_seq()) < seq && !st.shutdown {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, _) = self.done.wait_timeout(st, remaining).unwrap();
+            st = next;
+        }
+        st.synced_seq.max(self.wal_sync.synced_seq()) >= seq
+    }
+
+    /// Block until the durable watermark advances past `seq`, then return.
+    /// Used by change streams waiting for new fsynced writes.
+    pub fn wait_durable_advance(&self, after_seq: u64, timeout: Duration) -> u64 {
+        let mut st = self.state.lock().unwrap();
+        let mut durable = st.synced_seq.max(self.wal_sync.synced_seq());
+        if durable > after_seq || st.shutdown {
+            return durable;
+        }
+        // Nudge the coordinator so periodic/sync modes keep moving.
+        if after_seq + 1 > st.requested_seq {
+            st.requested_seq = after_seq + 1;
+        }
+        self.work.notify_one();
+        let deadline = Instant::now() + timeout;
+        while durable <= after_seq && !st.shutdown {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, _) = self.done.wait_timeout(st, remaining).unwrap();
+            st = next;
+            durable = st.synced_seq.max(self.wal_sync.synced_seq());
+        }
+        durable
     }
 
     /// Block until `seq` is fsynced, or the coordinator is shutting down (in

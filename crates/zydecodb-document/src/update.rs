@@ -5,6 +5,10 @@
 //! whole document. `$setOnInsert` applies only on upsert insert (see
 //! [`materialize_upsert`]); normal updates ignore it.
 //!
+//! `$set` supports one filtered positional array segment per path:
+//! `items.$[skuId=ABC].qty` updates the single matching element (exactly one
+//! match required). Mongo `$` / `$[]` / `arrayFilters` forms are rejected.
+//!
 //! Each write reuses the atomic [`crate::store::upsert`]/[`crate::store::delete`]
 //! path, so the body and every secondary index move together in one WAL record.
 //! `update_many`/`delete_many` select candidate ids from a snapshot first, then
@@ -108,6 +112,7 @@ impl UpdateDoc {
 }
 
 fn parse_op(op: &str, path: &str, operand: &Value) -> DocResult<UpdateOp> {
+    validate_update_path(op, path)?;
     Ok(match op {
         "$set" => UpdateOp::Set(path.to_string(), operand.clone()),
         "$unset" => UpdateOp::Unset(path.to_string()),
@@ -125,6 +130,150 @@ fn parse_op(op: &str, path: &str, operand: &Value) -> DocResult<UpdateOp> {
             )))
         }
     })
+}
+
+/// Validate path shape at parse time. Filtered `$[field=value]` is `$set`-only.
+fn validate_update_path(op: &str, path: &str) -> DocResult<()> {
+    let segs = tokenize_path(path)?;
+    let mut filtered = 0usize;
+    for seg in &segs {
+        match seg {
+            PathSeg::Field(name) => {
+                if *name == "$" || name.starts_with("$[") {
+                    return Err(DocError::BadUpdate(format!(
+                        "unsupported positional path segment '{name}' in '{path}'"
+                    )));
+                }
+            }
+            PathSeg::Filtered { .. } => {
+                filtered += 1;
+            }
+        }
+    }
+    if filtered > 1 {
+        return Err(DocError::BadUpdate(format!(
+            "path '{path}' may contain at most one $[field=value] segment"
+        )));
+    }
+    if filtered == 1 && op != "$set" {
+        return Err(DocError::BadUpdate(format!(
+            "filtered positional paths are only supported with $set (got {op})"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PathSeg<'a> {
+    Field(&'a str),
+    Filtered { field: &'a str, value: Value },
+}
+
+/// Split `a.b.$[skuId=ABC].qty` without breaking on dots inside `$[…]`.
+fn tokenize_path(path: &str) -> DocResult<Vec<PathSeg<'_>>> {
+    if path.is_empty() {
+        return Err(DocError::BadUpdate("update path is empty".into()));
+    }
+    let mut segs = Vec::new();
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'.' {
+            return Err(DocError::BadUpdate(format!(
+                "invalid empty path segment in '{path}'"
+            )));
+        }
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let close = path[i..]
+                .find(']')
+                .ok_or_else(|| DocError::BadUpdate(format!("unclosed $[…] in path '{path}'")))?;
+            let inner = &path[i + 2..i + close];
+            if inner.is_empty() {
+                return Err(DocError::BadUpdate(format!(
+                    "empty $[…] is not supported in '{path}'"
+                )));
+            }
+            if !inner.contains('=') {
+                return Err(DocError::BadUpdate(format!(
+                    "unsupported positional form '$[{inner}]' in '{path}' — use $[field=value]"
+                )));
+            }
+            let (field, raw_val) = inner.split_once('=').unwrap();
+            if field.is_empty() || field.contains('.') || field.contains('[') || field.contains(']')
+            {
+                return Err(DocError::BadUpdate(format!(
+                    "invalid identity field in '$[{inner}]'"
+                )));
+            }
+            let value = parse_filter_literal(raw_val)?;
+            segs.push(PathSeg::Filtered { field, value });
+            i += close + 1;
+            if i < bytes.len() {
+                if bytes[i] != b'.' {
+                    return Err(DocError::BadUpdate(format!(
+                        "expected '.' after $[…] in '{path}'"
+                    )));
+                }
+                i += 1; // skip trailing '.'
+            }
+        } else {
+            let mut j = i;
+            while j < bytes.len() && bytes[j] != b'.' {
+                // A bare `$` segment (Mongo positional) or `$name` without `[` is rejected later.
+                j += 1;
+            }
+            let name = &path[i..j];
+            if name.is_empty() {
+                return Err(DocError::BadUpdate(format!(
+                    "invalid empty path segment in '{path}'"
+                )));
+            }
+            segs.push(PathSeg::Field(name));
+            i = j;
+            if i < bytes.len() {
+                i += 1; // skip '.'
+                if i == bytes.len() {
+                    return Err(DocError::BadUpdate(format!(
+                        "trailing '.' in path '{path}'"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(segs)
+}
+
+/// Parse the RHS of `$[field=value]`: JSON literal, or bare token as string.
+fn parse_filter_literal(raw: &str) -> DocResult<Value> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(DocError::BadUpdate(
+            "empty value in $[field=value] predicate".into(),
+        ));
+    }
+    // Quoted string / number / bool / null via JSON.
+    if raw.starts_with('"')
+        || raw.starts_with('{')
+        || raw.starts_with('[')
+        || matches!(raw.as_bytes().first(), Some(b'0'..=b'9') | Some(b'-'))
+        || raw == "true"
+        || raw == "false"
+        || raw == "null"
+    {
+        return serde_json::from_str(raw).map_err(|e| {
+            DocError::BadUpdate(format!("invalid $[field=value] literal '{raw}': {e}"))
+        });
+    }
+    // Bare token → string (ABC, sku_1).
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(DocError::BadUpdate(format!(
+            "invalid bare token '{raw}' in $[field=value] — use a JSON string literal"
+        )));
+    }
+    Ok(Value::String(raw.to_string()))
 }
 
 impl UpdateOp {
@@ -170,6 +319,8 @@ fn json_number(f: f64) -> Value {
 }
 
 fn get_path<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
+    // Object-only dotted paths (no filtered segments). Filtered paths are
+    // rejected at parse time for non-$set ops that use get_path.
     let mut cur = doc;
     for seg in path.split('.') {
         cur = cur.as_object()?.get(seg)?;
@@ -178,21 +329,120 @@ fn get_path<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 fn set_path(doc: &mut Value, path: &str, val: Value) -> DocResult<()> {
-    let segs: Vec<&str> = path.split('.').collect();
+    let segs = tokenize_path(path)?;
+    if segs.iter().any(|s| matches!(s, PathSeg::Filtered { .. })) {
+        return set_path_filtered(doc, path, &segs, val);
+    }
+    set_path_object(doc, path, &segs, val)
+}
+
+fn set_path_object(doc: &mut Value, path: &str, segs: &[PathSeg<'_>], val: Value) -> DocResult<()> {
+    if segs.is_empty() {
+        return Err(DocError::BadUpdate("update path is empty".into()));
+    }
     let mut cur = doc;
     for seg in &segs[..segs.len() - 1] {
+        let PathSeg::Field(name) = seg else {
+            unreachable!("filtered segments handled elsewhere");
+        };
         let map = cur
             .as_object_mut()
             .ok_or_else(|| DocError::BadUpdate(format!("cannot set nested path '{path}'")))?;
         cur = map
-            .entry((*seg).to_string())
+            .entry((*name).to_string())
             .or_insert_with(|| Value::Object(Map::new()));
     }
+    let PathSeg::Field(last) = &segs[segs.len() - 1] else {
+        unreachable!("filtered segments handled elsewhere");
+    };
     let map = cur
         .as_object_mut()
         .ok_or_else(|| DocError::BadUpdate(format!("cannot set nested path '{path}'")))?;
-    map.insert(segs[segs.len() - 1].to_string(), val);
+    map.insert((*last).to_string(), val);
     Ok(())
+}
+
+/// `$set` on `prefix.$[field=value]` or `prefix.$[field=value].suffix`.
+/// Requires exactly one matching array element.
+fn set_path_filtered(
+    doc: &mut Value,
+    path: &str,
+    segs: &[PathSeg<'_>],
+    val: Value,
+) -> DocResult<()> {
+    let filt_idx = segs
+        .iter()
+        .position(|s| matches!(s, PathSeg::Filtered { .. }))
+        .expect("caller checked for filtered segment");
+    if filt_idx == 0 {
+        return Err(DocError::BadUpdate(format!(
+            "filtered path '{path}' must have an array field before $[…]"
+        )));
+    }
+
+    // Walk object prefix to the parent of the array field, then into the array field.
+    let mut cur = doc;
+    for seg in &segs[..filt_idx - 1] {
+        let PathSeg::Field(name) = seg else {
+            return Err(DocError::BadUpdate(format!(
+                "invalid path '{path}': $[…] before array field"
+            )));
+        };
+        let map = cur.as_object_mut().ok_or_else(|| {
+            DocError::BadUpdate(format!("cannot traverse path '{path}' — not an object"))
+        })?;
+        cur = map
+            .get_mut(*name)
+            .ok_or_else(|| DocError::BadUpdate(format!("path '{path}' missing field '{name}'")))?;
+    }
+    let PathSeg::Field(arr_name) = &segs[filt_idx - 1] else {
+        return Err(DocError::BadUpdate(format!(
+            "invalid path '{path}': expected array field before $[…]"
+        )));
+    };
+    let map = cur.as_object_mut().ok_or_else(|| {
+        DocError::BadUpdate(format!("cannot traverse path '{path}' — not an object"))
+    })?;
+    let arr_val = map.get_mut(*arr_name).ok_or_else(|| {
+        DocError::BadUpdate(format!("path '{path}' missing array field '{arr_name}'"))
+    })?;
+    let arr = arr_val.as_array_mut().ok_or_else(|| {
+        DocError::BadUpdate(format!("path '{path}': field '{arr_name}' is not an array"))
+    })?;
+
+    let PathSeg::Filtered {
+        field: id_field,
+        value: id_value,
+    } = &segs[filt_idx]
+    else {
+        unreachable!();
+    };
+
+    let mut match_idx: Option<usize> = None;
+    for (i, elem) in arr.iter().enumerate() {
+        let Some(obj) = elem.as_object() else {
+            continue;
+        };
+        if obj.get(*id_field) == Some(id_value) {
+            if match_idx.is_some() {
+                return Err(DocError::BadUpdate(format!(
+                    "filtered path '{path}' matched multiple array elements"
+                )));
+            }
+            match_idx = Some(i);
+        }
+    }
+    let idx = match_idx.ok_or_else(|| {
+        DocError::BadUpdate(format!("filtered path '{path}' matched no array elements"))
+    })?;
+
+    let suffix = &segs[filt_idx + 1..];
+    if suffix.is_empty() {
+        arr[idx] = val;
+        return Ok(());
+    }
+    // Set nested path inside the matched element (object nesting only).
+    set_path_object(&mut arr[idx], path, suffix, val)
 }
 
 fn unset_path(doc: &mut Value, path: &str) {
@@ -603,5 +853,124 @@ mod tests {
         let (_, body) = materialize_upsert(&f, &u).unwrap();
         let v = crate::binary::ValueView::new(&body).to_value();
         assert_eq!(v["created"], json!(true));
+    }
+
+    #[test]
+    fn filtered_set_updates_matching_leaf() {
+        let doc = json!({
+            "items": [
+                {"skuId": "A", "qty": 1},
+                {"skuId": "B", "qty": 2}
+            ]
+        });
+        let out = apply(json!({"$set": {"items.$[skuId=B].qty": 9}}), doc);
+        assert_eq!(out["items"][1]["qty"], json!(9));
+        assert_eq!(out["items"][0]["qty"], json!(1));
+    }
+
+    #[test]
+    fn filtered_set_accepts_json_string_literal() {
+        let doc = json!({"items": [{"skuId": "A", "qty": 1}]});
+        let out = apply(json!({"$set": {"items.$[skuId=\"A\"].qty": 3}}), doc);
+        assert_eq!(out["items"][0]["qty"], json!(3));
+    }
+
+    #[test]
+    fn filtered_set_replaces_whole_element() {
+        let doc = json!({"items": [{"skuId": "A", "qty": 1}]});
+        let out = apply(
+            json!({"$set": {"items.$[skuId=A]": {"skuId": "A", "qty": 5, "extra": true}}}),
+            doc,
+        );
+        assert_eq!(
+            out["items"][0],
+            json!({"skuId": "A", "qty": 5, "extra": true})
+        );
+    }
+
+    #[test]
+    fn filtered_set_zero_matches_fails() {
+        let mut doc = json!({"items": [{"skuId": "A", "qty": 1}]});
+        let u = UpdateDoc::parse(&json!({"$set": {"items.$[skuId=Z].qty": 1}})).unwrap();
+        let err = u.apply(&mut doc).unwrap_err();
+        assert!(matches!(err, DocError::BadUpdate(_)), "{err}");
+        assert!(err.to_string().contains("matched no"), "{err}");
+    }
+
+    #[test]
+    fn filtered_set_many_matches_fails() {
+        let mut doc = json!({
+            "items": [
+                {"skuId": "A", "qty": 1},
+                {"skuId": "A", "qty": 2}
+            ]
+        });
+        let u = UpdateDoc::parse(&json!({"$set": {"items.$[skuId=A].qty": 9}})).unwrap();
+        let err = u.apply(&mut doc).unwrap_err();
+        assert!(err.to_string().contains("multiple"), "{err}");
+    }
+
+    #[test]
+    fn filtered_set_requires_array() {
+        let mut doc = json!({"items": {"skuId": "A"}});
+        let u = UpdateDoc::parse(&json!({"$set": {"items.$[skuId=A].qty": 1}})).unwrap();
+        let err = u.apply(&mut doc).unwrap_err();
+        assert!(err.to_string().contains("not an array"), "{err}");
+    }
+
+    #[test]
+    fn filtered_path_rejected_on_inc() {
+        let err = UpdateDoc::parse(&json!({"$inc": {"items.$[skuId=A].qty": 1}})).unwrap_err();
+        assert!(err.to_string().contains("$set"), "{err}");
+    }
+
+    #[test]
+    fn mongo_positional_forms_rejected() {
+        assert!(UpdateDoc::parse(&json!({"$set": {"items.$.qty": 1}})).is_err());
+        assert!(UpdateDoc::parse(&json!({"$set": {"items.$[].qty": 1}})).is_err());
+        assert!(UpdateDoc::parse(&json!({"$set": {"items.$[elem].qty": 1}})).is_err());
+        assert!(UpdateDoc::parse(&json!({
+            "$set": {"items.$[skuId=A].qty": 1, "other.$[id=1].x": 2}
+        }))
+        .is_ok()); // two ops, each path has one filter — allowed
+                   // One path with two filters:
+        assert!(UpdateDoc::parse(&json!({
+            "$set": {"items.$[skuId=A].subs.$[id=1].x": 2}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn filtered_set_numeric_and_bool_identity() {
+        let doc = json!({
+            "rows": [
+                {"id": 1, "ok": false},
+                {"id": 2, "ok": true}
+            ]
+        });
+        let out = apply(json!({"$set": {"rows.$[id=2].ok": false}}), doc);
+        assert_eq!(out["rows"][1]["ok"], json!(false));
+        let out2 = apply(
+            json!({"$set": {"rows.$[ok=true].n": 7}}),
+            json!({
+                "rows": [{"ok": true, "n": 1}, {"ok": false, "n": 2}]
+            }),
+        );
+        assert_eq!(out2["rows"][0]["n"], json!(7));
+        assert_eq!(out2["rows"][1]["n"], json!(2));
+        let _ = out;
+    }
+
+    #[test]
+    fn tokenize_preserves_dots_inside_quoted_value() {
+        let segs = tokenize_path(r#"items.$[skuId="a.b"].qty"#).unwrap();
+        assert_eq!(segs.len(), 3);
+        match &segs[1] {
+            PathSeg::Filtered { field, value } => {
+                assert_eq!(*field, "skuId");
+                assert_eq!(value, &json!("a.b"));
+            }
+            _ => panic!("expected filtered seg"),
+        }
     }
 }

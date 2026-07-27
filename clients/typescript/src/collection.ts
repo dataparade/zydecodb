@@ -1,5 +1,6 @@
 import type { Client, UpdateResult } from "./client.ts";
 import { generateId } from "./client.ts";
+import { ChangeStream } from "./watch.ts";
 import { ZydecoError } from "./errors.ts";
 import { Proj, type Projection, type SortKey } from "./protocol.ts";
 
@@ -37,20 +38,36 @@ export class Collection {
    * Create a secondary index over one or more dotted field paths. Returns false
    * if the index already existed.
    */
-  /** `expireAfterSeconds` marks a TTL index (field = unix millis); 0 = not TTL. */
+  /**
+   * Create a secondary index. `fields` may be `string[]` (all ascending) or
+   * `{ path: string; ascending?: boolean }[]` (`ascending` defaults true).
+   * `expireAfterSeconds` marks a TTL index (field = unix millis); 0 = not TTL.
+   */
   createIndex(
-    fields: string[],
+    fields: string[] | { path: string; ascending?: boolean }[],
     unique = false,
     expireAfterSeconds: number | bigint = 0,
   ): Promise<boolean> {
-    const indexName = "by_" + fields.map((f) => f.replaceAll(".", "_")).join("_");
+    const paths: string[] = [];
+    const directions: boolean[] = [];
+    for (const f of fields) {
+      if (typeof f === "string") {
+        paths.push(f);
+        directions.push(true);
+      } else {
+        paths.push(f.path);
+        directions.push(f.ascending !== false);
+      }
+    }
+    const indexName = "by_" + paths.map((p) => p.replaceAll(".", "_")).join("_");
     return this.client.defineIndex(
       this.name,
       indexName,
-      fields,
+      paths,
       unique,
       true,
       expireAfterSeconds,
+      directions,
     );
   }
 
@@ -224,6 +241,17 @@ export class Collection {
 
   distinct(field: string, filter: Document | null = null): Promise<unknown[]> {
     return this.client.distinct(this.name, field, filterBytes(filter));
+  }
+
+  /** Run a bounded aggregation pipeline and return result documents. */
+  async aggregate(pipeline: unknown[]): Promise<Document[]> {
+    const rows = await this.client.aggregate(this.name, jsonBytes(pipeline));
+    return rows.map((b) => (b.length ? (JSON.parse(b.toString("utf8")) as Document) : {}));
+  }
+
+  /** Open a dedicated change stream on this collection. */
+  watch(resumeToken?: Buffer, signal?: AbortSignal): ChangeStream {
+    return this.client.watch(this.name, resumeToken, signal);
   }
 }
 

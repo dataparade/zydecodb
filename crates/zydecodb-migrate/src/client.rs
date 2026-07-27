@@ -62,6 +62,7 @@ impl Client {
         collection: &str,
         index_name: &str,
         fields: &[String],
+        directions: &[bool],
         unique: bool,
     ) -> MigrateResult<()> {
         let payload = IndexDefPayload {
@@ -70,6 +71,7 @@ impl Client {
             fields: fields.to_vec(),
             unique,
             expire_after_seconds: 0,
+            directions: directions.to_vec(),
         }
         .encode();
         let (status, body) = self.request_retrying(Command::IndexDef, payload)?;

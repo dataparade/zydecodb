@@ -6,6 +6,7 @@
 pub mod apply_worker;
 pub mod block_cache;
 pub mod bloom;
+pub mod change_log;
 pub mod compaction;
 pub mod compaction_worker;
 pub mod engine;

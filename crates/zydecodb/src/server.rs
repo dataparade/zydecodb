@@ -7,6 +7,7 @@ use crate::security::ratelimit::RateLimiter;
 use crate::security::tls::{accept as tls_accept, load_server_config};
 use crate::security::{SecurityRuntime, SessionState};
 use crate::shared::{SharedCatalog, SharedEngine};
+use crate::transaction::{self, TransactionState};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -347,6 +348,47 @@ impl Server {
         } else {
             None
         };
+
+        // Change streams: retain sealed WAL segments for authorized resume.
+        // Attached after metrics so archive gauges populate on open reconcile.
+        if config.change_streams.enabled {
+            if config.replica.from.is_some() {
+                return Err(
+                    "change_streams.enabled is incompatible with replica.from (primary-only)"
+                        .into(),
+                );
+            }
+            let archive_dir = config
+                .change_streams
+                .archive_dir
+                .clone()
+                .unwrap_or_else(|| config.data_dir.join("change_log"));
+            let cl_cfg = zydecodb_engine::change_log::ChangeLogConfig {
+                archive_dir: archive_dir.clone(),
+                retention_secs: config.change_streams.retention_secs,
+                retention_bytes: config.change_streams.retention_bytes,
+            };
+            engine = engine.with_change_log(cl_cfg)?;
+            if let Some(manifest) = engine.change_log_manifest() {
+                metrics
+                    .change_log_archive_segments
+                    .set(manifest.segments.len() as i64);
+                metrics
+                    .change_log_archive_bytes
+                    .set(manifest.total_bytes() as i64);
+                if let Some(earliest) = manifest.earliest_seq() {
+                    metrics.change_log_earliest_seq.set(earliest as i64);
+                }
+                if let Some(latest) = manifest.latest_seq() {
+                    metrics.change_log_latest_seq.set(latest as i64);
+                }
+            }
+            info!(
+                dir = %archive_dir.display(),
+                retention_secs = config.change_streams.retention_secs,
+                "change stream WAL archive enabled"
+            );
+        }
 
         // Load the document catalog before sharing the engine; reads of it
         // afterward never need the engine lock.
@@ -835,7 +877,12 @@ fn serve_tcp_connection(
     tenant_metrics: &Option<Arc<TenantMetrics>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let write_to = if security.change_streams.enabled {
+        Duration::from_millis(security.change_streams.write_timeout_ms.max(1))
+    } else {
+        Duration::from_secs(30)
+    };
+    stream.set_write_timeout(Some(write_to))?;
 
     if let Some(config) = tls_config {
         let mut tls = tls_accept(stream, &config)?;
@@ -878,7 +925,12 @@ fn serve_uds_connection(
     tenant_metrics: &Option<Arc<TenantMetrics>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let write_to = if security.change_streams.enabled {
+        Duration::from_millis(security.change_streams.write_timeout_ms.max(1))
+    } else {
+        Duration::from_secs(30)
+    };
+    stream.set_write_timeout(Some(write_to))?;
     let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     serve_stream(
         engine,
@@ -908,6 +960,8 @@ fn is_write_command(cmd: Command) -> bool {
             | Command::DocUpdateIfMatch
             | Command::IndexDef
             | Command::AdminDropTenant
+            | Command::Begin
+            | Command::Commit
     )
 }
 
@@ -925,9 +979,13 @@ fn serve_stream<S: Read + Write>(
     let mut session = SessionState::anonymous();
     let mut rate_limiter = RateLimiter::new(security.rate_limit_rps);
     let mut last_activity = Instant::now();
+    let mut tx: Option<TransactionState> = None;
+    let mut next_tx_id: u64 = 1;
 
     loop {
         if *shutdown.lock().unwrap() {
+            // Drop any staged transaction; nothing has been persisted.
+            drop(tx.take());
             break;
         }
 
@@ -938,18 +996,36 @@ fn serve_stream<S: Read + Write>(
             }
             // Idle (no request started): keep the connection warm for pooled
             // clients, but enforce the configurable idle cap so dead peers are
-            // eventually reclaimed.
+            // eventually reclaimed. An open transaction also expires on its own
+            // deadline even if the connection stays warm.
             ReadOutcome::Idle => {
+                if tx.as_ref().is_some_and(|s| s.expired()) {
+                    drop(tx.take());
+                }
                 if let Some(limit) = security.idle_timeout {
                     if last_activity.elapsed() >= limit {
+                        drop(tx.take());
                         break;
                     }
                 }
                 continue;
             }
-            ReadOutcome::Closed => break,
-            ReadOutcome::Error(e) => return Err(e.into()),
+            ReadOutcome::Closed => {
+                drop(tx.take());
+                break;
+            }
+            ReadOutcome::Error(e) => {
+                drop(tx.take());
+                return Err(e.into());
+            }
         };
+
+        // Expire open transactions before dispatching the next command.
+        if let Some(ref state) = tx {
+            if state.expired() {
+                tx = None;
+            }
+        }
 
         if !rate_limiter.allow() {
             let resp = zydecodb_engine::frame::ResponseEnvelope::error(
@@ -1021,13 +1097,95 @@ fn serve_stream<S: Read + Write>(
         // Capture the command for metrics before `req` is moved into dispatch.
         let req_command = req.command;
 
+        // Session/tenant/admin mutations are forbidden while a transaction is open.
+        if tx.is_some()
+            && matches!(
+                req.command,
+                Command::SessionInit
+                    | Command::SetContext
+                    | Command::AdminDropTenant
+                    | Command::IndexDef
+            )
+        {
+            let resp = zydecodb_engine::frame::ResponseEnvelope::error(
+                zydecodb_engine::errors::Status::ProtocolError,
+                "transaction aborted: command not allowed inside a transaction",
+            );
+            tx = None;
+            write_response(stream, &resp)?;
+            stream.flush()?;
+            continue;
+        }
+
+        // Watch takes over the connection into dedicated stream mode.
+        if req.command == Command::Watch {
+            if tx.is_some() {
+                let resp = zydecodb_engine::frame::ResponseEnvelope::error(
+                    zydecodb_engine::errors::Status::ProtocolError,
+                    "Watch not allowed inside a transaction",
+                );
+                write_response(stream, &resp)?;
+                stream.flush()?;
+                continue;
+            }
+            crate::watch::run_watch_stream(
+                engine,
+                catalog,
+                commit,
+                security,
+                &security.watch_registry,
+                &session,
+                &req,
+                stream,
+                shutdown,
+            )?;
+            break;
+        }
+
         // Document commands have their own dispatch (and their own lock scoping,
         // including two-phase Query); they never mutate the session. Raw-KV
         // commands go through handle_request, which scopes the engine lock per
         // command (no lock for control commands, a brief snapshot capture for
         // Get/Stats, the write under the lock for Put/Del) -- never across
-        // socket I/O.
-        let response = if is_admin_command(req.command) {
+        // socket I/O. Transaction control and staged ops are connection-local.
+        let response = if req.command.is_transaction_command() {
+            transaction::handle_control(
+                engine,
+                catalog,
+                commit,
+                &req,
+                &session,
+                security,
+                &mut tx,
+                &mut next_tx_id,
+            )
+        } else if tx.is_some() {
+            let staged = transaction::handle_in_transaction(
+                engine,
+                catalog,
+                &req,
+                &session,
+                security,
+                tx.as_mut().unwrap(),
+            );
+            match staged {
+                Some(resp) => {
+                    // Staging/read errors that abort the transaction clear state.
+                    let abort = resp.status == zydecodb_engine::errors::Status::ProtocolError
+                        && String::from_utf8_lossy(&resp.payload).contains("transaction aborted");
+                    if abort {
+                        tx = None;
+                    }
+                    resp
+                }
+                None => {
+                    // Ping/Stats fall through to the normal path.
+                    let outcome = handle_request(engine, req, session, security);
+                    session = outcome.session;
+                    outcome.response
+                }
+            }
+        } else if is_admin_command(req.command) {
             handle_admin_drop_tenant(engine, catalog, &req, &session, security)
         } else if req.command.is_document_command() {
             handle_document(engine, catalog, commit, &req, &session, security)

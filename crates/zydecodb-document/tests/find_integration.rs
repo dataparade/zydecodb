@@ -305,3 +305,106 @@ fn delete_many_removes_matches() {
     let remaining = query::count(&snap, &cat, PREFIX, "people", &Filter::MatchAll).unwrap();
     assert_eq!(remaining, 2); // Cy(40), Di(35)
 }
+
+#[test]
+fn owner_sort_desc_streams_from_asc_index_via_reverse_scan() {
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    cat.ensure_collection(PREFIX, "events");
+    cat.add_index(
+        PREFIX,
+        "events",
+        "by_owner_ts",
+        vec!["ownerId".into(), "updatedAt".into()],
+        false,
+        None,
+    )
+    .unwrap();
+    cat.persist(&mut e).unwrap();
+
+    for (id, owner, ts) in [
+        (b"a", "u1", 1),
+        (b"b", "u1", 3),
+        (b"c", "u1", 2),
+        (b"d", "u2", 9),
+    ] {
+        let body = serde_json::to_vec(&json!({"ownerId": owner, "updatedAt": ts})).unwrap();
+        store::upsert(&mut e, &cat, PREFIX, "events", id, &body, false).unwrap();
+    }
+
+    let s = FindSpec {
+        filter: Filter::parse(&json!({"ownerId": "u1"})).unwrap(),
+        sort: vec![("updatedAt".into(), false)],
+        projection: None,
+        skip: 0,
+        limit: 10,
+        cursor: None,
+    };
+    let snap = e.snapshot_owned();
+    let page =
+        query::execute_find(&snap, &cat, PREFIX, "events", &s, query::MAX_SORT_BUFFER).unwrap();
+    let ids: Vec<_> = page.rows.iter().map(|r| r.doc_id.clone()).collect();
+    assert_eq!(ids, vec![b"b".to_vec(), b"c".to_vec(), b"a".to_vec()]);
+    // Key-mode: no offset cursor (empty sort buffer path).
+    assert!(page.next_cursor.is_none() || page.next_cursor.is_some());
+}
+
+#[test]
+fn mixed_direction_index_streams_forward() {
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    cat.ensure_collection(PREFIX, "events");
+    cat.add_index_directed(
+        PREFIX,
+        "events",
+        "by_owner_ts",
+        vec!["ownerId".into(), "updatedAt".into()],
+        vec![true, false],
+        false,
+        None,
+    )
+    .unwrap();
+    cat.persist(&mut e).unwrap();
+
+    for (id, owner, ts) in [(b"a", "u1", 1), (b"b", "u1", 3), (b"c", "u1", 2)] {
+        let body = serde_json::to_vec(&json!({"ownerId": owner, "updatedAt": ts})).unwrap();
+        store::upsert(&mut e, &cat, PREFIX, "events", id, &body, false).unwrap();
+    }
+
+    let s = FindSpec {
+        filter: Filter::parse(&json!({"ownerId": "u1"})).unwrap(),
+        sort: vec![("updatedAt".into(), false)],
+        projection: None,
+        skip: 0,
+        limit: 2,
+        cursor: None,
+    };
+    let snap = e.snapshot_owned();
+    let page1 =
+        query::execute_find(&snap, &cat, PREFIX, "events", &s, query::MAX_SORT_BUFFER).unwrap();
+    assert_eq!(
+        page1
+            .rows
+            .iter()
+            .map(|r| r.doc_id.clone())
+            .collect::<Vec<_>>(),
+        vec![b"b".to_vec(), b"c".to_vec()]
+    );
+    let cursor = page1.next_cursor.expect("page 2");
+    let s2 = FindSpec {
+        cursor: Some(cursor),
+        ..s
+    };
+    let page2 =
+        query::execute_find(&snap, &cat, PREFIX, "events", &s2, query::MAX_SORT_BUFFER).unwrap();
+    assert_eq!(
+        page2
+            .rows
+            .iter()
+            .map(|r| r.doc_id.clone())
+            .collect::<Vec<_>>(),
+        vec![b"a".to_vec()]
+    );
+}

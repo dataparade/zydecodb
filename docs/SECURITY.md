@@ -79,6 +79,8 @@ allowed_prefixes = ["events:", "metrics:"]
 
 - **KV:** the client key must start with one of the prefixes.
 - **Documents:** the collection name must start with a prefix, or equal the prefix with a trailing `:` stripped (so `events:` allows collection `events`).
+- **Aggregate** is an authenticated read and uses the same collection-prefix ACL.
+- **Watch** (change streams) is primary-only, uses the same collection-prefix ACL, and is subject to `[change_streams]` subscription caps. Read-only replicas reject Watch. SIGHUP key revocation terminates active streams.
 
 Dev-only bootstrap: set `ZYDECODB_BOOTSTRAP_KEY` instead of a keys file. The server **refuses to start** if this env var is set and `listen` is not loopback. Use a real `keys.toml` for any networked bind.
 

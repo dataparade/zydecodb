@@ -182,3 +182,25 @@ test("optimistic concurrency", { skip }, async () => {
     db.close();
   }
 });
+
+test("bounded transaction", { skip }, async () => {
+  const db = newClient();
+  const collName = uniqueCollection();
+  const coll = db.collection(collName);
+  try {
+    await coll.insertOne({ _seed: true });
+    const key = Buffer.from(`tx-ts-${collName}`);
+    const { seq } = await db.withTransaction(async (tx) => {
+      await tx.put(key, Buffer.from("v1"));
+      await tx.putDocument(collName, "u1", { n: 1 });
+      const got = await tx.get(key);
+      assert.ok(got);
+      assert.equal(got!.toString("utf8"), "v1");
+    });
+    assert.ok(seq > 0n);
+    const committed = await db.get(key);
+    assert.equal(committed?.toString("utf8"), "v1");
+  } finally {
+    db.close();
+  }
+});

@@ -49,6 +49,107 @@ pub struct Config {
     /// hosting multiple tenants on one process. See `docs/SECURITY.md`.
     #[serde(default)]
     pub fair: FairTomlConfig,
+    /// Bounded aggregation resource limits (`[aggregation]`).
+    #[serde(default)]
+    pub aggregation: AggregationConfig,
+    /// Change-stream retention and subscription caps (`[change_streams]`).
+    /// Disabled unless `enabled = true`.
+    #[serde(default)]
+    pub change_streams: ChangeStreamsConfig,
+}
+
+/// Change-stream retention and subscription caps.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChangeStreamsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory for retained WAL segment archives. Default: `<data_dir>/change_log`.
+    #[serde(default)]
+    pub archive_dir: Option<PathBuf>,
+    #[serde(default = "default_cs_retention_secs")]
+    pub retention_secs: u64,
+    #[serde(default = "default_cs_retention_bytes")]
+    pub retention_bytes: u64,
+    #[serde(default = "default_cs_heartbeat_ms")]
+    pub heartbeat_ms: u64,
+    #[serde(default = "default_cs_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    #[serde(default = "default_cs_max_subscriptions")]
+    pub max_subscriptions: usize,
+    #[serde(default = "default_cs_max_subscriptions_per_tenant")]
+    pub max_subscriptions_per_tenant: usize,
+}
+
+impl Default for ChangeStreamsConfig {
+    fn default() -> Self {
+        ChangeStreamsConfig {
+            enabled: false,
+            archive_dir: None,
+            retention_secs: default_cs_retention_secs(),
+            retention_bytes: default_cs_retention_bytes(),
+            heartbeat_ms: default_cs_heartbeat_ms(),
+            write_timeout_ms: default_cs_write_timeout_ms(),
+            max_subscriptions: default_cs_max_subscriptions(),
+            max_subscriptions_per_tenant: default_cs_max_subscriptions_per_tenant(),
+        }
+    }
+}
+
+fn default_cs_retention_secs() -> u64 {
+    3600
+}
+fn default_cs_retention_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_cs_heartbeat_ms() -> u64 {
+    15_000
+}
+fn default_cs_write_timeout_ms() -> u64 {
+    5_000
+}
+fn default_cs_max_subscriptions() -> usize {
+    128
+}
+fn default_cs_max_subscriptions_per_tenant() -> usize {
+    8
+}
+
+/// Per-request aggregation budgets. Defaults match
+/// [`zydecodb_document::aggregation::AggregationLimits`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AggregationConfig {
+    #[serde(default = "default_agg_max_scan_docs")]
+    pub max_scan_docs: usize,
+    #[serde(default = "default_agg_max_groups")]
+    pub max_groups: usize,
+    #[serde(default = "default_agg_max_memory_bytes")]
+    pub max_memory_bytes: usize,
+    #[serde(default = "default_agg_max_result_bytes")]
+    pub max_result_bytes: usize,
+}
+
+impl Default for AggregationConfig {
+    fn default() -> Self {
+        AggregationConfig {
+            max_scan_docs: default_agg_max_scan_docs(),
+            max_groups: default_agg_max_groups(),
+            max_memory_bytes: default_agg_max_memory_bytes(),
+            max_result_bytes: default_agg_max_result_bytes(),
+        }
+    }
+}
+
+fn default_agg_max_scan_docs() -> usize {
+    100_000
+}
+fn default_agg_max_groups() -> usize {
+    10_000
+}
+fn default_agg_max_memory_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn default_agg_max_result_bytes() -> usize {
+    4 * 1024 * 1024
 }
 
 /// TOML surface for [`FairConfig`]. Durations are milliseconds.

@@ -159,6 +159,27 @@ impl SnapshotHandle {
         )?;
         Ok(OwnedRangeIter { inner, now_ms })
     }
+
+    /// Range scan over user keys `[lo, hi)` yielding pairs in user-key DESC order.
+    pub fn scan_rev(&self, lo: Vec<u8>, hi: Vec<u8>) -> EngineResult<OwnedRangeIter<'_>> {
+        let now_ms = now_ms();
+        let sst_refs: Vec<Arc<SstableReader>> = self
+            .sstables
+            .iter()
+            .zip(self.sstable_metas.iter())
+            .filter(|(_, meta)| range_overlaps(meta, &lo, &hi))
+            .map(|(r, _)| r.clone())
+            .collect();
+        let inner = crate::snapshot::build_sources_rev(
+            self.active.as_ref(),
+            self.immutables.iter().map(|m| m.as_ref()),
+            &sst_refs,
+            self.seq_upper,
+            lo,
+            hi,
+        )?;
+        Ok(OwnedRangeIter { inner, now_ms })
+    }
 }
 
 impl Drop for SnapshotHandle {

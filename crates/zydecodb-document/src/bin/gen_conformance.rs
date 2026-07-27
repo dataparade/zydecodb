@@ -21,9 +21,9 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use zydecodb_document::query::{QueryPage, QueryRow};
 use zydecodb_document::wire::{
-    self, CountPayload, DeletePayload, DocDelPayload, DocPutIfMatchPayload, DocPutPayload,
-    DocUpdateIfMatchPayload, FindPayload, IndexDefPayload, QueryPayload, UpdatePayload,
-    WireProjection,
+    self, AggregatePayload, CountPayload, DeletePayload, DocDelPayload, DocPutIfMatchPayload,
+    DocPutPayload, DocUpdateIfMatchPayload, FindPayload, IndexDefPayload, QueryPayload,
+    UpdatePayload, WatchPayload, WireProjection, WATCH_OP_DELETE, WATCH_OP_UPSERT,
 };
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, KeyPayload, PutPayload, RequestEnvelope, PROTO_VERSION};
@@ -169,6 +169,7 @@ fn payload_vectors() -> Vec<Value> {
         fields: vec!["age".into()],
         unique: false,
         expire_after_seconds: 0,
+        directions: vec![true],
     };
     v.push(req(
         "index_def_single",
@@ -183,6 +184,7 @@ fn payload_vectors() -> Vec<Value> {
         fields: vec!["email".into(), "name".into()],
         unique: true,
         expire_after_seconds: 0,
+        directions: vec![true, true],
     };
     v.push(req(
         "index_def_unique_multi",
@@ -197,11 +199,27 @@ fn payload_vectors() -> Vec<Value> {
         fields: vec!["exp".into()],
         unique: false,
         expire_after_seconds: 3600,
+        directions: vec![true],
     };
     v.push(req(
         "index_def_ttl",
         "IndexDef",
         json!({"collection":"sess","index_name":"by_exp","fields":["exp"],"unique":false,"expire_after_seconds":3600}),
+        Command::IndexDef,
+        p.encode(),
+    ));
+    let p = IndexDefPayload {
+        collection: "events".into(),
+        index_name: "by_owner_ts".into(),
+        fields: vec!["ownerId".into(), "updatedAt".into()],
+        unique: false,
+        expire_after_seconds: 0,
+        directions: vec![true, false],
+    };
+    v.push(req(
+        "index_def_directional",
+        "IndexDef",
+        json!({"collection":"events","index_name":"by_owner_ts","fields":["ownerId","updatedAt"],"unique":false,"directions":[true,false]}),
         Command::IndexDef,
         p.encode(),
     ));
@@ -500,6 +518,70 @@ fn payload_vectors() -> Vec<Value> {
         p.encode(),
     ));
 
+    // ---- Watch ----
+    let p = WatchPayload {
+        collection: "users".into(),
+        resume_token: vec![],
+    };
+    v.push(req(
+        "watch_empty_resume",
+        "Watch",
+        json!({"collection":"users","resume_token_hex":""}),
+        Command::Watch,
+        p.encode(),
+    ));
+    let p = WatchPayload {
+        collection: "events".into(),
+        resume_token: vec![0xab, 0xcd, 0xef],
+    };
+    v.push(req(
+        "watch_with_resume",
+        "Watch",
+        json!({"collection":"events","resume_token_hex":"abcdef"}),
+        Command::Watch,
+        p.encode(),
+    ));
+
+    // ---- Aggregate ----
+    let pipeline = br#"[{"$match":{"active":true}},{"$group":{"_id":"$team","n":{"$count":{}}}}]"#;
+    let p = AggregatePayload {
+        collection: "sales".into(),
+        pipeline: pipeline.to_vec(),
+    };
+    v.push(req(
+        "aggregate_match_group",
+        "Aggregate",
+        json!({
+            "collection":"sales",
+            "pipeline_json":"[{\"$match\":{\"active\":true}},{\"$group\":{\"_id\":\"$team\",\"n\":{\"$count\":{}}}}]"
+        }),
+        Command::Aggregate,
+        p.encode(),
+    ));
+
+    // ---- Begin / Commit / Rollback (empty payloads) ----
+    v.push(req(
+        "begin_empty",
+        "Begin",
+        json!({}),
+        Command::Begin,
+        vec![],
+    ));
+    v.push(req(
+        "commit_empty",
+        "Commit",
+        json!({}),
+        Command::Commit,
+        vec![],
+    ));
+    v.push(req(
+        "rollback_empty",
+        "Rollback",
+        json!({}),
+        Command::Rollback,
+        vec![],
+    ));
+
     // ---- SessionInit / Ping (raw payloads on the envelope) ----
     v.push(req(
         "session_init",
@@ -596,16 +678,101 @@ fn response_vectors() -> Vec<Value> {
         "decoded": {"body_json":"{\"age\":30}","revision":7}
     }));
 
+    v.push(json!({
+        "name": "begin_response",
+        "kind": "BeginResponse",
+        "bytes_hex": hex(&wire::encode_begin_response(1, 42)),
+        "decoded": {"tx_id": 1, "snapshot_seq": 42}
+    }));
+
+    v.push(json!({
+        "name": "commit_response",
+        "kind": "CommitResponse",
+        "bytes_hex": hex(&wire::encode_commit_response(99)),
+        "decoded": {"seq": 99}
+    }));
+
+    v.push(json!({
+        "name": "stage_ack",
+        "kind": "StageAck",
+        "bytes_hex": hex(&wire::encode_stage_ack(3, 12)),
+        "decoded": {"logical_ops": 3, "estimated_keys": 12}
+    }));
+
+    let agg_rows = vec![
+        serde_json::json!({"_id":"a","n":1}),
+        serde_json::json!({"_id":"b","n":2}),
+    ];
+    v.push(json!({
+        "name": "aggregate_two_rows",
+        "kind": "AggregateResponse",
+        "bytes_hex": hex(&wire::encode_aggregate_response(&agg_rows, 4 * 1024 * 1024).unwrap()),
+        "decoded": {
+            "rows_json": [
+                "{\"_id\":\"a\",\"n\":1}",
+                "{\"_id\":\"b\",\"n\":2}"
+            ]
+        }
+    }));
+
+    let resume = b"\x01\x02\x03\x04".as_slice();
+    v.push(json!({
+        "name": "watch_frame_ack",
+        "kind": "WatchFrameAck",
+        "bytes_hex": hex(&wire::encode_watch_ack(resume)),
+        "decoded": {"resume_token_hex": hex(resume)}
+    }));
+    v.push(json!({
+        "name": "watch_frame_event_upsert",
+        "kind": "WatchFrameEvent",
+        "bytes_hex": hex(&wire::encode_watch_event(
+            resume,
+            WATCH_OP_UPSERT,
+            b"u1",
+            br#"{"_id":"u1","age":30}"#,
+        )),
+        "decoded": {
+            "resume_token_hex": hex(resume),
+            "op": "upsert",
+            "doc_id": "u1",
+            "body_json": "{\"_id\":\"u1\",\"age\":30}"
+        }
+    }));
+    v.push(json!({
+        "name": "watch_frame_event_delete",
+        "kind": "WatchFrameEvent",
+        "bytes_hex": hex(&wire::encode_watch_event(
+            resume,
+            WATCH_OP_DELETE,
+            b"u2",
+            &[],
+        )),
+        "decoded": {
+            "resume_token_hex": hex(resume),
+            "op": "delete",
+            "doc_id": "u2",
+            "body_json": ""
+        }
+    }));
+    v.push(json!({
+        "name": "watch_frame_heartbeat",
+        "kind": "WatchFrameHeartbeat",
+        "bytes_hex": hex(&wire::encode_watch_heartbeat(resume)),
+        "decoded": {"resume_token_hex": hex(resume)}
+    }));
+
     v
 }
 
 fn commands_map() -> Value {
-    // Implemented 0.9 opcodes (frozen). Reserved Begin/Commit/Rollback/SchemaDef
-    // are intentionally omitted from this map.
+    // Implemented 0.9 opcodes (frozen). SchemaDef remains reserved/omitted.
     json!({
         "Put": Command::Put.as_u8(),
         "Get": Command::Get.as_u8(),
         "Del": Command::Del.as_u8(),
+        "Begin": Command::Begin.as_u8(),
+        "Commit": Command::Commit.as_u8(),
+        "Rollback": Command::Rollback.as_u8(),
         "Query": Command::Query.as_u8(),
         "DocPut": Command::DocPut.as_u8(),
         "DocDel": Command::DocDel.as_u8(),
@@ -617,6 +784,8 @@ fn commands_map() -> Value {
         "FindRev": Command::FindRev.as_u8(),
         "DocPutIfMatch": Command::DocPutIfMatch.as_u8(),
         "DocUpdateIfMatch": Command::DocUpdateIfMatch.as_u8(),
+        "Aggregate": Command::Aggregate.as_u8(),
+        "Watch": Command::Watch.as_u8(),
         "IndexDef": Command::IndexDef.as_u8(),
         "SessionInit": Command::SessionInit.as_u8(),
         "SetContext": Command::SetContext.as_u8(),

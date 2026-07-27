@@ -266,3 +266,145 @@ fn space_amplification_drops_after_tombstone_gc() {
         "disk should shrink after tombstone GC"
     );
 }
+
+#[test]
+fn compaction_drops_expired_values_and_reclaims_space() {
+    use std::sync::Arc;
+    use zydecodb_engine::metrics::Metrics;
+
+    let dir = TempDir::new().unwrap();
+    let mut cfg = CompactionConfig::default();
+    cfg.l0_trigger = 2;
+    cfg.target_file_bytes = 512;
+    let metrics = Metrics::new();
+    let mut e = open(&dir, cfg).with_metrics(Arc::clone(&metrics));
+
+    // expires_at = 1 ms is in the past for any current wall clock.
+    for i in 0..20u32 {
+        e.put(uk(format!("k{i:02}").as_bytes()), vec![0u8; 128], 1)
+            .unwrap();
+    }
+    e.force_flush().unwrap();
+    e.drain_compaction().unwrap();
+    let before = e.estimate_disk_bytes();
+    for i in 0..20u32 {
+        assert!(e.get(&uk(format!("k{i:02}").as_bytes())).unwrap().is_none());
+    }
+
+    // Extra flush to ensure another compaction pass that can drop expired.
+    for i in 0..4u32 {
+        e.put(uk(format!("live{i}").as_bytes()), b"ok".to_vec(), 0)
+            .unwrap();
+    }
+    e.force_flush().unwrap();
+    e.drain_compaction().unwrap();
+
+    assert!(
+        metrics.compaction_expired_dropped_total.get() > 0,
+        "expected expired_dropped metric to increment"
+    );
+    for i in 0..20u32 {
+        assert!(e.get(&uk(format!("k{i:02}").as_bytes())).unwrap().is_none());
+    }
+    assert!(
+        e.estimate_disk_bytes() < before,
+        "disk should shrink after expired reclaim: before={before} after={}",
+        e.estimate_disk_bytes()
+    );
+}
+
+#[test]
+fn compaction_expired_drop_does_not_resurrect_older_version() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = CompactionConfig::default();
+    cfg.l0_trigger = 2;
+    cfg.target_file_bytes = 512;
+    let mut e = open(&dir, cfg);
+
+    let key = uk(b"k");
+    e.put(key.clone(), b"old-live".to_vec(), 0).unwrap();
+    e.force_flush().unwrap();
+    e.put(key.clone(), b"new-expired".to_vec(), 1).unwrap();
+    e.force_flush().unwrap();
+    e.drain_compaction().unwrap();
+
+    assert!(
+        e.get(&key).unwrap().is_none(),
+        "must not resurrect the older non-expired version after dropping expired newest"
+    );
+}
+
+#[test]
+fn compaction_drops_expired_under_live_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = CompactionConfig::default();
+    cfg.l0_trigger = 2;
+    cfg.target_file_bytes = 512;
+    let mut e = open(&dir, cfg);
+
+    for i in 0..16u32 {
+        e.put(uk(format!("k{i:02}").as_bytes()), vec![0u8; 64], 1)
+            .unwrap();
+    }
+    e.force_flush().unwrap();
+    let snap = e.snapshot_owned();
+    assert!(snap.get(&uk(b"k00")).unwrap().is_none());
+
+    for i in 0..4u32 {
+        e.put(uk(format!("x{i}").as_bytes()), b"v".to_vec(), 0)
+            .unwrap();
+    }
+    e.force_flush().unwrap();
+    e.drain_compaction().unwrap();
+
+    // Wall-clock TTL: snapshot still cannot see expired keys.
+    assert!(snap.get(&uk(b"k00")).unwrap().is_none());
+    drop(snap);
+}
+
+#[test]
+fn restart_then_compact_reclaims_expired_sst_entries() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("data");
+    let wal = dir.path().join("data/wal");
+    let mut cfg = CompactionConfig::default();
+    cfg.l0_trigger = 2;
+    cfg.target_file_bytes = 512;
+
+    {
+        let mut e = Engine::open(EngineConfig {
+            data_dir: data.clone(),
+            wal_dir: wal.clone(),
+            compaction: cfg,
+            ..Default::default()
+        })
+        .unwrap();
+        for i in 0..16u32 {
+            e.put(uk(format!("k{i:02}").as_bytes()), vec![0u8; 96], 1)
+                .unwrap();
+        }
+        e.force_flush().unwrap();
+        e.shutdown().unwrap();
+    }
+
+    let mut e = Engine::open(EngineConfig {
+        data_dir: data,
+        wal_dir: wal,
+        compaction: cfg,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(e.get(&uk(b"k00")).unwrap().is_none());
+    let before = e.estimate_disk_bytes();
+    for i in 0..4u32 {
+        e.put(uk(format!("keep{i}").as_bytes()), b"v".to_vec(), 0)
+            .unwrap();
+    }
+    e.force_flush().unwrap();
+    e.drain_compaction().unwrap();
+    assert!(
+        e.estimate_disk_bytes() <= before,
+        "expired SST entries should be reclaimable after restart+compact"
+    );
+    assert!(e.get(&uk(b"k00")).unwrap().is_none());
+}

@@ -54,6 +54,7 @@ def _encode_request(kind: str, inp: dict) -> bytes:
         return proto.encode_index_def(
             inp["collection"], inp["index_name"], inp["fields"], unique=inp["unique"],
             expire_after_seconds=inp.get("expire_after_seconds", 0),
+            directions=inp.get("directions"),
         )
     if kind == "QueryById":
         return proto.encode_query_by_id(inp["collection"], inp["doc_id"])
@@ -91,6 +92,8 @@ def _encode_request(kind: str, inp: dict) -> bytes:
             relaxed=inp["relaxed"],
             if_match=inp["if_match"],
         )
+    if kind in ("Begin", "Commit", "Rollback"):
+        return b""
     if kind == "Update":
         return proto.encode_update(
             inp["collection"], _json_field(inp["filter_json"]),
@@ -108,6 +111,14 @@ def _encode_request(kind: str, inp: dict) -> bytes:
         return proto.encode_distinct(
             inp["collection"], inp["field"], _json_field(inp["filter_json"])
         )
+    if kind == "Aggregate":
+        return proto.encode_aggregate(
+            inp["collection"], json.loads(inp["pipeline_json"])
+        )
+    if kind == "Watch":
+        token_hex = inp.get("resume_token_hex", "")
+        resume = bytes.fromhex(token_hex) if token_hex else b""
+        return proto.encode_watch(inp["collection"], resume)
     if kind == "SessionInit":
         return inp["api_key"].encode("utf-8")
     if kind == "Ping":
@@ -156,6 +167,53 @@ def test_response_decode_matches(vec):
         assert body.decode("utf-8") == vec["decoded"]["body_json"]
         assert rev == vec["decoded"]["revision"]
         return
+    if kind == "BeginResponse":
+        tx_id, snap = proto.decode_begin_response(bytes.fromhex(vec["bytes_hex"]))
+        assert tx_id == vec["decoded"]["tx_id"]
+        assert snap == vec["decoded"]["snapshot_seq"]
+        return
+    if kind == "CommitResponse":
+        seq = proto.decode_commit_response(bytes.fromhex(vec["bytes_hex"]))
+        assert seq == vec["decoded"]["seq"]
+        return
+    if kind == "StageAck":
+        ops, keys = proto.decode_stage_ack(bytes.fromhex(vec["bytes_hex"]))
+        assert ops == vec["decoded"]["logical_ops"]
+        assert keys == vec["decoded"]["estimated_keys"]
+        return
+    if kind == "AggregateResponse":
+        rows = proto.decode_aggregate_response(bytes.fromhex(vec["bytes_hex"]))
+        expected = vec["decoded"]["rows_json"]
+        assert len(rows) == len(expected), vec["name"]
+        for got, exp in zip(rows, expected):
+            assert got.decode("utf-8") == exp
+        return
+    if kind in ("WatchFrameAck", "WatchFrameHeartbeat"):
+        kind_name, token, op, doc_id, body = proto.decode_watch_frame(
+            bytes.fromhex(vec["bytes_hex"])
+        )
+        expected_kind = {
+            "WatchFrameAck": "ack",
+            "WatchFrameHeartbeat": "heartbeat",
+        }[kind]
+        assert kind_name == expected_kind, vec["name"]
+        assert token.hex() == vec["decoded"]["resume_token_hex"]
+        assert op is None and doc_id is None and body is None
+        return
+    if kind == "WatchFrameEvent":
+        kind_name, token, op, doc_id, body = proto.decode_watch_frame(
+            bytes.fromhex(vec["bytes_hex"])
+        )
+        assert kind_name == "event", vec["name"]
+        assert token.hex() == vec["decoded"]["resume_token_hex"]
+        expected_op = {
+            "upsert": proto.WATCH_OP_UPSERT,
+            "delete": proto.WATCH_OP_DELETE,
+        }[vec["decoded"]["op"]]
+        assert op == expected_op
+        assert doc_id.decode("utf-8") == vec["decoded"]["doc_id"]
+        assert (body or b"").decode("utf-8") == vec["decoded"]["body_json"]
+        return
     raise AssertionError(f"unhandled response kind: {kind}")
 
 
@@ -170,6 +228,11 @@ def test_command_codes_match_vectors():
     assert proto.CMD_FIND_REV == cmds["FindRev"]
     assert proto.CMD_DOC_PUT_IF_MATCH == cmds["DocPutIfMatch"]
     assert proto.CMD_DOC_UPDATE_IF_MATCH == cmds["DocUpdateIfMatch"]
+    assert proto.CMD_AGGREGATE == cmds["Aggregate"]
+    assert proto.CMD_WATCH == cmds["Watch"]
+    assert proto.CMD_BEGIN == cmds["Begin"]
+    assert proto.CMD_COMMIT == cmds["Commit"]
+    assert proto.CMD_ROLLBACK == cmds["Rollback"]
     assert proto.CMD_INDEX_DEF == cmds["IndexDef"]
     assert proto.CMD_SESSION_INIT == cmds["SessionInit"]
 

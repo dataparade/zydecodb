@@ -136,6 +136,25 @@ export class Connection {
     });
   }
 
+  /**
+   * Wait for the next server-pushed framed response without sending a request.
+   * Used by Watch streams after the subscription request is written.
+   */
+  waitResponse(timeoutMs?: number): Promise<Response> {
+    return new Promise<Response>((resolve, reject) => {
+      if (!this.socket || this.dead) {
+        reject(new ConnectionError("not connected"));
+        return;
+      }
+      const ms = timeoutMs ?? this.timeoutMs;
+      const timer = setTimeout(() => {
+        this.fail(new ConnectionError("wait timed out"));
+      }, ms);
+
+      this.inFlight.push({ resolve, reject, timer });
+    });
+  }
+
   private async pumpWrites(): Promise<void> {
     if (this.writing || !this.socket || this.dead) return;
     this.writing = true;

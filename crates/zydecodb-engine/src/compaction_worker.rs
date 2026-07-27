@@ -33,6 +33,8 @@ pub struct CompactionExecuteResult {
     pub bytes_written: u64,
     pub versions_dropped: u64,
     pub tombstones_dropped: u64,
+    /// Expired values (and older versions of those keys) dropped for TTL reclaim.
+    pub expired_dropped: u64,
     pub worker_elapsed: Duration,
 }
 
@@ -46,6 +48,8 @@ struct WorkItem {
     next_sstable_id: Arc<AtomicU64>,
     gc_watermark: u64,
     drop_tombstones: bool,
+    /// Wall-clock ms at job submit; used for TTL drop during merge.
+    now_ms: u64,
 }
 
 enum WorkerCommand {
@@ -149,6 +153,7 @@ impl CompactionScheduler {
         next_sstable_id: Arc<AtomicU64>,
         gc_watermark: u64,
         drop_tombstones: bool,
+        now_ms: u64,
     ) {
         let item = WorkItem {
             job,
@@ -160,6 +165,7 @@ impl CompactionScheduler {
             next_sstable_id,
             gc_watermark,
             drop_tombstones,
+            now_ms,
         };
         let mut pending = self.pending.lock().expect("compaction pending lock");
         let replace = match pending.as_ref() {
@@ -183,6 +189,7 @@ impl CompactionScheduler {
         next_sstable_id: Arc<AtomicU64>,
         gc_watermark: u64,
         drop_tombstones: bool,
+        now_ms: u64,
     ) -> bool {
         if self.worker_busy.load(Ordering::Acquire) {
             self.stage_if_busy(
@@ -195,6 +202,7 @@ impl CompactionScheduler {
                 next_sstable_id,
                 gc_watermark,
                 drop_tombstones,
+                now_ms,
             );
             return false;
         }
@@ -208,6 +216,7 @@ impl CompactionScheduler {
             next_sstable_id,
             gc_watermark,
             drop_tombstones,
+            now_ms,
         })
     }
 
@@ -280,6 +289,7 @@ fn compaction_worker_loop(
                         &item.next_sstable_id,
                         item.gc_watermark,
                         item.drop_tombstones,
+                        item.now_ms,
                     )
                     .map(|mut r| {
                         r.worker_elapsed = start.elapsed();
@@ -320,6 +330,7 @@ pub fn execute_compaction(
     next_sstable_id: &AtomicU64,
     gc_watermark: u64,
     drop_tombstones: bool,
+    now_ms: u64,
 ) -> EngineResult<CompactionExecuteResult> {
     let mut bytes_read = 0u64;
     let mut input_readers: Vec<Arc<SstableReader>> = Vec::new();
@@ -341,8 +352,10 @@ pub fn execute_compaction(
     let mut bytes_written = 0u64;
     let mut versions_dropped = 0u64;
     let mut tombstones_dropped = 0u64;
+    let mut expired_dropped = 0u64;
     let mut last_user_key: Option<Vec<u8>> = None;
     let mut kept_at_or_below_watermark = false;
+    let mut drop_rest_of_key = false;
 
     loop {
         let next = EntryIterator::next(&mut merger)?;
@@ -352,6 +365,7 @@ pub fn execute_compaction(
         };
         if at_key_boundary {
             kept_at_or_below_watermark = false;
+            drop_rest_of_key = false;
         }
         let flush_this_round = match &next {
             None => !pending.is_empty(),
@@ -373,7 +387,14 @@ pub fn execute_compaction(
         match next {
             None => break,
             Some((k, e)) => {
-                if should_drop_at_compaction(
+                let drop_reason = if drop_rest_of_key {
+                    Some(DropReason::Expired)
+                } else if e.is_expired(now_ms) && !e.is_tombstone() {
+                    // Newest version is expired: drop it and all older versions
+                    // of this key so compaction cannot resurrect a prior live value.
+                    drop_rest_of_key = true;
+                    Some(DropReason::Expired)
+                } else if should_drop_at_compaction(
                     &k,
                     &e,
                     gc_watermark,
@@ -381,9 +402,18 @@ pub fn execute_compaction(
                     drop_tombstones,
                 ) {
                     if e.is_tombstone() {
-                        tombstones_dropped += 1;
+                        Some(DropReason::Tombstone)
                     } else {
-                        versions_dropped += 1;
+                        Some(DropReason::Version)
+                    }
+                } else {
+                    None
+                };
+                if let Some(reason) = drop_reason {
+                    match reason {
+                        DropReason::Expired => expired_dropped += 1,
+                        DropReason::Tombstone => tombstones_dropped += 1,
+                        DropReason::Version => versions_dropped += 1,
                     }
                     last_user_key = Some(k.user_key.clone());
                     continue;
@@ -410,9 +440,16 @@ pub fn execute_compaction(
         bytes_written,
         versions_dropped,
         tombstones_dropped,
+        expired_dropped,
         worker_elapsed: Duration::ZERO,
     };
     Ok(result)
+}
+
+enum DropReason {
+    Expired,
+    Tombstone,
+    Version,
 }
 
 fn should_drop_at_compaction(

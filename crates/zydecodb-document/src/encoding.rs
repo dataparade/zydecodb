@@ -52,6 +52,33 @@ pub fn encode_fields(values: &[Value]) -> Vec<u8> {
     out
 }
 
+/// Ones-complement every byte of an ASC encoding. Because ASC encodings are
+/// prefix-free, this reverses lexicographic order while remaining prefix-free.
+fn invert_encoding(bytes: &[u8], out: &mut Vec<u8>) {
+    out.extend(bytes.iter().map(|b| !b));
+}
+
+/// Encode one JSON scalar for a descending index field.
+pub fn encode_value_desc(v: &Value, out: &mut Vec<u8>) {
+    let mut asc = Vec::new();
+    encode_value(v, &mut asc);
+    invert_encoding(&asc, out);
+}
+
+/// Encode `values` applying per-field direction (`true` = ascending).
+/// `directions` shorter than `values` defaults missing entries to ascending.
+pub fn encode_fields_with_directions(values: &[Value], directions: &[bool]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, v) in values.iter().enumerate() {
+        if directions.get(i).copied().unwrap_or(true) {
+            encode_value(v, &mut out);
+        } else {
+            encode_value_desc(v, &mut out);
+        }
+    }
+    out
+}
+
 /// Encode one ZDoc scalar into `out` without materializing a `serde_json::Value`.
 /// Missing paths (caller passes `None`) and non-scalars sort as null.
 pub fn encode_view(v: Option<&ValueView<'_>>, out: &mut Vec<u8>) {
@@ -85,11 +112,35 @@ pub fn encode_view(v: Option<&ValueView<'_>>, out: &mut Vec<u8>) {
 
 /// Encode dotted paths from a ZDoc root into one composite key fragment.
 pub fn encode_fields_from_view(root: &ValueView<'_>, fields: &[String]) -> Vec<u8> {
+    encode_fields_from_view_with_directions(root, fields, &[])
+}
+
+/// Like [`encode_fields_from_view`] with per-field ascending flags.
+pub fn encode_fields_from_view_with_directions(
+    root: &ValueView<'_>,
+    fields: &[String],
+    directions: &[bool],
+) -> Vec<u8> {
     let mut out = Vec::new();
-    for f in fields {
-        encode_view(root.get_path(f).as_ref(), &mut out);
+    for (i, f) in fields.iter().enumerate() {
+        let mut asc = Vec::new();
+        encode_view(root.get_path(f).as_ref(), &mut asc);
+        if directions.get(i).copied().unwrap_or(true) {
+            out.extend_from_slice(&asc);
+        } else {
+            invert_encoding(&asc, &mut out);
+        }
     }
     out
+}
+
+/// Encode one value with the given direction (for planner scan bounds).
+pub fn encode_value_directed(v: &Value, ascending: bool, out: &mut Vec<u8>) {
+    if ascending {
+        encode_value(v, out);
+    } else {
+        encode_value_desc(v, out);
+    }
 }
 
 /// Total order over JSON values matching index order (null < bool < number <
@@ -256,5 +307,75 @@ mod tests {
         assert_eq!(extract_path(&doc, "name"), json!("x"));
         assert_eq!(extract_path(&doc, "a.b.missing"), Value::Null);
         assert_eq!(extract_path(&doc, "a.b"), json!({"c": 7}));
+    }
+
+    fn enc_desc(v: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_value_desc(v, &mut out);
+        out
+    }
+
+    #[test]
+    fn desc_encoding_reverses_asc_order() {
+        let mut values = vec![
+            json!(null),
+            json!(false),
+            json!(true),
+            json!(-1),
+            json!(0),
+            json!(1),
+            json!(""),
+            json!("a"),
+            json!("ab"),
+            json!("b"),
+        ];
+        values.sort_by(|a, b| enc(a).cmp(&enc(b)));
+        for w in values.windows(2) {
+            if enc(&w[0]) == enc(&w[1]) {
+                assert_eq!(enc_desc(&w[0]), enc_desc(&w[1]));
+            } else {
+                assert_eq!(
+                    enc_desc(&w[0]).cmp(&enc_desc(&w[1])),
+                    Ordering::Greater,
+                    "desc should reverse {:?} vs {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn desc_encodings_are_prefix_free() {
+        let values = [
+            json!("a"),
+            json!("ab"),
+            json!(1),
+            json!(2),
+            json!(true),
+            json!(null),
+        ];
+        for (i, a) in values.iter().enumerate() {
+            for (j, b) in values.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let (ea, eb) = (enc_desc(a), enc_desc(b));
+                assert!(!eb.starts_with(&ea), "{:?} is a prefix of {:?}", a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_direction_composite_orders_second_field_desc() {
+        let dirs = [true, false];
+        let a = encode_fields_with_directions(&[json!("x"), json!(1)], &dirs);
+        let b = encode_fields_with_directions(&[json!("x"), json!(2)], &dirs);
+        let c = encode_fields_with_directions(&[json!("y"), json!(1)], &dirs);
+        assert!(
+            a > b,
+            "within owner, higher updatedAt encodes first when DESC"
+        );
+        assert!(a < c, "owner ASC still groups x before y");
     }
 }

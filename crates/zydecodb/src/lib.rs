@@ -9,5 +9,7 @@ pub mod replica;
 pub mod security;
 pub mod server;
 pub mod shared;
+pub mod transaction;
+pub mod watch;
 
 pub use shared::{SharedCatalog, SharedEngine};

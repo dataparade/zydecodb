@@ -50,12 +50,31 @@ fn define_index_ttl(
     fields: &[&str],
     expire_after_seconds: u64,
 ) {
+    define_index_directed(
+        s,
+        collection,
+        name,
+        fields,
+        &vec![true; fields.len()],
+        expire_after_seconds,
+    );
+}
+
+fn define_index_directed(
+    s: &mut TcpStream,
+    collection: &str,
+    name: &str,
+    fields: &[&str],
+    directions: &[bool],
+    expire_after_seconds: u64,
+) {
     let p = wire::IndexDefPayload {
         collection: collection.into(),
         index_name: name.into(),
         fields: fields.iter().map(|f| f.to_string()).collect(),
         unique: false,
         expire_after_seconds,
+        directions: directions.to_vec(),
     };
     let resp = roundtrip(s, &RequestEnvelope::new(Command::IndexDef, p.encode()));
     assert_eq!(resp.status, Status::Ok, "IndexDef failed");
@@ -172,6 +191,20 @@ fn distinct(s: &mut TcpStream, collection: &str, field: &str) -> Vec<serde_json:
         .as_array()
         .unwrap()
         .clone()
+}
+
+fn aggregate(s: &mut TcpStream, collection: &str, pipeline: &str) -> Vec<serde_json::Value> {
+    let p = wire::AggregatePayload {
+        collection: collection.into(),
+        pipeline: pipeline.as_bytes().to_vec(),
+    };
+    let resp = roundtrip(s, &RequestEnvelope::new(Command::Aggregate, p.encode()));
+    assert_eq!(resp.status, Status::Ok, "Aggregate failed: {:?}", resp);
+    wire::decode_aggregate_response(&resp.payload)
+        .unwrap()
+        .into_iter()
+        .map(|row| serde_json::from_slice(&row).unwrap())
+        .collect()
 }
 
 #[test]
@@ -387,6 +420,54 @@ fn find_update_delete_count_over_wire() {
     // Filtered delete.
     assert_eq!(delete(&mut s, "people", r#"{"age":{"$lt":35}}"#, true), 1); // Ada(30)
     assert_eq!(count(&mut s, "people", "{}"), 2);
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn aggregate_over_wire() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    doc_put(
+        &mut s,
+        "sales",
+        b"1",
+        r#"{"active":true,"team":"b","amount":2}"#,
+    );
+    doc_put(
+        &mut s,
+        "sales",
+        b"2",
+        r#"{"active":true,"team":"a","amount":3}"#,
+    );
+    doc_put(
+        &mut s,
+        "sales",
+        b"3",
+        r#"{"active":true,"team":"b","amount":1}"#,
+    );
+    doc_put(
+        &mut s,
+        "sales",
+        b"4",
+        r#"{"active":false,"team":"a","amount":100}"#,
+    );
+
+    let rows = aggregate(
+        &mut s,
+        "sales",
+        r#"[{"$match":{"active":true}},{"$group":{"_id":"$team","total":{"$sum":"$amount"},"n":{"$count":{}}}}]"#,
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["_id"], serde_json::json!("a"));
+    assert_eq!(rows[0]["total"], serde_json::json!(3));
+    assert_eq!(rows[0]["n"], serde_json::json!(1));
+    assert_eq!(rows[1]["_id"], serde_json::json!("b"));
+    assert_eq!(rows[1]["total"], serde_json::json!(3));
+    assert_eq!(rows[1]["n"], serde_json::json!(2));
 
     drop(s);
     *shutdown.lock().unwrap() = true;
@@ -758,6 +839,140 @@ fn optimistic_concurrency_if_match_over_wire() {
     let (rows, _) = wire::decode_query_page_with_revision(&find.payload).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].revision.unwrap() > new_rev);
+
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn filtered_positional_set_over_wire() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    doc_put(
+        &mut s,
+        "orders",
+        b"o1",
+        r#"{"status":"open","items":[{"skuId":"A","qty":1},{"skuId":"B","qty":2}]}"#,
+    );
+
+    let res = update(
+        &mut s,
+        "orders",
+        r#"{"_id":"o1"}"#,
+        r#"{"$set":{"items.$[skuId=B].qty":9}}"#,
+        false,
+    );
+    assert_eq!(res["matched"].as_u64().unwrap(), 1);
+    assert_eq!(res["modified"].as_u64().unwrap(), 1);
+
+    let docs = find(&mut s, "orders", r#"{"_id":"o1"}"#);
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["items"][1]["qty"], 9);
+    assert_eq!(docs[0]["items"][0]["qty"], 1);
+
+    // Zero matches → BadUpdate / client error status.
+    let bad = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(
+            Command::Update,
+            wire::UpdatePayload {
+                collection: "orders".into(),
+                filter: br#"{"_id":"o1"}"#.to_vec(),
+                update: br#"{"$set":{"items.$[skuId=Z].qty":1}}"#.to_vec(),
+                multi: false,
+                relaxed: false,
+                upsert: false,
+            }
+            .encode(),
+        ),
+    );
+    assert_ne!(bad.status, Status::Ok);
+
+    let get = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(
+            Command::DocGetRev,
+            wire::encode_doc_get_rev("orders", b"o1"),
+        ),
+    );
+    assert_eq!(get.status, Status::Ok);
+    let (_body, rev) = wire::decode_doc_get_rev_response(&get.payload).unwrap();
+
+    let upd = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(
+            Command::DocUpdateIfMatch,
+            wire::DocUpdateIfMatchPayload {
+                collection: "orders".into(),
+                doc_id: b"o1".to_vec(),
+                update: br#"{"$set":{"items.$[skuId=\"A\"].qty":3}}"#.to_vec(),
+                relaxed: false,
+                if_match: rev,
+            }
+            .encode(),
+        ),
+    );
+    assert_eq!(upd.status, Status::Ok);
+
+    let docs = find(&mut s, "orders", r#"{"_id":"o1"}"#);
+    assert_eq!(docs[0]["items"][0]["qty"], 3);
+
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn directional_index_streams_desc_sort_over_wire() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    define_index_directed(
+        &mut s,
+        "events",
+        "by_owner_ts",
+        &["ownerId", "updatedAt"],
+        &[true, false],
+        0,
+    );
+
+    for (id, owner, ts) in [
+        ("a", "u1", 1),
+        ("b", "u1", 3),
+        ("c", "u1", 2),
+        ("d", "u2", 9),
+    ] {
+        doc_put(
+            &mut s,
+            "events",
+            id.as_bytes(),
+            &format!(r#"{{"ownerId":"{owner}","updatedAt":{ts}}}"#),
+        );
+    }
+
+    let resp = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(
+            Command::Find,
+            wire::FindPayload {
+                collection: "events".into(),
+                filter: br#"{"ownerId":"u1"}"#.to_vec(),
+                sort: vec![("updatedAt".into(), false)],
+                projection: wire::WireProjection::None,
+                skip: 0,
+                limit: 10,
+                cursor: vec![],
+            }
+            .encode(),
+        ),
+    );
+    assert_eq!(resp.status, Status::Ok, "Find failed: {:?}", resp);
+    let (rows, _) = wire::decode_query_page(&resp.payload).unwrap();
+    let ids: Vec<_> = rows
+        .iter()
+        .map(|r| String::from_utf8(r.doc_id.clone()).unwrap())
+        .collect();
+    assert_eq!(ids, vec!["b", "c", "a"]);
 
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();

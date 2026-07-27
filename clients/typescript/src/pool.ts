@@ -104,12 +104,37 @@ export class ConnectionPool {
     }
   }
 
+  /**
+   * Check out a connection exclusively for a transaction. The connection is
+   * removed from the multiplex set until `releaseExclusive` / `discard`.
+   */
+  async acquireExclusive(): Promise<Connection> {
+    if (this.closed) throw new ConnectionError("pool is closed");
+    const conn = this.newConnection();
+    await conn.connect();
+    // Count against capacity but do not add to the round-robin set.
+    this.total += 1;
+    return conn;
+  }
+
+  /** Return an exclusive connection to the multiplex set (or discard if dead). */
+  releaseExclusive(conn: Connection): void {
+    if (this.closed || !conn.connected) {
+      this.discard(conn);
+      return;
+    }
+    this.connections.push(conn);
+  }
+
   /** Permanently drop a (presumed-broken) connection, freeing its slot. */
   discard(conn: Connection): void {
     conn.close();
     const idx = this.connections.indexOf(conn);
     if (idx >= 0) {
       this.connections.splice(idx, 1);
+      this.total -= 1;
+    } else if (this.total > 0) {
+      // Exclusive connection that was never in the multiplex set.
       this.total -= 1;
     }
   }

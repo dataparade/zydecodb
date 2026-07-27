@@ -39,9 +39,18 @@ pub enum MergeMode {
     Raw,
 }
 
-/// K-way merging iterator. Pulls from a fixed set of input iterators in
-/// `InternalKey` order via a min-heap; in [`MergeMode::Dedup`] mode it
-/// suppresses shadowed versions and tombstones.
+/// Forward = user_key ascending; Reverse = user_key descending. In both cases
+/// sources must present the newest visible version of each user key first
+/// within that key's group so [`MergeMode::Dedup`] can skip the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanDirection {
+    Forward,
+    Reverse,
+}
+
+/// K-way merging iterator. Pulls from a fixed set of input iterators via a
+/// heap; in [`MergeMode::Dedup`] mode it suppresses shadowed versions and
+/// tombstones.
 ///
 /// The lifetime `'a` lets sources borrow from owned engine state (memtables,
 /// SSTable readers). Use `'static` when every source is owned (e.g. tests,
@@ -50,15 +59,21 @@ pub struct MergingIterator<'a> {
     sources: Vec<Box<dyn EntryIterator + 'a>>,
     heap: BinaryHeap<HeapEntry>,
     mode: MergeMode,
+    direction: ScanDirection,
     /// In Dedup mode, the user_key of the most recently yielded entry. Used
     /// to suppress all later versions of the same key (lower seq).
     last_user_key: Option<Vec<u8>>,
 }
 
 impl<'a> MergingIterator<'a> {
-    pub fn new(
+    pub fn new(sources: Vec<Box<dyn EntryIterator + 'a>>, mode: MergeMode) -> EngineResult<Self> {
+        Self::new_directed(sources, mode, ScanDirection::Forward)
+    }
+
+    pub fn new_directed(
         mut sources: Vec<Box<dyn EntryIterator + 'a>>,
         mode: MergeMode,
+        direction: ScanDirection,
     ) -> EngineResult<Self> {
         let mut heap = BinaryHeap::with_capacity(sources.len());
         for (idx, src) in sources.iter_mut().enumerate() {
@@ -67,6 +82,7 @@ impl<'a> MergingIterator<'a> {
                     key: k,
                     entry: e,
                     source: idx,
+                    direction,
                 });
             }
         }
@@ -74,6 +90,7 @@ impl<'a> MergingIterator<'a> {
             sources,
             heap,
             mode,
+            direction,
             last_user_key: None,
         })
     }
@@ -91,6 +108,7 @@ impl<'a> EntryIterator for MergingIterator<'a> {
                     key: k,
                     entry: e,
                     source: top.source,
+                    direction: self.direction,
                 });
             }
 
@@ -115,9 +133,9 @@ impl<'a> EntryIterator for MergingIterator<'a> {
     }
 }
 
-/// Heap node. Ordered by `InternalKey` ASC (so the heap's "max" is the
-/// smallest key in InternalKey order — this is what `Reverse` would do, but
-/// we invert `Ord` instead so the BinaryHeap behaves as a min-heap directly).
+/// Heap node. Ordering depends on [`ScanDirection`]:
+/// - Forward: pop smallest `InternalKey` first (user_key ASC, seq DESC).
+/// - Reverse: pop highest user_key first, then highest seq (newest first).
 struct HeapEntry {
     key: InternalKey,
     entry: Entry,
@@ -126,6 +144,7 @@ struct HeapEntry {
     /// shouldn't in a well-formed LSM, but we order deterministically
     /// regardless).
     source: usize,
+    direction: ScanDirection,
 }
 
 impl PartialEq for HeapEntry {
@@ -143,12 +162,21 @@ impl PartialOrd for HeapEntry {
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap; we want the smallest InternalKey to pop
-        // first, so reverse the natural ordering.
-        other
-            .key
-            .cmp(&self.key)
-            .then_with(|| other.source.cmp(&self.source))
+        // BinaryHeap is a max-heap; invert so the "next" entry pops first.
+        match self.direction {
+            ScanDirection::Forward => other
+                .key
+                .cmp(&self.key)
+                .then_with(|| other.source.cmp(&self.source)),
+            ScanDirection::Reverse => {
+                // Prefer higher user_key, then higher seq.
+                let by_key = self.key.user_key.cmp(&other.key.user_key);
+                let by_seq = self.key.seq.cmp(&other.key.seq);
+                by_key
+                    .then(by_seq)
+                    .then_with(|| other.source.cmp(&self.source))
+            }
+        }
     }
 }
 
@@ -181,6 +209,40 @@ impl<'a> MemtableIter<'a> {
 impl<'a> EntryIterator for MemtableIter<'a> {
     fn next(&mut self) -> EngineResult<Option<(InternalKey, Entry)>> {
         Ok(self.inner.next().map(|(k, e)| (k.clone(), e.clone())))
+    }
+}
+
+/// Reverse memtable range iterator. Yields user keys descending; within each
+/// user key, emits the highest-seq version first (for Dedup).
+pub struct MemtableRevIter<'a> {
+    /// Remaining entries from the range, already ordered for reverse yield:
+    /// user_key DESC, seq DESC.
+    pending: std::vec::IntoIter<(InternalKey, Entry)>,
+    _mt: std::marker::PhantomData<&'a crate::memtable::Memtable>,
+}
+
+impl<'a> MemtableRevIter<'a> {
+    pub fn range(mt: &'a crate::memtable::Memtable, lo: &[u8], hi: &[u8]) -> MemtableRevIter<'a> {
+        let mut pairs: Vec<(InternalKey, Entry)> = mt
+            .range_internal(lo, hi)
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect();
+        // user_key DESC, seq DESC (newest first within a key).
+        pairs.sort_by(|a, b| {
+            b.0.user_key
+                .cmp(&a.0.user_key)
+                .then_with(|| b.0.seq.cmp(&a.0.seq))
+        });
+        MemtableRevIter {
+            pending: pairs.into_iter(),
+            _mt: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a> EntryIterator for MemtableRevIter<'a> {
+    fn next(&mut self) -> EngineResult<Option<(InternalKey, Entry)>> {
+        Ok(self.pending.next())
     }
 }
 

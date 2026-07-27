@@ -22,16 +22,36 @@ type Collection struct {
 // Name returns the collection name.
 func (c *Collection) Name() string { return c.name }
 
-// CreateIndex creates a secondary index over one or more dotted field paths.
-// It returns false if the index already existed. expireAfterSeconds marks a TTL
-// index (field = unix millis); 0 means not a TTL index.
+// IndexField is a dotted path plus ascending/descending direction for
+// CreateIndexFields. Ascending defaults to true when using CreateIndex.
+type IndexField struct {
+	Path      string
+	Ascending bool
+}
+
+// CreateIndex creates a secondary index over one or more dotted field paths
+// (all ascending). It returns false if the index already existed.
+// expireAfterSeconds marks a TTL index (field = unix millis); 0 means not TTL.
 func (c *Collection) CreateIndex(ctx context.Context, fields []string, unique bool, expireAfterSeconds uint64) (bool, error) {
+	specs := make([]IndexField, len(fields))
+	for i, f := range fields {
+		specs[i] = IndexField{Path: f, Ascending: true}
+	}
+	return c.CreateIndexFields(ctx, specs, unique, expireAfterSeconds)
+}
+
+// CreateIndexFields creates an index with per-field directions.
+func (c *Collection) CreateIndexFields(ctx context.Context, fields []IndexField, unique bool, expireAfterSeconds uint64) (bool, error) {
+	paths := make([]string, len(fields))
+	dirs := make([]bool, len(fields))
 	parts := make([]string, len(fields))
 	for i, f := range fields {
-		parts[i] = strings.ReplaceAll(f, ".", "_")
+		paths[i] = f.Path
+		dirs[i] = f.Ascending
+		parts[i] = strings.ReplaceAll(f.Path, ".", "_")
 	}
 	name := "by_" + strings.Join(parts, "_")
-	return c.client.DefineIndex(ctx, c.name, name, fields, unique, true, expireAfterSeconds)
+	return c.client.DefineIndexDirected(ctx, c.name, name, paths, dirs, unique, true, expireAfterSeconds)
 }
 
 // InsertOne inserts a document, generating "_id" if absent, and returns the id.
@@ -317,6 +337,15 @@ func (c *Collection) Distinct(ctx context.Context, field string, filter Document
 		return nil, err
 	}
 	return c.client.Distinct(ctx, c.name, field, fb)
+}
+
+// Aggregate runs a bounded aggregation pipeline and returns result documents.
+func (c *Collection) Aggregate(ctx context.Context, pipeline []any) ([]Document, error) {
+	pb, err := json.Marshal(pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("zydecodb: encode pipeline: %w", err)
+	}
+	return c.client.Aggregate(ctx, c.name, pb)
 }
 
 // marshalFilter serializes a filter, treating a nil/empty filter as "match all"

@@ -1,10 +1,12 @@
 use super::keys::KeyStore;
 use super::limits::TenantLimits;
 use super::ratelimit::AuthBurstLimiter;
-use crate::config::Config;
+use crate::config::{ChangeStreamsConfig, Config};
+use crate::watch::WatchRegistry;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use zydecodb_document::aggregation::AggregationLimits;
 
 #[derive(Clone)]
 pub struct SecurityRuntime {
@@ -26,6 +28,12 @@ pub struct SecurityRuntime {
     /// Max documents buffered per query for in-memory sorts / multi-write
     /// candidate sets (see `[security] max_sort_buffer`).
     pub max_sort_buffer: usize,
+    /// Aggregate resource budgets (see `[aggregation]`).
+    pub aggregation_limits: AggregationLimits,
+    /// Change-stream config (see `[change_streams]`).
+    pub change_streams: ChangeStreamsConfig,
+    /// Active change-stream subscription capacity.
+    pub watch_registry: Arc<WatchRegistry>,
     active_connections: Arc<AtomicUsize>,
 }
 
@@ -48,6 +56,14 @@ impl SecurityRuntime {
             auth_burst: Arc::new(AuthBurstLimiter::new(config.security.auth_burst_limit)),
             tenant_limits,
             max_sort_buffer: config.security.max_sort_buffer,
+            aggregation_limits: AggregationLimits {
+                max_scan_docs: config.aggregation.max_scan_docs,
+                max_groups: config.aggregation.max_groups,
+                max_memory_bytes: config.aggregation.max_memory_bytes,
+                max_result_bytes: config.aggregation.max_result_bytes,
+            },
+            change_streams: config.change_streams.clone(),
+            watch_registry: Arc::new(WatchRegistry::default()),
             active_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -84,6 +100,9 @@ impl Default for SecurityRuntime {
             auth_burst: Arc::new(AuthBurstLimiter::new(10)),
             tenant_limits: Arc::new(TenantLimits::default()),
             max_sort_buffer: 10_000,
+            aggregation_limits: AggregationLimits::default(),
+            change_streams: ChangeStreamsConfig::default(),
+            watch_registry: Arc::new(WatchRegistry::default()),
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
