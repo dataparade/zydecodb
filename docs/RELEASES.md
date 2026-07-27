@@ -22,10 +22,11 @@ Go modules in a subdirectory do not inherit root `v*` tags. Without
 
 | Server | Drivers | Wire |
 |--------|---------|------|
+| `0.11.x` | Python / npm / Go `0.11.x*` | `proto_version = 1` |
 | `0.10.x` | Python / npm / Go `0.10.x*` | `proto_version = 1` |
 | `0.9.x` | Python / npm / Go `0.9.x*` | `proto_version = 1` |
 
-- Drivers tagged `v0.10.x` target server `0.10.x` with the frozen wire
+- Drivers tagged `v0.11.x` target server `0.11.x` with the frozen wire
   (see [`DOCUMENT_STORE.md`](DOCUMENT_STORE.md#wire-protocol)).
 - Applications should pin an explicit driver version, not `@latest`, until the
   release train is routine.
@@ -42,7 +43,7 @@ Bump versions in `Cargo.toml`, `clients/python/pyproject.toml`, and
 tags at that commit and push them together:
 
 ```bash
-ver=0.10.0   # or 0.10.0-beta.1
+ver=0.11.0   # or 0.11.0-beta.1
 git tag "v${ver}"
 git tag "clients/go/v${ver}" "$(git rev-parse "v${ver}^{commit}")"
 git push origin "v${ver}" "clients/go/v${ver}"
@@ -63,13 +64,32 @@ The release workflow then:
 
 ```bash
 # Go — pin the module version (not @latest)
-go get github.com/dataparade/zydecodb/clients/go@v0.10.0
+go get github.com/dataparade/zydecodb/clients/go@v0.11.0
 
 # Python
-pip install zydecodb==0.10.0
+pip install zydecodb==0.11.0
 
 # TypeScript
-npm install zydecodb@0.10.0
+npm install zydecodb@0.11.0
 ```
 
-Keep the server binary and drivers on the same `0.10.x` minor line.
+Keep the server binary and drivers on the same `0.11.x` minor line.
+
+## Updating the server binary
+
+After the first install (`scripts/install.sh` or a release tarball), upgrade the
+**server binary only** with:
+
+```bash
+zydecodb update --check    # print current vs available; exit 1 if newer exists
+zydecodb update            # download, sha256-verify, replace this binary
+zydecodb update --yes      # non-interactive
+zydecodb update --version v0.11.0
+zydecodb update --force    # reinstall same version, or allow a major jump
+```
+
+`update` uses the same GitHub Release assets as `install.sh`
+(`zydecodb-${tag}-${target}.tar.gz` + `.sha256`). It does **not** update data
+directories, config, or language drivers (still pip / npm / `go get`). Restart
+any running `zydecodb serve` after a successful update — the old process keeps
+the previous inode until it exits.

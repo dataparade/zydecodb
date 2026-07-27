@@ -47,7 +47,9 @@ fn named_base_config(dir: &TempDir, name: &str, listen: SocketAddr) -> Config {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    }
+    aggregation: Default::default(),
+        change_streams: Default::default(),
+        }
 }
 
 fn put_frame(key: &[u8], value: &[u8]) -> Vec<u8> {

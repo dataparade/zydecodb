@@ -36,7 +36,9 @@ fn base_config(tmp: &TempDir, port: u16, is_replica: bool) -> Config {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    };
+    aggregation: Default::default(),
+        change_streams: Default::default(),
+        };
 
     if is_replica {
         config.replica = ReplicaConfig {

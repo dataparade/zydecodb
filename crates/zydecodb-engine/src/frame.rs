@@ -19,7 +19,7 @@ pub const PROTO_VERSION: u8 = 0x01;
 pub const ENVELOPE_HEADER_LEN: usize = 6;
 
 /// Command codes for the 0.9 wire. Implemented opcodes and this numbering are
-/// frozen for 0.10.x; reserved slots may gain semantics later without renumbering.
+/// frozen for 0.11.x; reserved slots may gain semantics later without renumbering.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {

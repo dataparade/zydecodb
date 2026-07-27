@@ -29,7 +29,7 @@ from .errors import (
 )
 from .transaction import Transaction, UnknownCommitError
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 __all__ = [
     "Client",

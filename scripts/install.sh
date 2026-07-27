@@ -13,6 +13,9 @@
 #   ZYDECODB_INSTALL_DIR  — target directory. Default: /usr/local/bin if
 #                           writable, otherwise ~/.local/bin.
 #
+# Asset naming MUST stay in sync with crates/zydecodb/src/self_update.rs
+# (`zydecodb update` uses the same tag/target/.tar.gz/.sha256 contract).
+#
 # ZydecoDB is Unix-only (Linux and macOS, x86_64 and arm64).
 # ==============================================================================
 
@@ -122,10 +125,11 @@ esac
 say ""
 say "Get started:"
 say "  zydecodb serve                # starts on 127.0.0.1:9470, data in ~/.zydecodb"
+say "  zydecodb update               # later: upgrade this binary from GitHub Releases"
 say ""
 say "Then, in another terminal, grab a driver:"
 say "  pip install zydecodb          # Python"
 say "  npm install zydecodb          # TypeScript/Node"
-say "  go get github.com/${REPO}/clients/go@v0.10.0   # Go (pin a release tag)"
+say "  go get github.com/${REPO}/clients/go@v0.11.0   # Go (pin a release tag)"
 say ""
 say "Docs: https://github.com/${REPO}#readme"

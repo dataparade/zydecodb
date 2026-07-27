@@ -41,7 +41,9 @@ fn rate_limit_returns_engine_busy() {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    };
+    aggregation: Default::default(),
+        change_streams: Default::default(),
+        };
 
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();

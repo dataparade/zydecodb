@@ -1,6 +1,6 @@
 {
   "name": "zydecodb",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Official TypeScript/Node driver for ZydecoDB.",
   "license": "MIT",
   "author": "Dataparade",

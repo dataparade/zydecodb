@@ -53,7 +53,9 @@ fn auth_required_rejects_anonymous_put() {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    };
+    aggregation: Default::default(),
+        change_streams: Default::default(),
+        };
 
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
@@ -135,7 +137,9 @@ fn read_only_key_cannot_put() {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    };
+    aggregation: Default::default(),
+        change_streams: Default::default(),
+        };
 
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
@@ -218,7 +222,9 @@ fn tenant_isolation() {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    };
+    aggregation: Default::default(),
+        change_streams: Default::default(),
+        };
 
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
@@ -290,7 +296,9 @@ fn prefix_acl_denies_out_of_scope_keys() {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    };
+    aggregation: Default::default(),
+        change_streams: Default::default(),
+        };
 
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();
@@ -370,7 +378,9 @@ fn prefix_acl_applies_to_document_collections() {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    };
+    aggregation: Default::default(),
+        change_streams: Default::default(),
+        };
 
     let server = zydecodb::server::Server::new();
     let shutdown = server.shutdown_flag();

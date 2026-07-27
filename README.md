@@ -15,6 +15,9 @@ Two layers, one engine:
 # 1. Install the prebuilt binary (Linux/macOS, x86_64/arm64)
 curl -sSL https://zydecodb.com/install.sh | sh
 
+# Later: upgrade the server binary in place (drivers stay on pip/npm/go get)
+# zydecodb update
+
 # 2. Start the server — no config needed for local use
 zydecodb serve          # listens on 127.0.0.1:9470, data in ~/.zydecodb
 ```
@@ -127,7 +130,7 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 **Multi-tenant sharing model (read this):** tenants get **namespace isolation** (key prefix, ACLs, byte/RPS quotas, drop-tenant). Write/catalog mutations still serialize on the engine write lock; block cache, fair-share accounting, and WAL fsync are separate domains. δ-fair memtable/cache/stall isolation is **off by default** for local/single-tenant; pods hosts should start from [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) (`[fair] enabled = true`) and follow the one-page runbook [`docs/PODS.md`](docs/PODS.md). Until fair is on and soak-proven, do not assume one tenant’s write storm cannot affect another’s latency. See [`docs/SECURITY.md`](docs/SECURITY.md#multi-tenant-sharing-model).
 
-## 0.10 scope
+## 0.11 scope
 
 **Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). Filters, sort, projection, pagination, partial updates, `count`/`distinct`, bounded `$match`→`$group` aggregation, optional primary-only change streams, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits. See [`docs/AGGREGATION.md`](docs/AGGREGATION.md) and [`docs/CHANGE_STREAMS.md`](docs/CHANGE_STREAMS.md).
 
@@ -135,7 +138,7 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 ## Expectations, gotchas, advice
 
-- **0.10.0**. Implemented opcodes, write flags, and status bytes are **frozen for 0.10.x** (append-only on `proto_version = 1`; see [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md#wire-protocol)). Reserved opcodes and listed Not-yet features may gain semantics without renumbering. On-disk format changes follow [`docs/UPGRADE.md`](docs/UPGRADE.md).
+- **0.11.0**. Implemented opcodes, write flags, and status bytes are **frozen for 0.11.x** (append-only on `proto_version = 1`; see [`docs/DOCUMENT_STORE.md`](docs/DOCUMENT_STORE.md#wire-protocol)). Reserved opcodes and listed Not-yet features may gain semantics without renumbering. On-disk format changes follow [`docs/UPGRADE.md`](docs/UPGRADE.md).
 - **BSL license.** Self-hosting (including in production) is free; you may not offer ZydecoDB to third parties as a competing hosted/managed service. Converts to Apache 2.0 on the change date — see [LICENSE](LICENSE).
 - **Security:** run behind your API on localhost or a private network. See [`docs/SECURITY.md`](docs/SECURITY.md). Do not expose `:9470` to the internet without auth.
 - **Keys on the wire** are opaque bytes; the server stores them under the user keyspace (`KS_USER` prefix).

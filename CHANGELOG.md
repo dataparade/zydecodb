@@ -6,6 +6,19 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-27
+
+### Server
+
+- `zydecodb update`: in-process self-update from GitHub Releases using the same
+  asset contract as `scripts/install.sh` (sha256-verified tarball, atomic
+  replace). Flags: `--check`, `--version`, `--force`, `--yes`. Binary only —
+  does not update drivers or data dirs. See `docs/RELEASES.md`.
+
+### Compatibility
+
+- Requires server `0.11.x`, wire `proto_version = 1` (append-only opcodes)
+
 ## [0.10.0] - 2026-07-27
 
 ### Server

@@ -238,7 +238,7 @@ indexer.
 **0.9 freeze:** implemented opcodes above, write flags (`FLAG_RELAXED=0x01`,
 `FLAG_UPSERT=0x02`; unused flag bits must be zero), and status bytes in
 `zydecodb-engine::errors` (including `PolicyRejected` / `UnsupportedFormat`) are
-**frozen for 0.10.x** — append-only, no renumbering. Reserved slots and the
+**frozen for 0.11.x** — append-only, no renumbering. Reserved slots and the
 Not-yet list may gain semantics later without changing existing codes. On-disk
 format upgrades follow [`UPGRADE.md`](UPGRADE.md). Official drivers expose DocPut
 `expires_at` and IndexDef `expire_after_seconds` (TTL indexes); other admin

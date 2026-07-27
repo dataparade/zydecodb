@@ -7,6 +7,7 @@ pub mod docdispatch;
 pub mod metrics_http;
 pub mod replica;
 pub mod security;
+pub mod self_update;
 pub mod server;
 pub mod shared;
 pub mod transaction;

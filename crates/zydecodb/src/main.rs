@@ -29,6 +29,22 @@ enum Commands {
     },
     /// Print build version.
     Version,
+    /// Download and install a newer `zydecodb` binary from GitHub Releases
+    /// (same assets as `scripts/install.sh`). Does not update drivers or data.
+    Update {
+        /// Report current vs available; exit 1 if an update is available.
+        #[arg(long)]
+        check: bool,
+        /// Install this release tag (e.g. v0.10.0).
+        #[arg(long)]
+        version: Option<String>,
+        /// Reinstall even if the version matches; also allows major jumps.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Administrative commands.
     Admin {
         #[command(subcommand)]
@@ -279,6 +295,25 @@ fn main() {
         Commands::Version => {
             println!("zydecodb {}", env!("CARGO_PKG_VERSION"));
             Ok(())
+        }
+        Commands::Update {
+            check,
+            version,
+            force,
+            yes,
+        } => {
+            use zydecodb::self_update::{run, UpdateOptions, UpdateOutcome};
+            match run(UpdateOptions {
+                check,
+                version,
+                force,
+                yes,
+                ..Default::default()
+            }) {
+                Ok(UpdateOutcome::CheckUpdateAvailable) => std::process::exit(1),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
         }
         Commands::Admin { command } => match command {
             AdminCommands::Keys { command } => match command {
