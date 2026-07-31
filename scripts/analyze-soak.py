@@ -65,24 +65,42 @@ TODO_RSS_BYTES_STABILITY_CEILING: int | None = None
 # Headroom beyond configured caches when deriving RSS from soak header (MB).
 # 128 MB memtable + 128 MB engine/WAL/allocator (MEMO6: metadata via reader cap).
 DEFAULT_RSS_HEADROOM_MB = 256
-# Estimated pinned index+bloom per open reader (MB), for derived RSS ceiling.
+# Estimated pinned index+bloom per open reader (MB), for derived RSS ceiling
+# when the run's live sstable count is unknown.
 DEFAULT_PER_READER_METADATA_MB = 1.5
+# Pinned index+bloom+footer per live sstable (MB). The reader-cap estimate
+# undercounts badly at 20+ live 64MB files (~11MB observed per file in the
+# memo5 24h), so when samples are available the metadata term scales with
+# observed live sstables instead of the open-reader cap.
+DEFAULT_PER_SSTABLE_METADATA_MB = 12.0
 
 # ---------------------------------------------------------------------------
 
 
-def derived_rss_ceiling(header: dict) -> int | None:
-    """RSS stability ceiling from soak header cache budgets + headroom (MEMO6)."""
+def derived_rss_ceiling(header: dict, max_live_sstables: int | None = None) -> int | None:
+    """RSS stability ceiling from soak header cache budgets + headroom (MEMO6).
+
+    Reader metadata scales with observed live sstable count when provided —
+    leaks still trip the gate, legitimate topology growth does not.
+    """
     block_mb = header.get("block_cache_mb")
     if block_mb is None:
         return None
     result_mb = header.get("result_cache_mb", 0)
-    max_readers = int(header.get("max_open_readers", 128))
-    per_reader_mb = float(
-        os.environ.get("SOAK_PER_READER_METADATA_MB", DEFAULT_PER_READER_METADATA_MB)
-    )
     headroom_mb = int(os.environ.get("SOAK_RSS_HEADROOM_MB", DEFAULT_RSS_HEADROOM_MB))
-    metadata_mb = max_readers * per_reader_mb
+    if max_live_sstables is not None:
+        per_file_mb = float(
+            os.environ.get(
+                "SOAK_PER_SSTABLE_METADATA_MB", DEFAULT_PER_SSTABLE_METADATA_MB
+            )
+        )
+        metadata_mb = max_live_sstables * per_file_mb
+    else:
+        max_readers = int(header.get("max_open_readers", 128))
+        per_reader_mb = float(
+            os.environ.get("SOAK_PER_READER_METADATA_MB", DEFAULT_PER_READER_METADATA_MB)
+        )
+        metadata_mb = max_readers * per_reader_mb
     return int((int(block_mb) + int(result_mb) + metadata_mb + headroom_mb) * 1024 * 1024)
 
 
@@ -380,26 +398,27 @@ def report(
             TODO_ERRORS_TOTAL_CEILING,
         )
     if steady and run_stability:
+        max_live_ssts = max(s.live_sstable_count for s in steady)
         rss_ceiling = (
-            derived_rss_ceiling(header)
+            derived_rss_ceiling(header, max_live_ssts)
             or TODO_RSS_BYTES_STABILITY_CEILING
             or TODO_RSS_BYTES_CEILING
         )
-        if rss_ceiling is not None and derived_rss_ceiling(header) is not None:
+        if rss_ceiling is not None and derived_rss_ceiling(header, max_live_ssts) is not None:
             headroom_mb = int(
                 os.environ.get("SOAK_RSS_HEADROOM_MB", DEFAULT_RSS_HEADROOM_MB)
             )
-            max_readers = int(header.get("max_open_readers", 128))
-            per_reader_mb = float(
+            per_file_mb = float(
                 os.environ.get(
-                    "SOAK_PER_READER_METADATA_MB", DEFAULT_PER_READER_METADATA_MB
+                    "SOAK_PER_SSTABLE_METADATA_MB", DEFAULT_PER_SSTABLE_METADATA_MB
                 )
             )
-            metadata_mb = int(max_readers * per_reader_mb)
+            metadata_mb = int(max_live_ssts * per_file_mb)
             print(
                 f"  RSS ceiling (derived): "
                 f"{rss_ceiling // (1024 * 1024)} MB "
-                f"(caches + {metadata_mb} MB reader metadata + {headroom_mb} MB headroom)"
+                f"(caches + {metadata_mb} MB sstable metadata "
+                f"({max_live_ssts} live files) + {headroom_mb} MB headroom)"
             )
         check(
             "RSS max (bytes)",
