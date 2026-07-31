@@ -28,6 +28,24 @@ git -C "$REPO_ROOT" worktree add --detach "$WT" "$COMMIT" >/dev/null
 cleanup() { git -C "$REPO_ROOT" worktree remove --force "$WT" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# Early commits predate some workspace members (e.g. 6006bf6 lists
+# zydecodb-document before it existed). Trim missing members so cargo can
+# resolve the workspace; build-only tweak, engine sources untouched.
+python3 - "$WT" <<'PY'
+import re, sys, pathlib
+wt = pathlib.Path(sys.argv[1])
+root = wt / "Cargo.toml"
+text = root.read_text()
+m = re.search(r'members = \[(.*?)\]', text, re.S)
+if m:
+    members = re.findall(r'"([^"]+)"', m.group(1))
+    keep = [p for p in members if (wt / p / "Cargo.toml").exists()]
+    if len(keep) != len(members):
+        new = "members = [" + ", ".join(f'"{p}"' for p in keep) + "]"
+        root.write_text(text[:m.start()] + new + text[m.end():])
+        print(f"trimmed missing workspace members: {sorted(set(members) - set(keep))}")
+PY
+
 export CARGO_TARGET_DIR="$WT/target"
 echo "== building engine-soak (release) at $SHORT ..."
 ( cd "$WT" && cargo build --release -p zydecodb-engine --bin engine-soak ) >"$OUT_DIR/build.log" 2>&1 || {
