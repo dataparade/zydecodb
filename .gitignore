@@ -77,6 +77,7 @@ tls.key
 !/scripts/crash-soak.sh
 !/scripts/ref-workloads.sh
 !/scripts/bench-regression.sh
+!/scripts/bisect-amp.sh
 
 # Internal / Archived Docs
 /ROADMAP.md
