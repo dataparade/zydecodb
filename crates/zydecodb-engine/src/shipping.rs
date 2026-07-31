@@ -22,8 +22,16 @@
 
 use crate::errors::{EngineError, EngineResult};
 use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+
+fn fsync_dir(dir: &Path) -> EngineResult<()> {
+    let f = File::open(dir).map_err(|e| EngineError::Io(format!("open ship_dir: {e}")))?;
+    f.sync_all()
+        .map_err(|e| EngineError::Io(format!("fsync ship_dir: {e}")))?;
+    Ok(())
+}
 
 /// How a sealed segment reaches `ship_dir`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +81,7 @@ pub fn write_heartbeat(ship_dir: &Path, unix_millis: u64, last_seal_seq: u64) ->
         f.sync_all()?;
     }
     std::fs::rename(&tmp, &dst).map_err(|e| EngineError::Io(format!("heartbeat rename: {}", e)))?;
+    fsync_dir(ship_dir)?;
     Ok(())
 }
 
@@ -93,6 +102,11 @@ pub fn append_timeindex(ship_dir: &Path, unix_millis: u64, seq: u64) -> EngineRe
         .open(&path)?;
     writeln!(f, "{} {}", unix_millis, seq)
         .map_err(|e| EngineError::Io(format!("timeindex write: {}", e)))?;
+    // Durable immediately: a PITR restore resolves its replay ceiling from
+    // this index, so a lost sample silently shifts the restore point.
+    f.sync_all()
+        .map_err(|e| EngineError::Io(format!("timeindex fsync: {}", e)))?;
+    fsync_dir(ship_dir)?;
     Ok(())
 }
 
@@ -151,7 +165,12 @@ pub fn read_heartbeat(dir: &Path) -> EngineResult<Option<Heartbeat>> {
 }
 
 /// Ship one sealed segment into `ship_dir` and append a `shipped.log` entry.
-/// Idempotent on the destination file name (overwrites a same-named stale ship).
+/// Idempotent on the destination file name (overwrites a same-named stale ship)
+/// AND on the log: if the tail already records this exact segment (same id,
+/// seal seq, and sha256) no second line is appended — `read_shipped_log`
+/// rejects duplicate ids, so a blind re-append would poison the whole stream
+/// for replicas and restores. A same-id entry with DIFFERENT content is a hard
+/// error (the sealed bytes can never legitimately change).
 /// With `hmac_key`, the log line carries an HMAC authenticating the entry.
 pub fn ship_segment(
     src: &Path,
@@ -161,6 +180,7 @@ pub fn ship_segment(
     mode: ShipMode,
     hmac_key: Option<&[u8]>,
 ) -> EngineResult<()> {
+    crate::failpoints::failpoint_result(crate::failpoints::SHIP_BEFORE_SEGMENT)?;
     std::fs::create_dir_all(ship_dir)?;
     let file_name = src
         .file_name()
@@ -192,8 +212,30 @@ pub fn ship_segment(
             std::fs::write(&dst, &bytes)?;
         }
     }
+    // Durable segment bytes before recording the log entry.
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dst)
+            .map_err(|e| EngineError::Io(format!("open shipped segment: {e}")))?;
+        f.sync_all()
+            .map_err(|e| EngineError::Io(format!("fsync shipped segment: {e}")))?;
+    }
+    fsync_dir(ship_dir)?;
+    crate::failpoints::failpoint_result(crate::failpoints::SHIP_AFTER_SEGMENT)?;
 
     let hmac_hex = hmac_key.map(|k| entry_hmac_hex(k, segment_id, seal_seq, &hex));
+    if let Some(last) = read_shipped_log(ship_dir)?.last() {
+        if last.segment_id == segment_id {
+            if last.seal_seq == seal_seq && last.sha256_hex == hex && last.hmac_hex == hmac_hex {
+                return Ok(()); // already recorded; nothing to append
+            }
+            return Err(EngineError::Io(format!(
+                "ship: segment {segment_id} already recorded in shipped.log with \
+                 different content (sealed WAL bytes are immutable)"
+            )));
+        }
+    }
     append_shipped_log(ship_dir, segment_id, seal_seq, &hex, hmac_hex.as_deref())?;
     Ok(())
 }
@@ -205,6 +247,7 @@ fn append_shipped_log(
     sha256_hex: &str,
     hmac_hex: Option<&str>,
 ) -> EngineResult<()> {
+    crate::failpoints::failpoint_result(crate::failpoints::SHIP_BEFORE_LOG_APPEND)?;
     let log_path = ship_dir.join(SHIPPED_LOG);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -216,6 +259,8 @@ fn append_shipped_log(
     }
     .map_err(|e| EngineError::Io(format!("shipped.log write: {}", e)))?;
     f.sync_all()?;
+    fsync_dir(ship_dir)?;
+    crate::failpoints::failpoint_result(crate::failpoints::SHIP_AFTER_LOG_APPEND)?;
     Ok(())
 }
 
@@ -230,8 +275,15 @@ pub struct ShippedEntry {
 }
 
 /// Read and parse `shipped.log` from a ship directory, in append order.
-/// A missing log is treated as "nothing shipped yet" (empty list). Malformed
-/// lines are rejected so a corrupt manifest cannot silently skip data.
+/// A missing log is treated as "nothing shipped yet" (empty list).
+///
+/// Tolerance rules for an append-only log written with fsync:
+/// - a malformed FINAL non-empty line is a torn tail (crash mid-append) and
+///   is ignored, the same rule WAL segments apply;
+/// - an adjacent exact duplicate line (a double append from before
+///   `ship_segment` became idempotent) is skipped;
+/// - any other malformed line, or a duplicate id with different content, is
+///   rejected so a corrupt manifest cannot silently skip data.
 pub fn read_shipped_log(ship_dir: &Path) -> EngineResult<Vec<ShippedEntry>> {
     let log_path = ship_dir.join(SHIPPED_LOG);
     let text = match std::fs::read_to_string(&log_path) {
@@ -239,62 +291,80 @@ pub fn read_shipped_log(ship_dir: &Path) -> EngineResult<Vec<ShippedEntry>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(EngineError::Io(format!("read shipped.log: {}", e))),
     };
+    let lines: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.trim()))
+        .filter(|(_, l)| !l.is_empty())
+        .collect();
     let mut out: Vec<ShippedEntry> = Vec::new();
-    for (lineno, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() != 3 && parts.len() != 4 {
-            return Err(EngineError::Io(format!(
-                "shipped.log line {}: expected '<id> <seq> <sha256> [<hmac>]'",
-                lineno + 1
-            )));
-        }
-        let segment_id = parts[0]
-            .parse::<u64>()
-            .map_err(|_| EngineError::Io(format!("shipped.log line {}: bad id", lineno + 1)))?;
-        let seal_seq = parts[1]
-            .parse::<u64>()
-            .map_err(|_| EngineError::Io(format!("shipped.log line {}: bad seq", lineno + 1)))?;
-        let sha256_hex = parts[2].to_ascii_lowercase();
-        if sha256_hex.len() != 64 || !sha256_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(EngineError::Io(format!(
-                "shipped.log line {}: bad sha256",
-                lineno + 1
-            )));
-        }
-        let hmac_hex = if parts.len() == 4 {
-            let mac = parts[3].to_ascii_lowercase();
-            if mac.len() != 64 || !mac.bytes().all(|b| b.is_ascii_hexdigit()) {
+    for (idx, (lineno, line)) in lines.iter().enumerate() {
+        let lineno = *lineno;
+        let is_last_line = idx + 1 == lines.len();
+        let parsed = (|| -> EngineResult<ShippedEntry> {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() != 3 && parts.len() != 4 {
                 return Err(EngineError::Io(format!(
-                    "shipped.log line {}: bad hmac",
-                    lineno + 1
+                    "shipped.log line {}: expected '<id> <seq> <sha256> [<hmac>]'",
+                    lineno
                 )));
             }
-            Some(mac)
-        } else {
-            None
+            let segment_id = parts[0]
+                .parse::<u64>()
+                .map_err(|_| EngineError::Io(format!("shipped.log line {}: bad id", lineno)))?;
+            let seal_seq = parts[1]
+                .parse::<u64>()
+                .map_err(|_| EngineError::Io(format!("shipped.log line {}: bad seq", lineno)))?;
+            let sha256_hex = parts[2].to_ascii_lowercase();
+            if sha256_hex.len() != 64 || !sha256_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(EngineError::Io(format!(
+                    "shipped.log line {}: bad sha256",
+                    lineno
+                )));
+            }
+            let hmac_hex = if parts.len() == 4 {
+                let mac = parts[3].to_ascii_lowercase();
+                if mac.len() != 64 || !mac.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(EngineError::Io(format!(
+                        "shipped.log line {}: bad hmac",
+                        lineno
+                    )));
+                }
+                Some(mac)
+            } else {
+                None
+            };
+            Ok(ShippedEntry {
+                segment_id,
+                seal_seq,
+                sha256_hex,
+                hmac_hex,
+            })
+        })();
+        let entry = match parsed {
+            Ok(e) => e,
+            Err(e) if is_last_line => {
+                tracing::warn!(error = %e, "ignoring torn final line of shipped.log");
+                break;
+            }
+            Err(e) => return Err(e),
         };
 
         if let Some(last) = out.last() {
-            if segment_id <= last.segment_id {
+            if entry.segment_id <= last.segment_id {
+                if entry == *last {
+                    continue; // exact duplicate: tolerate, skip
+                }
                 return Err(EngineError::Io(format!(
                     "shipped.log line {}: out of order segment_id {} (<= {})",
-                    lineno + 1,
-                    segment_id,
+                    lineno,
+                    entry.segment_id,
                     last.segment_id
                 )));
             }
         }
 
-        out.push(ShippedEntry {
-            segment_id,
-            seal_seq,
-            sha256_hex,
-            hmac_hex,
-        });
+        out.push(entry);
     }
     Ok(out)
 }

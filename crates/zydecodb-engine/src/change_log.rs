@@ -193,11 +193,14 @@ pub fn persist_manifest(cfg: &ChangeLogConfig, manifest: &ChangeLogManifest) -> 
         f.write_all(&bytes)?;
         f.sync_all()?;
     }
+    crate::failpoints::failpoint_result(crate::failpoints::CHANGELOG_BEFORE_MANIFEST_RENAME)?;
     fs::rename(&tmp, &path)?;
-    // Best-effort directory fsync so the rename is durable.
-    if let Ok(dir) = File::open(&cfg.archive_dir) {
-        let _ = dir.sync_all();
+    // Directory fsync so the rename is durable.
+    {
+        let dir = File::open(&cfg.archive_dir)?;
+        dir.sync_all()?;
     }
+    crate::failpoints::failpoint_result(crate::failpoints::CHANGELOG_AFTER_MANIFEST_RENAME)?;
     Ok(())
 }
 
@@ -233,13 +236,21 @@ pub fn archive_segment(
     let max_seq = max_seq.max(observed_max);
     let size_bytes = fs::metadata(&src)?.len();
     let dst = cfg.archive_dir.join(&src_name);
+    crate::failpoints::failpoint_result(crate::failpoints::CHANGELOG_BEFORE_ARCHIVE)?;
     hardlink_or_copy(&src, &dst)?;
     // Ensure archived bytes are durable before recording the manifest.
     {
         let f = OpenOptions::new().write(true).open(&dst)?;
         f.sync_all()?;
     }
-    manifest.segments.push(ArchiveSegment {
+    crate::failpoints::failpoint_result(crate::failpoints::CHANGELOG_AFTER_ARCHIVE)?;
+    // Publish to disk BEFORE the in-memory manifest claims the segment:
+    // `wal_segment_safe_to_unlink` trusts the in-memory state, so it must
+    // never run ahead of the durable manifest. If persist fails, the live
+    // WAL stays put and a later retry re-archives (hardlink_or_copy removes
+    // any stale destination first, so the retry is idempotent).
+    let mut candidate = manifest.clone();
+    candidate.segments.push(ArchiveSegment {
         segment_id,
         min_seq,
         max_seq,
@@ -247,8 +258,9 @@ pub fn archive_segment(
         size_bytes,
         file_name: src_name,
     });
-    manifest.segments.sort_by_key(|s| s.segment_id);
-    persist_manifest(cfg, manifest)?;
+    candidate.segments.sort_by_key(|s| s.segment_id);
+    persist_manifest(cfg, &candidate)?;
+    *manifest = candidate;
     Ok(())
 }
 

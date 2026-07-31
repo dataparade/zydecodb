@@ -210,6 +210,10 @@ impl Server {
             );
         }
 
+        // Refuse obviously broken production configs before opening the engine
+        // or binding sockets (world-readable secrets, overlapping dirs, missing HMAC).
+        config.validate_serve_startup()?;
+
         let security = Arc::new(SecurityRuntime::from_config(&config)?);
         if security.require_auth {
             info!("authentication required for this listen address");
@@ -267,7 +271,8 @@ impl Server {
             Some(from) => {
                 let key_file = config.replica.hmac_key_file.as_ref().ok_or(
                     "replica.from is set but replica.hmac_key_file is missing — the shipped \
-                     stream must be HMAC-authenticated (share the primary's shipping key)",
+                     stream must be HMAC-authenticated. Set hmac_key_file to the same path \
+                     used by the primary's [shipping].hmac_key_file (chmod 600)",
                 )?;
                 let key = crate::config::load_hmac_key(key_file)?;
                 info!(dir = %from.display(), "starting as READ REPLICA (read-only)");
@@ -291,11 +296,16 @@ impl Server {
         // tenant is its override, else the global default (0 = unlimited).
         let global_tenant_cap = config.security.quotas.max_bytes_per_tenant;
         if global_tenant_cap > 0 || security.tenant_limits.any_byte_cap() {
-            engine =
-                engine.with_write_policy(Arc::new(crate::security::quota::TenantQuotaPolicy::new(
-                    global_tenant_cap,
-                    Arc::clone(&security.tenant_limits),
-                )));
+            let policy = Arc::new(crate::security::quota::TenantQuotaPolicy::new(
+                global_tenant_cap,
+                Arc::clone(&security.tenant_limits),
+            ));
+            // Seed from on-disk state so byte caps are enforced across
+            // restarts instead of silently resetting to zero per process.
+            let seeded = engine.tenant_usage_bytes()?;
+            info!(tenants = seeded.len(), "seeded tenant quota usage from keyspace scan");
+            policy.seed_usage(seeded);
+            engine = engine.with_write_policy(policy);
         }
 
         // WAL shipping: sealed segments are transported into ship_dir for an
@@ -321,8 +331,10 @@ impl Server {
             }
             let key_file = config.shipping.hmac_key_file.as_ref().ok_or(
                 "shipping.ship_dir is set but shipping.hmac_key_file is missing — shipped \
-                 manifests must be HMAC-authenticated (generate a key: \
-                 `head -c 32 /dev/urandom > ship.hmac && chmod 600 ship.hmac`)",
+                 manifests must be HMAC-authenticated. Generate a key with \
+                 `head -c 32 /dev/urandom > /etc/zydecodb/ship.hmac && chmod 600 \
+                 /etc/zydecodb/ship.hmac`, set hmac_key_file to that path, and share \
+                 the same file with every replica",
             )?;
             let hmac_key = crate::config::load_hmac_key(key_file)?;
             let mode =
@@ -579,8 +591,14 @@ impl Server {
                     "Seconds since the primary's last shipped heartbeat (-1 if none).",
                 ))
                 .expect("valid gauge opts");
+                let lag_secs_gauge = prometheus::IntGauge::with_opts(prometheus::Opts::new(
+                    "zydecodb_replica_lag_seconds",
+                    "Replica apply lag behind the primary, in seconds (heartbeat age; -1 if none).",
+                ))
+                .expect("valid gauge opts");
                 let _ = metrics.registry.register(Box::new(lag_gauge.clone()));
                 let _ = metrics.registry.register(Box::new(hb_age_gauge.clone()));
+                let _ = metrics.registry.register(Box::new(lag_secs_gauge.clone()));
                 Some(
                     thread::Builder::new()
                         .name("zydecodb-replica".into())
@@ -611,9 +629,11 @@ impl Server {
                             }
                             // Refresh observability each pass (cheap file reads).
                             if let Ok(report) = crate::replica::status(&from, &wal_dir, u64::MAX) {
+                                let hb_age =
+                                    report.heartbeat_age_secs.map(|a| a as i64).unwrap_or(-1);
                                 lag_gauge.set(report.seq_lag as i64);
-                                hb_age_gauge
-                                    .set(report.heartbeat_age_secs.map(|a| a as i64).unwrap_or(-1));
+                                hb_age_gauge.set(hb_age);
+                                lag_secs_gauge.set(hb_age);
                             }
                         })?,
                 )
@@ -962,6 +982,8 @@ fn is_write_command(cmd: Command) -> bool {
             | Command::AdminDropTenant
             | Command::Begin
             | Command::Commit
+            | Command::Rollback
+            | Command::SetContext
     )
 }
 
@@ -989,7 +1011,11 @@ fn serve_stream<S: Read + Write>(
             break;
         }
 
-        let req = match read_message(stream, shutdown, security.idle_timeout) {
+        // Before authentication the peer gets no benefit of the doubt on
+        // frame size: SessionInit/Ping payloads are a few hundred bytes, so a
+        // multi-megabyte pre-auth frame is abuse, not a big write.
+        let pre_auth = security.require_auth && !session.authenticated;
+        let req = match read_message(stream, shutdown, security.idle_timeout, pre_auth) {
             ReadOutcome::Request(r) => {
                 last_activity = Instant::now();
                 r
@@ -1223,6 +1249,11 @@ fn serve_stream<S: Read + Write>(
                 &format!("{:?}", response.status),
             );
         }
+        if response.status != zydecodb_engine::errors::Status::Ok {
+            if let Some(m) = engine.read().metrics() {
+                m.record_status_error(response.status);
+            }
+        }
 
         write_response(stream, &response)?;
         stream.flush()?;
@@ -1312,12 +1343,20 @@ fn fill<S: Read>(
     Ok(Fill::Done)
 }
 
+/// Pre-auth frame payload cap. An unauthenticated peer may only send
+/// SessionInit/Ping — a few hundred bytes — so anything beyond 64 KiB is
+/// rejected before the payload buffer is allocated.
+const PREAUTH_MAX_FRAME_BYTES: usize = 64 * 1024;
+
 /// Read one request frame, distinguishing "idle between frames" from "client
-/// closed" from "stream error".
+/// closed" from "stream error". When `pre_auth` is true the payload cap is
+/// clamped to [`PREAUTH_MAX_FRAME_BYTES`] so an unauthenticated peer cannot
+/// force a `MAX_VALUE_BYTES`-sized allocation per connection.
 fn read_message<S: Read>(
     stream: &mut S,
     shutdown: &Arc<Mutex<bool>>,
     idle_timeout: Option<Duration>,
+    pre_auth: bool,
 ) -> ReadOutcome {
     use zydecodb_engine::frame::{
         parse_request_header, RequestEnvelope, RequestHeader, ENVELOPE_HEADER_LEN,
@@ -1338,7 +1377,12 @@ fn read_message<S: Read>(
     let len = match parsed {
         RequestHeader::Known { len, .. } | RequestHeader::Unknown { len, .. } => len,
     };
-    if len > zydecodb_engine::keys::MAX_VALUE_BYTES + 4096 {
+    let cap = if pre_auth {
+        PREAUTH_MAX_FRAME_BYTES
+    } else {
+        zydecodb_engine::keys::MAX_VALUE_BYTES + 4096
+    };
+    if len > cap {
         return ReadOutcome::Error(zydecodb_engine::errors::EngineError::Protocol(
             "payload too large".into(),
         ));

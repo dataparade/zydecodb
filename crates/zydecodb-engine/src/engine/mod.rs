@@ -79,6 +79,9 @@ pub struct EngineConfig {
     /// any record with `seq > N`, so the engine boots at exactly that sequence.
     /// `None` (default) replays the entire WAL. Used by `admin restore`.
     pub wal_replay_max_seq: Option<u64>,
+    /// When true, [`Engine::open`] ignores [`RESTORE_IN_PROGRESS_MARKER`]. Only
+    /// `admin restore` sets this — normal opens refuse a half-finished restore.
+    pub allow_restore_in_progress: bool,
     /// δ-fair multi-tenant isolation (Phase 5). Disabled by default; enable
     /// under pods when per-tenant limits exist. See [`crate::tenant_fair`].
     pub fair: crate::tenant_fair::FairConfig,
@@ -100,6 +103,7 @@ impl Default for EngineConfig {
             manifest_sync_debounce_ms: 50,
             max_open_readers: 128,
             wal_replay_max_seq: None,
+            allow_restore_in_progress: false,
             fair: crate::tenant_fair::FairConfig::default(),
             l0_write_stall_threshold: None,
         }
@@ -250,6 +254,10 @@ pub struct Engine {
 /// Name of the clean-shutdown marker written in the data dir by
 /// [`Engine::shutdown`] and consumed (then removed) on the next [`Engine::open`].
 const CLEAN_SHUTDOWN_MARKER: &str = "CLEAN_SHUTDOWN";
+
+/// Marker left in `data_dir` while `admin restore` is in flight. [`Engine::open`]
+/// refuses the directory so a killed restore cannot serve partial state.
+pub const RESTORE_IN_PROGRESS_MARKER: &str = "RESTORE_IN_PROGRESS";
 
 impl Drop for Engine {
     fn drop(&mut self) {

@@ -13,7 +13,7 @@ Two layers, one engine:
 
 ```bash
 # 1. Install the prebuilt binary (Linux/macOS, x86_64/arm64)
-curl -sSL https://zydecodb.com/install.sh | sh
+curl -sSL https://zydeco.dev/install.sh | sh
 
 # Later: upgrade the server binary in place (drivers stay on pip/npm/go get)
 # zydecodb update

@@ -21,11 +21,28 @@ jobs:
         run: cargo test --all
       - name: Failpoint tests
         run: cargo test -p zydecodb-engine --features failpoints --test crash_matrix --test resilience_failpoints -- --test-threads=1
+      - name: Ops drills (restore / PITR / promote)
+        run: cargo test -p zydecodb --test restore_equivalence --test pitr_restore --test promote_under_load -- --test-threads=1
       - name: Coverage (informational)
         continue-on-error: true
         run: |
           cargo install cargo-llvm-cov --locked || true
           cargo llvm-cov -p zydecodb-engine --summary-only || true
+      - name: Authz + replica write-reject audit
+        run: cargo test -p zydecodb --test authz_matrix --test replica_write_reject -- --test-threads=1
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit
+        # Advisories covering the self-update surface (ureq/flate2/tar) fail the job.
+        # Prefer upgrading deps over allowlisting.
 
   # Single gate: vectors.json is fresh from Rust encoders, and Py/Go/TS codecs
   # match it byte-for-byte. No live server required.
@@ -218,7 +235,7 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Fuzz smoke (1000 runs each)
         run: |
-          for t in decode_envelope fuzz_dispatch; do
+          for t in decode_envelope fuzz_dispatch wal_parser fuzz_filter fuzz_update; do
             cargo fuzz run "$t" -- -runs=1000 -max_total_time=60
           done
         working-directory: fuzz

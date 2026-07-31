@@ -1,0 +1,32 @@
+# Kill-loop crash recovery soak (~30–45 min). Not on every PR.
+name: Crash recovery soak
+
+on:
+  schedule:
+    # 05:30 UTC daily (before tenant-isolation soak)
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  crash-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run crash-soak
+        env:
+          MINUTES: "35"
+          RELEASE: "1"
+          OUT_DIR: ${{ runner.temp }}/zydeco-crash-soak
+        run: ./scripts/crash-soak.sh
+      - name: Upload crash-soak summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-soak-summary
+          path: |
+            ${{ runner.temp }}/zydeco-crash-soak/summary.json
+            ${{ runner.temp }}/zydeco-crash-soak/crash-soak.log
+          if-no-files-found: ignore

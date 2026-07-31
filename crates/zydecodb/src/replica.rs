@@ -96,7 +96,7 @@ impl Replica {
         let entries = shipping::read_shipped_log(&self.from)?;
         let mut outcome = SyncOutcome::default();
 
-        for entry in entries {
+        for entry in &entries {
             self.last_seq = self.last_seq.max(entry.seal_seq);
             if self.applied.contains(&entry.segment_id) {
                 continue;
@@ -105,11 +105,29 @@ impl Replica {
             let file_name = wal::segment_filename(entry.segment_id);
             let src = self.from.join(&file_name);
             if !src.exists() {
-                // The sidecar logged the segment but hasn't delivered the bytes
+                // Permanent retention gap: a later segment's bytes are already
+                // present while this earlier one is missing — never skip ahead.
+                let later_present = entries.iter().any(|later| {
+                    later.segment_id > entry.segment_id
+                        && self
+                            .from
+                            .join(wal::segment_filename(later.segment_id))
+                            .exists()
+                });
+                if later_present {
+                    return Err(EngineError::Io(format!(
+                        "replica retention gap: shipped segment {} missing but a later \
+                         segment is present under {} — re-seed from a base snapshot \
+                         (admin restore) then resume catch-up; refusing to skip ahead",
+                        entry.segment_id,
+                        self.from.display()
+                    )));
+                }
+                // Sidecar logged the segment but hasn't delivered the bytes
                 // yet; stop and retry on the next pass so order is preserved.
                 break;
             }
-            if !shipping::verify_entry(&src, &entry, self.hmac_key.as_deref())? {
+            if !shipping::verify_entry(&src, entry, self.hmac_key.as_deref())? {
                 // A partial/corrupt/forged transfer: stop and retry once it
                 // settles (or fail permanently if the manifest was tampered).
                 break;
@@ -130,15 +148,39 @@ impl Replica {
     }
 }
 
-/// Persist the highest installed seal sequence (atomic temp + rename).
+/// fsync a directory so a rename or create inside it survives power loss.
+fn fsync_dir(dir: &Path) -> EngineResult<()> {
+    std::fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| EngineError::Io(format!("fsync dir {}: {}", dir.display(), e)))
+}
+
+/// Write `contents` to `dst` atomically: fsync the temp file, rename, then
+/// fsync the directory. A rename alone is not durable — without the directory
+/// fsync a crash can resurrect the old name or lose the new one entirely.
+fn write_atomic_durable(dst: &Path, contents: &str) -> EngineResult<()> {
+    let tmp = dst.with_file_name(format!(
+        "{}.tmp",
+        dst.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        use std::io::Write;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dst)
+        .map_err(|e| EngineError::Io(format!("{} rename: {}", dst.display(), e)))?;
+    if let Some(parent) = dst.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Persist the highest installed seal sequence (atomic temp + rename + dir fsync).
 pub fn write_replica_state(wal_dir: &Path, seq: u64) -> EngineResult<()> {
     std::fs::create_dir_all(wal_dir)?;
-    let tmp = wal_dir.join("replica.state.tmp");
-    let dst = wal_dir.join(REPLICA_STATE);
-    std::fs::write(&tmp, seq.to_string())?;
-    std::fs::rename(&tmp, &dst)
-        .map_err(|e| EngineError::Io(format!("replica.state rename: {}", e)))?;
-    Ok(())
+    write_atomic_durable(&wal_dir.join(REPLICA_STATE), &seq.to_string())
 }
 
 /// Read the persisted applied seal sequence (absent / unreadable -> None).
@@ -156,14 +198,10 @@ pub fn read_epoch(data_dir: &Path) -> u64 {
         .unwrap_or(1)
 }
 
-/// Persist this node's promotion epoch (atomic temp + rename).
+/// Persist this node's promotion epoch (atomic temp + rename + dir fsync).
 pub fn write_epoch(data_dir: &Path, epoch: u64) -> EngineResult<()> {
     std::fs::create_dir_all(data_dir)?;
-    let tmp = data_dir.join("EPOCH.tmp");
-    let dst = data_dir.join(EPOCH);
-    std::fs::write(&tmp, epoch.to_string())?;
-    std::fs::rename(&tmp, &dst).map_err(|e| EngineError::Io(format!("EPOCH rename: {}", e)))?;
-    Ok(())
+    write_atomic_durable(&data_dir.join(EPOCH), &epoch.to_string())
 }
 
 /// Read the fence epoch recorded in a shipped stream (absent -> None).
@@ -173,14 +211,10 @@ pub fn read_fence(dir: &Path) -> Option<u64> {
         .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
-/// Stamp the fence epoch into a shipped stream (atomic temp + rename).
+/// Stamp the fence epoch into a shipped stream (atomic temp + rename + dir fsync).
 pub fn write_fence(dir: &Path, epoch: u64) -> EngineResult<()> {
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join("FENCE.tmp");
-    let dst = dir.join(FENCE);
-    std::fs::write(&tmp, epoch.to_string())?;
-    std::fs::rename(&tmp, &dst).map_err(|e| EngineError::Io(format!("FENCE rename: {}", e)))?;
-    Ok(())
+    write_atomic_durable(&dir.join(FENCE), &epoch.to_string())
 }
 
 fn now_millis() -> u64 {
@@ -322,16 +356,32 @@ pub fn promote(from: &Path, wal_dir: &Path, data_dir: &Path) -> EngineResult<Pro
     let new_epoch = local_epoch.max(fence_epoch) + 1;
     write_epoch(data_dir, new_epoch)?;
 
+    let applied_max_seq = rep.applied_max_seq();
+    let prev_s = local_epoch.to_string();
+    let new_s = new_epoch.to_string();
+    let seq_s = applied_max_seq.to_string();
+    let drained_s = drained.len().to_string();
+    crate::security::audit::log_security_event(
+        "promote",
+        &[
+            ("previous_epoch", &prev_s),
+            ("new_epoch", &new_s),
+            ("applied_seq", &seq_s),
+            ("drained_segments", &drained_s),
+        ],
+    );
+
     Ok(PromoteOutcome {
         drained,
         previous_epoch: local_epoch,
         new_epoch,
-        applied_max_seq: rep.applied_max_seq(),
+        applied_max_seq,
     })
 }
 
 /// Atomically install a verified segment into the WAL directory: write to a
-/// temp file, fsync, then rename over any existing placeholder of the same id.
+/// temp file, fsync, rename over any existing placeholder of the same id, then
+/// fsync the directory so the rename itself survives power loss.
 fn install_segment(src: &Path, dst: &Path) -> EngineResult<()> {
     let bytes = std::fs::read(src)?;
     let tmp = dst.with_extension("log.tmp");
@@ -343,6 +393,9 @@ fn install_segment(src: &Path, dst: &Path) -> EngineResult<()> {
     }
     std::fs::rename(&tmp, dst)
         .map_err(|e| EngineError::Io(format!("install segment {}: {}", dst.display(), e)))?;
+    if let Some(parent) = dst.parent() {
+        fsync_dir(parent)?;
+    }
     Ok(())
 }
 

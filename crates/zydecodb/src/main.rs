@@ -44,6 +44,9 @@ enum Commands {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+        /// Skip GitHub Artifact Attestation (airgap / no `gh`). SHA-256 still verified.
+        #[arg(long)]
+        skip_attestation: bool,
     },
     /// Administrative commands.
     Admin {
@@ -301,6 +304,7 @@ fn main() {
             version,
             force,
             yes,
+            skip_attestation,
         } => {
             use zydecodb::self_update::{run, UpdateOptions, UpdateOutcome};
             match run(UpdateOptions {
@@ -308,6 +312,7 @@ fn main() {
                 version,
                 force,
                 yes,
+                skip_attestation,
                 ..Default::default()
             }) {
                 Ok(UpdateOutcome::CheckUpdateAvailable) => std::process::exit(1),

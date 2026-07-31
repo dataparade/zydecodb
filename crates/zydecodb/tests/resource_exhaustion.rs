@@ -10,7 +10,9 @@ use tempfile::TempDir;
 
 use zydecodb::config::{RequireAuth, SecurityConfig};
 use zydecodb_engine::errors::Status;
-use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN};
+use zydecodb_engine::frame::{
+    Command, KeyPayload, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN,
+};
 
 fn tight_limits_config(tmp: &TempDir, listen: std::net::SocketAddr) -> zydecodb::config::Config {
     let mut cfg = base_config(tmp, listen);
@@ -94,6 +96,87 @@ fn test_slowloris_connection_starvation() {
         "Connections were not closed at the correct idle timeout! Elapsed: {:?}",
         elapsed
     );
+
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn test_preauth_frame_cap_rejects_oversize_header() {
+    let tmp = TempDir::new().unwrap();
+    let addr = free_addr();
+    let keys_file = tmp.path().join("keys.toml");
+    let keys_toml = format!(
+        "[[key]]\nid = \"k\"\nsecret_hash = \"{}\"\nsecret_lookup = \"{}\"\ntenant = \"{}\"\n",
+        zydecodb::security::keys::hash_secret("dummy").unwrap(),
+        zydecodb::security::keys::secret_lookup_hex("dummy"),
+        "00000000000000000000000000000001",
+    );
+    write_secret_file(&keys_file, keys_toml);
+    let mut config = base_config(&tmp, addr);
+    config.security = SecurityConfig {
+        require_auth: RequireAuth::True,
+        keys_file,
+        legacy_single_tenant: false,
+        ..Default::default()
+    };
+
+    let server = zydecodb::server::Server::new();
+    let shutdown = server.shutdown_flag();
+    let handle = thread::spawn(move || server.run(config).unwrap());
+
+    // Bounded wait for the listener: if startup failed (server thread dead),
+    // fail fast instead of spinning on connect forever.
+    let mut evil = {
+        let mut found = None;
+        for _ in 0..150 {
+            if let Ok(s) = TcpStream::connect(addr) {
+                found = Some(s);
+                break;
+            }
+            if handle.is_finished() {
+                panic!("server thread exited before listening");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        found.expect("server never started listening")
+    };
+    evil.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    evil.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // Header-only frame: declares an 8 MiB Put payload, body never follows.
+    // Pre-auth the server must reject at the header (64 KiB cap) instead of
+    // allocating MAX_VALUE_BYTES and waiting for the body.
+    let frame = RequestEnvelope::new(Command::Put, vec![0u8; 8 * 1024 * 1024]).encode();
+    evil.write_all(&frame[..ENVELOPE_HEADER_LEN]).unwrap();
+    evil.flush().unwrap();
+    let mut buf = [0u8; 1];
+    let res = evil.read(&mut buf);
+    assert!(
+        res.is_err() || res.unwrap() == 0,
+        "oversized pre-auth frame must terminate the connection at the header"
+    );
+    drop(evil);
+
+    // The server survived and still serves honest frames on new connections.
+    let mut ok = TcpStream::connect(addr).unwrap();
+    ok.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let get = RequestEnvelope::new(
+        Command::Get,
+        KeyPayload {
+            routing_key: [0u8; 16],
+            snapshot_seq: u64::MAX,
+            key: b"k".to_vec(),
+        }
+        .encode(),
+    );
+    ok.write_all(&get.encode()).unwrap();
+    ok.flush().unwrap();
+    let mut header = [0u8; ENVELOPE_HEADER_LEN];
+    ok.read_exact(&mut header)
+        .expect("server must still answer after rejecting the oversized frame");
+    let (status, _) = ResponseEnvelope::parse_header(&header).unwrap();
+    assert_eq!(status, Status::Unauthorized, "honest small frame reaches dispatch");
 
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();

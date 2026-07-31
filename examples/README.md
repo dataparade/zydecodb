@@ -20,7 +20,7 @@ Security model: **ZydecoDB handles connection auth; your app handles human login
 
 ```bash
 # Prebuilt binary (or build from source: cargo build --release -p zydecodb)
-curl -sSL https://zydecodb.com/install.sh | sh
+curl -sSL https://zydeco.dev/install.sh | sh
 
 # No config needed locally: 127.0.0.1:9470, data in ~/.zydecodb
 zydecodb serve

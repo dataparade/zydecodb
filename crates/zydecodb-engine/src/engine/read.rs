@@ -123,6 +123,29 @@ impl Engine {
         self.snapshot().prefix_scan(prefix)
     }
 
+    /// Sum live value bytes per tenant across the whole user keyspace.
+    ///
+    /// Seeds per-tenant quota accounting at startup so byte caps survive
+    /// restarts. The tenant extraction mirrors the write-path policy exactly
+    /// (`0x01` prefix + 16-byte tenant id); keys that do not match that
+    /// layout (e.g. legacy un-prefixed single-tenant keys) are skipped, just
+    /// as the policy's own accounting ignores them.
+    pub fn tenant_usage_bytes(&self) -> EngineResult<std::collections::HashMap<[u8; 16], u64>> {
+        let mut usage: std::collections::HashMap<[u8; 16], u64> =
+            std::collections::HashMap::new();
+        let iter = self.scan(vec![keys::KS_USER], vec![keys::KS_USER + 1])?;
+        for item in iter {
+            let (key, value) = item?;
+            if key.first() != Some(&keys::KS_USER) || key.len() < 1 + 16 {
+                continue;
+            }
+            let mut tenant = [0u8; 16];
+            tenant.copy_from_slice(&key[1..17]);
+            *usage.entry(tenant).or_insert(0) += value.len() as u64;
+        }
+        Ok(usage)
+    }
+
     /// Internal point-lookup that respects a sequence-number ceiling.
     /// Used by [`crate::snapshot::SnapshotView::get`] and by [`Engine::get`].
     ///

@@ -70,7 +70,9 @@ pub fn stored_to_json_vec(stored: &[u8]) -> Vec<u8> {
     let kind = stored[0];
     let payload = strip_value_kind(stored);
     if kind == VK_ZDOC {
-        let val = crate::binary::ValueView::new(payload).to_value();
+        let Ok(val) = crate::binary::ValueView::new(payload).to_value() else {
+            return Vec::new();
+        };
         serde_json::to_vec(&val).unwrap_or_default()
     } else {
         payload.to_vec()
@@ -583,7 +585,7 @@ pub fn current_json_body(
         Some(stored) if !stored.is_empty() => {
             let payload = strip_value_kind(&stored);
             if stored[0] == VK_ZDOC {
-                Ok(Some(crate::binary::ValueView::new(payload).to_value()))
+                Ok(Some(crate::binary::ValueView::new(payload).to_value()?))
             } else {
                 Ok(Some(
                     serde_json::from_slice(payload)

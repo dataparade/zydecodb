@@ -28,7 +28,7 @@ fn evasion_config(tmp: &TempDir, listen: std::net::SocketAddr) -> zydecodb::conf
         key_record.tenant,
         tenant_record.tenant,
     );
-    std::fs::write(&keys_file, keys_toml).unwrap();
+    write_secret_file(&keys_file, keys_toml);
     let mut cfg = base_config(tmp, listen);
     cfg.security = SecurityConfig {
         require_auth: RequireAuth::True,

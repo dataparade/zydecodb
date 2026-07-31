@@ -124,15 +124,135 @@ match crate::security::keys::KeyStore::load(&keys_file) {
 
 Sources of truth: [`PROTOCOL.md`](PROTOCOL.md), this file, [`GUIDE.md`](GUIDE.md#security).
 
+## Durability / directory fsync
+
+Every create/rename that durability depends on must fsync the **file** and the
+**containing directory**. Audit (1.0 Section 2):
+
+| Surface | File sync | Directory sync | Notes |
+|---------|-----------|----------------|-------|
+| WAL segment create/roll | `sync_all` on segment fd | via data/wal open path | `open_new_wal_segment` |
+| SSTable flush / compaction rename | tmp `sync_all` then rename | `fsync_dir(data_dir)` | flush/compaction workers |
+| LSM `MANIFEST` | append + `sync_all` | N/A (append-only file) | |
+| Change-log archive segment | `sync_all` on dst | before manifest rewrite | `archive_segment` |
+| Change-log `manifest.json` | tmp `sync_all` + rename | `archive_dir` `sync_all` | `persist_manifest` |
+| Base snapshot | `SNAPMETA` `sync_all` | `fsync_dir(snapshot)` | `snapshot_to` |
+| Shipping segment + `shipped.log` | segment + log `sync_all` | `ship_dir` after both | fixed in Section 2 |
+| Shipping heartbeat rename | tmp `sync_all` + rename | `ship_dir` | fixed in Section 2 |
+
+Failpoint crash matrix: `cargo test -p zydecodb-engine --features failpoints --test crash_matrix -- --test-threads=1`.
+
+**Fuzz findings:** every crash from fuzz must land as a committed regression
+unit test in the owning crate **before** the fix merges.
+
+## Authorization audit matrix
+
+Wire-level proof that every `Command` opcode enforces the same auth/role/tenant
+rules. **Test:** `crates/zydecodb/tests/authz_matrix.rs` (also gated in CI).
+**Replica mutators:** `crates/zydecodb/tests/replica_write_reject.rs`.
+
+Roles: `read_only` / `read_write` / `admin`. Tenants are 16-byte ids on the key;
+prefix ACL is optional per key (`allowed_prefixes`).
+
+| Opcode class | Anon (auth on) | read_only | read_write | admin | Prefix ACL deny |
+|--------------|----------------|-----------|------------|-------|-----------------|
+| KV/doc **reads** (Get, Find, Query, Count, Aggregate, …) | Unauthorized | Ok\* | Ok\* | Ok\* | Forbidden |
+| KV/doc **writes** (Put, Del, DocPut, Update, Delete, DocPutIfMatch, DocUpdateIfMatch, IndexDef) | Unauthorized | Forbidden | Ok\* | Ok\* | Forbidden |
+| `Begin` | Unauthorized | Forbidden | Ok | Ok | — |
+| `Commit` / `Rollback` | Unauthorized | Commit: no-tx ProtocolError; Rollback: Ok | Ok | Ok | — |
+| `Watch` | Unauthorized | Ok\* (primary) | Ok\* | Ok\* | Forbidden |
+| `SetContext` / `AdminDropTenant` | Unauthorized | Forbidden | Forbidden | Ok | — |
+| `Ping` | Ok (default `allow_unauthenticated_ping`) | Ok | Ok | Ok | — |
+| `SchemaDef` | ProtocolError (reserved) | ProtocolError | ProtocolError | ProtocolError | — |
+
+\* Ok / NotFound both mean the authz gate passed (empty tenant or missing doc).
+
+**Replica Forbidden set:** Put, Del, DocPut, DocDel, Update, Delete,
+DocPutIfMatch, DocUpdateIfMatch, IndexDef, AdminDropTenant, Begin, Commit,
+Rollback, SetContext, Watch. Reads + Ping/Stats/SessionInit remain allowed
+(subject to auth).
+
+### Supply chain
+
+CI job `cargo-audit` runs `cargo audit` on every PR/push (includes self-update
+deps `ureq` / `flate2` / `tar`). Dependabot weekly for `cargo` + `github-actions`
+(`.github/dependabot.yml`). Prefer upgrade over advisory allowlists.
+
+## Reference workloads (published numbers)
+
+Operator-facing numbers live in [`GUIDE.md`](GUIDE.md#performance). This harness
+is the **repro source** for those tables (engine soak remains the **stability**
+gate).
+
+**Binary:** `crates/zydecodb/src/bin/ref-workloads.rs`  
+**Driver:** `scripts/ref-workloads.sh`
+
+| Workload | Setup | Ops measured |
+|----------|--------|----------------|
+| `point_get` | 10k KV keys preloaded | GET throughput + p50/p99 |
+| `find_indexed` | collection + secondary index | filtered Find |
+| `find_unindexed` | same shape, no usable index | filtered Find (scan) |
+| `upsert` | DocPut seed + Update `upsert=true` | upsert rate + p99 |
+| `tx_commit` | Begin → DocPut → Commit | commits/sec + p99 |
+| `aggregate` | `$group` over 1k docs | pipeline rate + p99 |
+| `watch_fanout` | K Watch subscribers + writers | write + drain lag |
+
+```bash
+# Maintainer-class run (release binary, seeded, JSON out)
+OPS=2000 OUT=docs/soak-baselines/ref-workloads-local.json scripts/ref-workloads.sh
+
+# Quick local check
+OPS=40 cargo run -p zydecodb --bin ref-workloads -- --ops 40
+```
+
+Ephemeral server: auth off, `rate_limit_rps=1_000_000`, change streams on
+(for `watch_fanout`). Document CPU / RAM / disk / OS in the GUIDE table caption
+whenever you refresh published numbers.
+
+### Bench regression (nightly)
+
+Short paced engine put/get mix (~minutes), not Criterion:
+
+**Binary:** `crates/zydecodb-engine/src/bin/bench-regression.rs`  
+**Driver:** `scripts/bench-regression.sh`  
+**Baseline:** [`soak-baselines/bench-baseline.json`](soak-baselines/bench-baseline.json)
+
+```bash
+# Emit JSON only
+scripts/bench-regression.sh
+
+# Fail if p99_us or rss_bytes regresses >20% vs committed baseline
+COMPARE=1 scripts/bench-regression.sh
+```
+
+CI: `.github/workflows/bench-nightly.yml` (schedule + `workflow_dispatch`).
+GitHub `ubuntu-latest` is noisy — the gate is coarse: fail if `p99_us` or
+`rss_bytes` exceeds `max(baseline×1.2, baseline + floor)` (floor 100 µs /
+8 MiB). Not a μs SLA.
+
 ## Soak testing
 
 Internal long-running stress harness for release validation. End users do not need this — see the [README](../README.md) for embedding the engine.
 
 The soak answers: is memory stable? Are errors zero? Is compaction healthy? Is throughput drifting down?
 
-**Harness:** `crates/engine/src/bin/engine-soak.rs`  
+**Harness:** `crates/zydecodb-engine/src/bin/engine-soak.rs`  
 **Driver:** `scripts/soak.sh`  
 **Analyzer:** `scripts/analyze-soak.py`
+
+#### Crash-recovery kill loop
+
+SIGKILL the soak at random intervals, reopen, CRC-scan WAL segments, probe
+put/get/flush. CI runs ~35 minutes nightly (`.github/workflows/crash-soak.yml`).
+Multi-hour VPS runs use the same script:
+
+```bash
+./scripts/crash-soak.sh                         # ~35 min (CI default)
+MINUTES=180 OUT_DIR=/var/tmp/crash-soak ./scripts/crash-soak.sh
+CYCLES=50 KILL_MIN_MS=200 KILL_MAX_MS=3000 ./scripts/crash-soak.sh
+```
+
+Gate: zero failed reopens; integrity must pass every cycle.
 
 #### Multi-tenant isolation (simulated pods)
 

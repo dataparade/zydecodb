@@ -74,10 +74,7 @@ fn unused_doc_put_flag_bit_returns_protocol_error() {
     .encode();
     *payload.last_mut().unwrap() |= 0x80;
 
-    write_request(
-        &mut stream,
-        &RequestEnvelope::new(Command::DocPut, payload),
-    );
+    write_request(&mut stream, &RequestEnvelope::new(Command::DocPut, payload));
     let resp = read_response(&mut stream);
     assert_eq!(resp.status, Status::ProtocolError);
 

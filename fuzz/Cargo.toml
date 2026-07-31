@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 tempfile = "3"
+serde_json = "1"
 zydecodb = { path = "../crates/zydecodb" }
 zydecodb-engine = { path = "../crates/zydecodb-engine" }
 zydecodb-document = { path = "../crates/zydecodb-document" }
@@ -23,5 +24,53 @@ doc = false
 [[bin]]
 name = "fuzz_dispatch"
 path = "fuzz_targets/fuzz_dispatch.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wal_parser"
+path = "fuzz_targets/wal_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sstable_reader"
+path = "fuzz_targets/sstable_reader.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "manifest_parser"
+path = "fuzz_targets/manifest_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ipc_envelope"
+path = "fuzz_targets/ipc_envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_filter"
+path = "fuzz_targets/fuzz_filter.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_update"
+path = "fuzz_targets/fuzz_update.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_aggregate"
+path = "fuzz_targets/fuzz_aggregate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_index_key"
+path = "fuzz_targets/fuzz_index_key.rs"
 test = false
 doc = false

@@ -166,6 +166,61 @@ fn encode_f64_total_order(f: f64) -> [u8; 8] {
     x.to_be_bytes()
 }
 
+/// Walk ascending `encoded_fields` bytes without panicking. Returns how many
+/// complete field encodings were consumed. Used by fuzz/tests — not a product API.
+pub fn try_decode_fields(bytes: &[u8]) -> Result<usize, ()> {
+    let mut i = 0;
+    let mut count = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            TAG_NULL => {
+                i += 1;
+                count += 1;
+            }
+            TAG_BOOL => {
+                if i + 1 >= bytes.len() {
+                    return Err(());
+                }
+                i += 2;
+                count += 1;
+            }
+            TAG_NUM => {
+                if i + 8 >= bytes.len() {
+                    return Err(());
+                }
+                i += 9;
+                count += 1;
+            }
+            TAG_STR => {
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return Err(());
+                    }
+                    if bytes[i] == 0x00 {
+                        if i + 1 >= bytes.len() {
+                            return Err(());
+                        }
+                        if bytes[i + 1] == 0x00 {
+                            i += 2;
+                            break;
+                        }
+                        if bytes[i + 1] == 0xFF {
+                            i += 2;
+                            continue;
+                        }
+                        return Err(());
+                    }
+                    i += 1;
+                }
+                count += 1;
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok(count)
+}
+
 /// Encode a string: escape `0x00 -> 0x00 0xFF`, terminate with `0x00 0x00`.
 /// The terminator is strictly less than any escaped or literal continuation
 /// byte at the same position, so a shorter string sorts before a longer one
@@ -209,6 +264,18 @@ mod tests {
         let mut out = Vec::new();
         encode_value(v, &mut out);
         out
+    }
+
+    #[test]
+    fn try_decode_fields_round_trips_encode() {
+        let fields = encode_fields(&[
+            Value::Null,
+            Value::Bool(true),
+            Value::Number(3.into()),
+            Value::String("a\0b".into()),
+        ]);
+        assert_eq!(try_decode_fields(&fields), Ok(4));
+        assert!(try_decode_fields(&fields[..fields.len().saturating_sub(1)]).is_err());
     }
 
     /// A reference total order matching our intended semantics.

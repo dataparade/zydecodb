@@ -1,9 +1,18 @@
 use super::session::SessionState;
 use crate::config::AuditConfig;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::info;
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::Command;
+
+/// Process-wide request id allocator for audit lines.
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate the next audit request id (monotonically increasing, wraps).
+pub fn next_request_id() -> u64 {
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A privacy-bounded capture of the client's KV key for audit lines: full
 /// length plus at most the first 8 bytes. Even with `log_client_key = true`
@@ -42,6 +51,7 @@ pub fn log_request(
     client_key: Option<AuditKey>,
     status: Status,
     duration: Duration,
+    request_id: u64,
 ) {
     if !cfg.enabled {
         return;
@@ -60,6 +70,7 @@ pub fn log_request(
             .map(|k| k.prefix_hex())
             .unwrap_or_else(|| "-".to_string());
         info!(
+            request_id,
             tenant = %tenant_hex,
             key_id = %key_id,
             cmd = %cmd,
@@ -71,6 +82,7 @@ pub fn log_request(
         );
     } else {
         info!(
+            request_id,
             tenant = %tenant_hex,
             key_id = %key_id,
             cmd = %cmd,
@@ -80,6 +92,22 @@ pub fn log_request(
             "audit"
         );
     }
+}
+
+/// Structured audit line for security-relevant admin / lifecycle events
+/// (key revoke, tenant drop, replica promote, …). Always emitted — not gated
+/// by `[security.audit].enabled` (those events are rare and operator-critical).
+pub fn log_security_event(event: &str, fields: &[(&str, &str)]) {
+    let mut pairs = String::new();
+    for (i, (k, v)) in fields.iter().enumerate() {
+        if i > 0 {
+            pairs.push(' ');
+        }
+        pairs.push_str(k);
+        pairs.push('=');
+        pairs.push_str(v);
+    }
+    info!(event = %event, detail = %pairs, "security_event");
 }
 
 mod hex {

@@ -12,6 +12,15 @@ impl Engine {
         // rejected here rather than racing on the manifest/WAL/SSTables.
         let data_dir_lock = Self::acquire_data_dir_lock(&cfg.data_dir)?;
 
+        let restore_marker = cfg.data_dir.join(RESTORE_IN_PROGRESS_MARKER);
+        if restore_marker.exists() && !cfg.allow_restore_in_progress {
+            return Err(EngineError::Io(format!(
+                "refusing to open {}: {} present (incomplete admin restore)",
+                cfg.data_dir.display(),
+                RESTORE_IN_PROGRESS_MARKER
+            )));
+        }
+
         // Detect (and immediately clear) the clean-shutdown marker. We clear it
         // up front so that if THIS process later crashes, the next boot correctly
         // reports an unclean start rather than a stale clean one.
@@ -337,42 +346,42 @@ impl Engine {
     /// Archive a sealed WAL segment into the change-log (no-op when disabled).
     /// Failures are logged and leave the live WAL in place so unlink is blocked.
     pub(crate) fn archive_sealed_segment(&mut self, segment_id: u64, max_seq: u64) {
+        if let Err(e) = self.archive_sealed_segment_result(segment_id, max_seq) {
+            tracing::error!(error = %e, segment = segment_id, "change_log archive failed");
+        }
+    }
+
+    /// Like [`Self::archive_sealed_segment`] but surfaces archive errors (test roll).
+    pub(crate) fn archive_sealed_segment_result(
+        &mut self,
+        segment_id: u64,
+        max_seq: u64,
+    ) -> EngineResult<()> {
         let Some(cfg) = self.change_log.clone() else {
-            return;
+            return Ok(());
         };
         let Some(manifest) = self.change_log_manifest.as_mut() else {
-            return;
+            return Ok(());
         };
-        match crate::change_log::archive_segment(
-            &cfg,
-            manifest,
-            &self.cfg.wal_dir,
-            segment_id,
-            max_seq,
-        ) {
-            Ok(()) => {
-                let _ = crate::change_log::prune(&cfg, manifest);
-                if let Some(m) = &self.metrics {
-                    m.change_log_archive_segments
-                        .set(manifest.segments.len() as i64);
-                    m.change_log_archive_bytes
-                        .set(manifest.total_bytes() as i64);
-                    if let Some(earliest) = manifest.earliest_seq() {
-                        m.change_log_earliest_seq.set(earliest as i64);
-                    }
-                    if let Some(latest) = manifest.latest_seq() {
-                        m.change_log_latest_seq.set(latest as i64);
-                    }
-                }
-                tracing::info!(
-                    segment = segment_id,
-                    "archived sealed WAL segment for change streams"
-                );
+        crate::change_log::archive_segment(&cfg, manifest, &self.cfg.wal_dir, segment_id, max_seq)?;
+        let _ = crate::change_log::prune(&cfg, manifest);
+        if let Some(m) = &self.metrics {
+            m.change_log_archive_segments
+                .set(manifest.segments.len() as i64);
+            m.change_log_archive_bytes
+                .set(manifest.total_bytes() as i64);
+            if let Some(earliest) = manifest.earliest_seq() {
+                m.change_log_earliest_seq.set(earliest as i64);
             }
-            Err(e) => {
-                tracing::error!(error = %e, segment = segment_id, "change_log archive failed");
+            if let Some(latest) = manifest.latest_seq() {
+                m.change_log_latest_seq.set(latest as i64);
             }
         }
+        tracing::info!(
+            segment = segment_id,
+            "archived sealed WAL segment for change streams"
+        );
+        Ok(())
     }
 
     /// Whether a covered WAL segment may be unlinked (archived when change_log on).
@@ -544,6 +553,9 @@ impl Engine {
         f.write_all(&first_seq.to_be_bytes())?;
         f.write_all(&[wal::WAL_FORMAT_VERSION])?;
         f.sync_all()?;
+        // The file fsync above makes the bytes durable; the directory entry
+        // itself needs its own fsync or a power loss can un-name the segment.
+        Self::fsync_dir(&self.cfg.wal_dir)?;
         crate::engine_fail_point!(crate::failpoints::WAL_AFTER_SEGMENT_ROLL);
         // Share the fd with the durability state so the coordinator can fsync it
         // off the engine lock. Publishing here (after the prior segment was synced
@@ -565,23 +577,29 @@ impl Engine {
     /// truth and the sidecar can reconcile from `shipped.log`. No-op when
     /// shipping is disabled.
     pub(crate) fn ship_sealed_segment(&self, segment_id: u64) {
+        if let Err(e) = self.ship_sealed_segment_result(segment_id) {
+            tracing::error!(error = %e, segment = segment_id, "WAL shipping failed");
+        }
+    }
+
+    /// Like [`Self::ship_sealed_segment`] but surfaces shipping errors (used by
+    /// the test-only WAL roll helper so failpoints are observable).
+    pub(crate) fn ship_sealed_segment_result(&self, segment_id: u64) -> EngineResult<()> {
         let Some(ship_dir) = &self.ship_dir else {
-            return;
+            return Ok(());
         };
         let name = wal::segment_filename(segment_id);
         let src = self.cfg.wal_dir.join(&name);
-        if let Err(e) = crate::shipping::ship_segment(
+        crate::shipping::ship_segment(
             &src,
             ship_dir,
             segment_id,
             self.wal_sync.synced_seq(),
             self.ship_mode,
             self.ship_hmac_key.as_deref(),
-        ) {
-            tracing::error!(error = %e, segment = segment_id, "WAL shipping failed");
-        } else {
-            tracing::info!(segment = segment_id, "shipped sealed WAL segment");
-        }
+        )?;
+        tracing::info!(segment = segment_id, "shipped sealed WAL segment");
+        Ok(())
     }
 
     pub(crate) fn append_wal(&mut self, rec: &WalRecord) -> EngineResult<()> {

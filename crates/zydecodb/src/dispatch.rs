@@ -31,6 +31,7 @@ pub fn handle_request(
     let start = Instant::now();
     let outcome = handle_request_inner(engine, req, session, security);
     let client_key = outcome.client_key;
+    let request_id = crate::security::audit::next_request_id();
     crate::security::audit::log_request(
         &security.audit,
         &outcome.session,
@@ -38,6 +39,7 @@ pub fn handle_request(
         client_key,
         outcome.response.status,
         start.elapsed(),
+        request_id,
     );
     DispatchOutcome {
         response: outcome.response,
@@ -73,7 +75,7 @@ fn handle_request_inner(
 
     match req.command {
         Command::SessionInit => handle_session_init(req, session, security),
-        Command::SetContext => handle_set_context(req, session),
+        Command::SetContext => handle_set_context(req, session, security),
         Command::AdminDropTenant => InnerOutcome {
             // Handled in the server loop with catalog access; should not reach here.
             response: ResponseEnvelope::error(
@@ -164,8 +166,15 @@ fn handle_session_init(
     }
 }
 
-fn handle_set_context(req: RequestEnvelope, session: SessionState) -> InnerOutcome {
-    if !session.authenticated || !session.is_admin() {
+fn handle_set_context(
+    req: RequestEnvelope,
+    session: SessionState,
+    security: &SecurityRuntime,
+) -> InnerOutcome {
+    if security.require_auth && !session.authenticated {
+        return unauthorized(session, Command::SetContext, "authentication required");
+    }
+    if !session.is_admin() {
         return forbidden(session, Command::SetContext, "admin role required");
     }
     if req.payload.len() != 16 {

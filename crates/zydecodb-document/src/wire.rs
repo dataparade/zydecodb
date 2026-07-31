@@ -12,6 +12,14 @@ use crate::query::QueryPage;
 const MODE_BY_ID: u8 = 0x00;
 const MODE_INDEX_RANGE: u8 = 0x01;
 
+/// Bounds on client-supplied count fields in payload decoders. These counts
+/// drive loop iterations and `vec![true; count]`-style allocations — without
+/// a cap, one malicious u32 forces a multi-GB allocation before the first
+/// bounds check can fire.
+const MAX_INDEX_FIELDS: usize = 64;
+const MAX_SORT_FIELDS: usize = 64;
+const MAX_FIELD_LIST: usize = 256;
+
 /// Bit 0 of the optional trailing flags byte on write payloads: when set, the
 /// write is acknowledged without waiting for the durability fsync (`relaxed`).
 const FLAG_RELAXED: u8 = 0x01;
@@ -224,7 +232,12 @@ impl IndexDefPayload {
         let index_name = r.lp_string()?;
         let unique = r.u8()? != 0;
         let count = r.u32()? as usize;
-        let mut fields = Vec::with_capacity(count.min(256));
+        if count > MAX_INDEX_FIELDS {
+            return Err(DocError::Protocol(format!(
+                "index field count {count} exceeds max {MAX_INDEX_FIELDS}"
+            )));
+        }
+        let mut fields = Vec::with_capacity(count);
         for _ in 0..count {
             fields.push(r.lp_string()?);
         }
@@ -414,7 +427,12 @@ impl FindPayload {
         let collection = r.lp_string()?;
         let filter = r.lp()?.to_vec();
         let sort_count = r.u32()?;
-        let mut sort = Vec::with_capacity(sort_count.min(64));
+        if sort_count > MAX_SORT_FIELDS {
+            return Err(DocError::Protocol(format!(
+                "sort field count {sort_count} exceeds max {MAX_SORT_FIELDS}"
+            )));
+        }
+        let mut sort = Vec::with_capacity(sort_count);
         for _ in 0..sort_count {
             let field = r.lp_string()?;
             let asc = r.u8()? != 0;
@@ -454,7 +472,12 @@ fn put_field_list(out: &mut Vec<u8>, fields: &[String]) {
 
 fn take_field_list(r: &mut Reader<'_>) -> DocResult<Vec<String>> {
     let n = r.u32()?;
-    let mut v = Vec::with_capacity(n.min(256));
+    if n > MAX_FIELD_LIST {
+        return Err(DocError::Protocol(format!(
+            "field list count {n} exceeds max {MAX_FIELD_LIST}"
+        )));
+    }
+    let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         v.push(r.lp_string()?);
     }
@@ -725,12 +748,7 @@ pub fn encode_watch_ack(resume_token: &[u8]) -> Vec<u8> {
 
 /// Encode a Watch EVENT:
 /// `[WATCH_FRAME_EVENT][resume_token lp][op u8][doc_id lp][body lp]`.
-pub fn encode_watch_event(
-    resume_token: &[u8],
-    op: u8,
-    doc_id: &[u8],
-    body: &[u8],
-) -> Vec<u8> {
+pub fn encode_watch_event(resume_token: &[u8], op: u8, doc_id: &[u8], body: &[u8]) -> Vec<u8> {
     let mut out = vec![WATCH_FRAME_EVENT];
     put_lp(&mut out, resume_token);
     out.push(op);
@@ -993,6 +1011,56 @@ impl DocUpdateIfMatchPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_count_fields_rejected_without_huge_allocation() {
+        // IndexDefPayload: collection, index name, unique, then count = u32::MAX.
+        // Before the cap, the direction-default path did `vec![true; count]`
+        // (multi-GB) even though every other path bounds the loop by bytes.
+        let mut p = Vec::new();
+        put_lp(&mut p, b"users");
+        put_lp(&mut p, b"idx");
+        p.push(0u8); // unique = false
+        p.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            IndexDefPayload::decode(&p),
+            Err(DocError::Protocol(_))
+        ));
+
+        // FindPayload: collection, filter, then sort_count = u32::MAX.
+        let mut f = Vec::new();
+        put_lp(&mut f, b"users");
+        put_lp(&mut f, br"{}");
+        f.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            FindPayload::decode(&f),
+            Err(DocError::Protocol(_))
+        ));
+
+        // Projection field list: valid prefix, then count = u32::MAX.
+        let mut fl = Vec::new();
+        put_lp(&mut fl, b"users");
+        put_lp(&mut fl, br"{}");
+        fl.extend_from_slice(&0u32.to_be_bytes()); // no sort
+        fl.push(PROJ_INCLUDE);
+        fl.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            FindPayload::decode(&fl),
+            Err(DocError::Protocol(_))
+        ));
+
+        // Sane counts still decode.
+        let ok = IndexDefPayload {
+            collection: "users".into(),
+            index_name: "by_age".into(),
+            fields: vec!["age".into()],
+            unique: false,
+            expire_after_seconds: 0,
+            directions: vec![true],
+        };
+        let decoded = IndexDefPayload::decode(&ok.encode()).unwrap();
+        assert_eq!(decoded.fields, vec!["age".to_string()]);
+    }
 
     #[test]
     fn unused_write_flag_bits_rejected() {

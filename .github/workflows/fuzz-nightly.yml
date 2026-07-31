@@ -1,0 +1,58 @@
+# Longer fuzz budgets with corpus cache. PR gate stays in ci.yml fuzz-smoke.
+name: Fuzz nightly
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-
+      - name: Fuzz all targets
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          targets=(
+            decode_envelope
+            fuzz_dispatch
+            wal_parser
+            sstable_reader
+            manifest_parser
+            ipc_envelope
+            fuzz_filter
+            fuzz_update
+            fuzz_aggregate
+            fuzz_index_key
+          )
+          for t in "${targets[@]}"; do
+            echo "==> fuzz $t"
+            mkdir -p "corpus/$t"
+            cargo fuzz run "$t" -- -max_total_time=180 -artifact_prefix="artifacts/${t}-"
+          done
+      - name: Save fuzz corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.sha }}
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts
+          if-no-files-found: ignore

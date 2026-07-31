@@ -10,7 +10,9 @@ use tempfile::TempDir;
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN};
 
-use zydecodb_document::wire::{DocPutPayload, FindPayload, IndexDefPayload, WireProjection};
+use zydecodb_document::wire::{
+    DocPutPayload, FindPayload, IndexDefPayload, UpdatePayload, WireProjection,
+};
 
 #[test]
 fn test_filter_complexity_exhaustion() {
@@ -108,6 +110,98 @@ fn test_filter_complexity_exhaustion() {
         // If it crashed (stack overflow), that's also a vulnerability
         panic!("VULNERABILITY SURFACED: Server crashed on deeply nested filter (likely Stack Overflow)");
     }
+
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn test_deep_graft_update_rejected_without_crash() {
+    let tmp = TempDir::new().unwrap();
+    let addr = free_addr();
+    let config = base_config(&tmp, addr);
+
+    let server = zydecodb::server::Server::new();
+    let shutdown = server.shutdown_flag();
+    let handle = thread::spawn(move || server.run(config).unwrap());
+
+    let mut stream = wait_connect(addr);
+
+    let idx = IndexDefPayload {
+        collection: "test".to_string(),
+        index_name: "idx_a".to_string(),
+        fields: vec!["a".to_string()],
+        unique: false,
+        expire_after_seconds: 0,
+        directions: vec![true],
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::IndexDef, idx.encode()),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+
+    let put = DocPutPayload {
+        collection: "test".to_string(),
+        doc_id: b"doc1".to_vec(),
+        body: b"{\"a\": 1}".to_vec(),
+        relaxed: false,
+        expires_at: 0,
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::DocPut, put.encode()),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+
+    // A dotted path is a flat JSON string — serde's parse depth cap does not
+    // bound it. 5000 segments would graft 5000 nesting levels in ONE update
+    // (and blow the stack on the next read) if the path cap didn't reject it.
+    let path = std::iter::repeat("s")
+        .take(5000)
+        .enumerate()
+        .map(|(i, s)| format!("{s}{i}"))
+        .collect::<Vec<_>>()
+        .join(".");
+    let update_json = format!("{{\"$set\": {{\"{path}\": 1}}}}");
+    let upd = UpdatePayload {
+        collection: "test".to_string(),
+        filter: br#"{"a": 1}"#.to_vec(),
+        update: update_json.into_bytes(),
+        multi: false,
+        relaxed: false,
+        upsert: false,
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::Update, upd.encode()),
+    );
+    let resp = read_response(&mut stream);
+    assert_ne!(
+        resp.status,
+        Status::Ok,
+        "a 5000-segment graft path must be rejected, not applied"
+    );
+
+    // The server survived: the document is still intact and readable.
+    let find = FindPayload {
+        collection: "test".to_string(),
+        filter: br#"{"a": 1}"#.to_vec(),
+        sort: vec![],
+        projection: WireProjection::None,
+        skip: 0,
+        limit: 10,
+        cursor: vec![],
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::Find, find.encode()),
+    );
+    assert_eq!(
+        read_response(&mut stream).status,
+        Status::Ok,
+        "server must still answer after rejecting the deep graft"
+    );
 
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();

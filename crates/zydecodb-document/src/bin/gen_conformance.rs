@@ -609,7 +609,13 @@ fn payload_vectors() -> Vec<Value> {
         b"zdk_example".to_vec(),
     ));
     v.push(req("ping", "Ping", json!({}), Command::Ping, Vec::new()));
-    v.push(req("stats_empty", "Stats", json!({}), Command::Stats, Vec::new()));
+    v.push(req(
+        "stats_empty",
+        "Stats",
+        json!({}),
+        Command::Stats,
+        Vec::new(),
+    ));
     let tenant = [0x11u8; 16];
     v.push(req(
         "set_context",
@@ -812,19 +818,31 @@ fn response_vectors() -> Vec<Value> {
         ("status_io_error", Status::IoError, "disk write failed"),
         ("status_invalid_key", Status::InvalidKey, "key too long"),
         ("status_invalid_value", Status::InvalidValue, "bad document"),
-        ("status_engine_busy", Status::EngineBusy, "rate limit exceeded"),
+        (
+            "status_engine_busy",
+            Status::EngineBusy,
+            "rate limit exceeded",
+        ),
         (
             "status_protocol_error",
             Status::ProtocolError,
             "unknown command 0x99",
         ),
-        ("status_policy_rejected", Status::PolicyRejected, "quota exceeded"),
+        (
+            "status_policy_rejected",
+            Status::PolicyRejected,
+            "quota exceeded",
+        ),
         (
             "status_unsupported_format",
             Status::UnsupportedFormat,
             "unknown sstable version",
         ),
-        ("status_unauthorized", Status::Unauthorized, "invalid api key"),
+        (
+            "status_unauthorized",
+            Status::Unauthorized,
+            "invalid api key",
+        ),
         ("status_forbidden", Status::Forbidden, "read-only key"),
     ] {
         let env = if detail.is_empty() {

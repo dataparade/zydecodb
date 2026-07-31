@@ -1,0 +1,10 @@
+{
+  "elapsed_ms": 1339,
+  "mix": "75% get / 25% put, 10k key hot set",
+  "ops": 50000,
+  "ops_sec": 37333.7533191424,
+  "p50_us": 0,
+  "p99_us": 5,
+  "rss_bytes": 7176192,
+  "hw_note": "AMD Ryzen 5 3600 / 62GiB / NVMe / Linux 6.8 — seed baseline for COMPARE=1; GHA uses +20% or absolute floor"
+}

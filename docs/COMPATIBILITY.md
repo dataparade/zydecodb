@@ -172,6 +172,14 @@ but runtime compatibility is the wire — not lockstep minors. Full policy:
 
 ## Cutting a release
 
+**Pre-tag gates** (mandatory before any RC / 1.0 tag) — see
+[`GUIDE.md` Release checklist](GUIDE.md#release-checklist-pre-tag):
+
+- [ ] 90m paced soak + `analyze-soak.py --mode stability` exit 0
+      (or green `.github/workflows/release-soak.yml`)
+- [ ] `MODE=both` tenant-isolation soak exit 0 (same workflow / nightly on RC commit)
+- [ ] (RC) 24h uncapped VPS soak archived under `docs/soak-baselines/`
+
 Bump versions in `Cargo.toml`, `clients/python/pyproject.toml`, and
 `clients/typescript/package.json` on the release commit. Update
 [`CHANGELOG.md`](../CHANGELOG.md). Then tag **both** the root and Go module
@@ -220,14 +228,102 @@ After the first install (`scripts/install.sh` or a release tarball), upgrade the
 
 ```bash
 zydecodb update --check    # print current vs available; exit 1 if newer exists
-zydecodb update            # download, sha256-verify, replace this binary
+zydecodb update            # sha256 + gh attestation verify, then replace binary
 zydecodb update --yes      # non-interactive
 zydecodb update --version v0.11.0
 zydecodb update --force    # reinstall same version, or allow a major jump
+zydecodb update --skip-attestation   # airgap / no gh CLI; SHA-256 still required
 ```
 
 `update` uses the same GitHub Release assets as `install.sh`
-(`zydecodb-${tag}-${target}.tar.gz` + `.sha256`). It does **not** update data
-directories, config, or language drivers (still pip / npm / `go get`). Restart
-any running `zydecodb serve` after a successful update — the old process keeps
-the previous inode until it exits.
+(`zydecodb-${tag}-${target}.tar.gz` + `.sha256`). After checksum verify it runs
+`gh attestation verify` by default and **refuses to install** on failure or if
+`gh` is missing — use `--skip-attestation` only when you intentionally opt out.
+It does **not** update data directories, config, or language drivers (still pip /
+npm / `go get`). Restart any running `zydecodb serve` after a successful update —
+the old process keeps the previous inode until it exits.
+
+## Prometheus metric names (1.0 freeze)
+
+Published series names below are part of the 1.0 contract. **Renames are
+breaking** and require a major version bump. New series may be added in 1.x
+minors. Source of truth: `crates/zydecodb-engine/src/metrics.rs` plus replica
+gauges registered in `crates/zydecodb/src/server.rs`.
+
+### Engine registry (`Metrics`)
+
+- `zydecodb_wal_bytes_written_total`
+- `zydecodb_wal_group_commit_syncs_total`
+- `zydecodb_wal_fsync_duration_seconds`
+- `zydecodb_wal_segment_count`
+- `zydecodb_wal_unshipped_bytes`
+- `zydecodb_sstable_flushes_total`
+- `zydecodb_sstable_get_duration_seconds`
+- `zydecodb_bloom_false_positives_total`
+- `zydecodb_memtable_size_bytes`
+- `zydecodb_immutable_memtable_count`
+- `zydecodb_live_sstable_count`
+- `zydecodb_live_sstables_by_level` (label `level`)
+- `zydecodb_compaction_jobs_total`
+- `zydecodb_compaction_bytes_read_total`
+- `zydecodb_compaction_bytes_written_total`
+- `zydecodb_compaction_duration_seconds`
+- `zydecodb_compaction_queue_depth`
+- `zydecodb_compaction_worker_busy`
+- `zydecodb_compaction_versions_dropped_total`
+- `zydecodb_compaction_tombstones_dropped_total`
+- `zydecodb_compaction_expired_dropped_total`
+- `zydecodb_ttl_sweep_tombstones_total`
+- `zydecodb_compaction_repack_total`
+- `zydecodb_compaction_rejected_no_progress_total`
+- `zydecodb_compaction_jobs_by_input_level_total` (label `input_level`)
+- `zydecodb_compaction_apply_duration_seconds`
+- `zydecodb_manifest_syncs_total`
+- `zydecodb_manifest_sync_duration_seconds`
+- `zydecodb_pending_compaction_bytes`
+- `zydecodb_user_bytes_written_total`
+- `zydecodb_block_cache_hits_total`
+- `zydecodb_block_cache_misses_total`
+- `zydecodb_block_cache_compaction_reads_total`
+- `zydecodb_block_cache_evictions_total`
+- `zydecodb_block_cache_resident_bytes`
+- `zydecodb_block_cache_resident_entries`
+- `zydecodb_result_cache_hits_total` (registered when result cache enabled)
+- `zydecodb_result_cache_misses_total` (registered when result cache enabled)
+- `zydecodb_result_cache_evictions_total` (registered when result cache enabled)
+- `zydecodb_result_cache_resident_bytes` (registered when result cache enabled)
+- `zydecodb_disk_bytes_total`
+- `zydecodb_logical_live_bytes`
+- `zydecodb_space_amplification`
+- `zydecodb_last_durable_seq`
+- `zydecodb_last_shutdown_clean`
+- `zydecodb_change_stream_subscriptions`
+- `zydecodb_change_stream_events_total`
+- `zydecodb_change_stream_heartbeats_total`
+- `zydecodb_change_stream_disconnects_total` (label `reason`)
+- `zydecodb_change_stream_consumer_lag_seqs`
+- `zydecodb_change_log_archive_segments`
+- `zydecodb_change_log_archive_bytes`
+- `zydecodb_change_log_earliest_seq`
+- `zydecodb_change_log_latest_seq`
+- `zydecodb_snapshot_duration_seconds`
+- `zydecodb_restore_duration_seconds`
+- `zydecodb_tx_begin_total`
+- `zydecodb_tx_commit_total`
+- `zydecodb_tx_abort_total`
+- `zydecodb_tx_timeout_total`
+- `zydecodb_errors_total` (label `code`)
+
+### Server-registered replica gauges
+
+Registered into the shared registry when `[replica].from` is set:
+
+- `zydecodb_replica_lag_seqs`
+- `zydecodb_replica_heartbeat_age_seconds`
+- `zydecodb_replica_lag_seconds`
+
+### Optional per-tenant series
+
+When `[metrics].per_tenant = true`, the server also registers:
+
+- `zydecodb_tenant_requests_total` (labels `tenant`, `command`, `status`)

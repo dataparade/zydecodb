@@ -661,8 +661,10 @@ impl Engine {
         let sealed_id = self.active_wal_id;
         let sealed_max = self.wal_sync.buffered_seq();
         self.sealed_segment_max_seq.insert(sealed_id, sealed_max);
-        self.ship_sealed_segment(sealed_id);
-        self.archive_sealed_segment(sealed_id, sealed_max);
+        // Propagate ship/archive errors so failpoint return-mode is observable.
+        // Production roll paths keep best-effort logging via ship_sealed_segment.
+        self.ship_sealed_segment_result(sealed_id)?;
+        self.archive_sealed_segment_result(sealed_id, sealed_max)?;
         self.active_wal_id += 1;
         self.open_new_wal_segment()
     }

@@ -19,6 +19,10 @@ failpoints = ["zydecodb-engine/failpoints", "fail"]
 name = "zydecodb"
 path = "src/main.rs"
 
+[[bin]]
+name = "ref-workloads"
+path = "src/bin/ref-workloads.rs"
+
 [dependencies]
 zydecodb-engine = { path = "../zydecodb-engine" }
 zydecodb-document = { path = "../zydecodb-document" }

@@ -1,0 +1,57 @@
+# Pre-RC release gates: 90m paced soak (stability) + tenant-isolation (MODE=both).
+# workflow_dispatch only — not on every PR and not on tag publish.
+# Checklist: green run of this workflow (or equivalent local) before tags.
+name: Release soak (pre-RC)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  soak-90m:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: 90m paced soak + stability analyzer
+        env:
+          HOURS: "1.5"
+          OPS: "3000"
+          OUT_DIR: ${{ runner.temp }}/zydeco-release-soak-90m
+        run: |
+          set -euo pipefail
+          ./scripts/soak.sh --no-analyze
+          python3 scripts/analyze-soak.py --mode stability \
+            "${OUT_DIR}/metrics.jsonl"
+      - name: Upload 90m soak metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-soak-90m-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/zydeco-release-soak-90m/metrics.jsonl
+            ${{ runner.temp }}/zydeco-release-soak-90m/stderr.log
+          if-no-files-found: ignore
+
+  tenant-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Tenant isolation soak (MODE=both)
+        env:
+          MODE: both
+          RELEASE: "1"
+          DATA_ROOT: ${{ runner.temp }}/zydeco-release-tenant-soak
+          JSON_OUT: ${{ runner.temp }}/zydeco-release-tenant-soak/summary.json
+        run: ./scripts/tenant-isolation-soak.sh
+      - name: Upload tenant-isolation summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-tenant-isolation-${{ github.run_id }}
+          path: ${{ runner.temp }}/zydeco-release-tenant-soak/summary.json
+          if-no-files-found: ignore

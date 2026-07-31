@@ -85,7 +85,7 @@ impl UpdateDoc {
             }
             op.apply(doc)?;
         }
-        Ok(())
+        check_result_depth(doc)
     }
 
     /// Apply operators for an upsert insert: `$setOnInsert` first, then regular
@@ -107,7 +107,30 @@ impl UpdateDoc {
             }
             op.apply(doc)?;
         }
-        Ok(())
+        check_result_depth(doc)
+    }
+}
+
+/// Total document depth an update may produce. A dotted path is a flat JSON
+/// string, so serde_json's parse depth cap does NOT bound grafting — without
+/// this check, repeated `$set` ratchets a document past the read path's
+/// [`crate::binary::MAX_ZDOC_DEPTH`] guard until reads blow the stack. The
+/// mutation happens on an in-memory clone; on error nothing is persisted.
+fn check_result_depth(doc: &Value) -> DocResult<()> {
+    if value_depth(doc) > crate::binary::MAX_ZDOC_DEPTH {
+        return Err(DocError::BadUpdate(format!(
+            "update would nest the document deeper than {} levels",
+            crate::binary::MAX_ZDOC_DEPTH
+        )));
+    }
+    Ok(())
+}
+
+fn value_depth(v: &Value) -> usize {
+    match v {
+        Value::Array(a) => 1 + a.iter().map(value_depth).max().unwrap_or(0),
+        Value::Object(m) => 1 + m.values().map(value_depth).max().unwrap_or(0),
+        _ => 1,
     }
 }
 
@@ -132,9 +155,20 @@ fn parse_op(op: &str, path: &str, operand: &Value) -> DocResult<UpdateOp> {
     })
 }
 
+/// Bound on segments in one update path. A single flat dotted string is not
+/// subject to any JSON parse depth cap, so an unbounded segment count would
+/// graft thousands of nesting levels in ONE update.
+const MAX_UPDATE_PATH_SEGMENTS: usize = 64;
+
 /// Validate path shape at parse time. Filtered `$[field=value]` is `$set`-only.
 fn validate_update_path(op: &str, path: &str) -> DocResult<()> {
     let segs = tokenize_path(path)?;
+    if segs.len() > MAX_UPDATE_PATH_SEGMENTS {
+        return Err(DocError::BadUpdate(format!(
+            "path has {} segments (max {MAX_UPDATE_PATH_SEGMENTS})",
+            segs.len()
+        )));
+    }
     let mut filtered = 0usize;
     for seg in &segs {
         match seg {
@@ -493,7 +527,7 @@ fn updated_body(
         }
     }
     let old: Value = if stored[0] == crate::store::VK_ZDOC {
-        crate::binary::ValueView::new(strip_value_kind(&stored)).to_value()
+        crate::binary::ValueView::new(strip_value_kind(&stored)).to_value()?
     } else {
         serde_json::from_slice(strip_value_kind(&stored))
             .map_err(|e| DocError::InvalidJson(e.to_string()))?
@@ -742,6 +776,39 @@ mod tests {
     }
 
     #[test]
+    fn path_over_segment_cap_rejected_at_parse() {
+        // A dotted path is a flat JSON string: serde's depth cap never sees it.
+        let path = (0..MAX_UPDATE_PATH_SEGMENTS + 1)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        let u = json!({"$set": { path: 1 }});
+        assert!(matches!(
+            UpdateDoc::parse(&u),
+            Err(DocError::BadUpdate(_))
+        ));
+
+        // Exactly at the cap still parses.
+        let ok_path = (0..MAX_UPDATE_PATH_SEGMENTS)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        assert!(UpdateDoc::parse(&json!({"$set": { ok_path: 1 }})).is_ok());
+    }
+
+    #[test]
+    fn apply_rejects_document_beyond_depth_cap() {
+        // Defense in depth: if a too-deep document is ever in play, grafting
+        // onto it is rejected rather than ratcheting it deeper.
+        let mut deep = json!(1);
+        for _ in 0..crate::binary::MAX_ZDOC_DEPTH + 20 {
+            deep = json!({ "d": deep });
+        }
+        let u = UpdateDoc::parse(&json!({"$set": {"x": 1}})).unwrap();
+        assert!(matches!(u.apply(&mut deep), Err(DocError::BadUpdate(_))));
+    }
+
+    #[test]
     fn set_inc_unset_push() {
         let doc = json!({"name": "a", "n": 1, "tags": ["x"]});
         let out = apply(
@@ -809,7 +876,7 @@ mod tests {
         let u = UpdateDoc::parse(&json!({"$set": {"email": "a@b.c", "n": 1}})).unwrap();
         let (id, body) = materialize_upsert(&f, &u).unwrap();
         assert_eq!(id, b"x");
-        let v = crate::binary::ValueView::new(&body).to_value();
+        let v = crate::binary::ValueView::new(&body).to_value().unwrap();
         assert_eq!(v["_id"], json!("x"));
         assert_eq!(v["email"], json!("a@b.c"));
         assert_eq!(v["n"], json!(1));
@@ -824,7 +891,7 @@ mod tests {
         }))
         .unwrap();
         let (_, body) = materialize_upsert(&f, &u).unwrap();
-        let v = crate::binary::ValueView::new(&body).to_value();
+        let v = crate::binary::ValueView::new(&body).to_value().unwrap();
         assert_eq!(v["created"], json!(true));
         // Regular $set wins over $setOnInsert on the same path.
         assert_eq!(v["n"], json!(1));
@@ -851,7 +918,7 @@ mod tests {
         assert!(doc.get("created").is_none());
         let f = Filter::parse(&json!({"_id": "x"})).unwrap();
         let (_, body) = materialize_upsert(&f, &u).unwrap();
-        let v = crate::binary::ValueView::new(&body).to_value();
+        let v = crate::binary::ValueView::new(&body).to_value().unwrap();
         assert_eq!(v["created"], json!(true));
     }
 

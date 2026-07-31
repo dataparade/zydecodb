@@ -25,6 +25,15 @@ impl TenantQuotaPolicy {
         }
     }
 
+    /// Seed usage counters from a startup scan of the keyspace
+    /// (`Engine::tenant_usage_bytes`) so byte caps are enforced against data
+    /// written before this process started. Without this, every restart
+    /// silently reset each tenant's usage to zero.
+    pub fn seed_usage(&self, usage: std::collections::HashMap<[u8; 16], u64>) {
+        let mut guard = self.usage.lock().unwrap();
+        *guard = usage;
+    }
+
     /// Effective cap for a tenant: per-tenant override, else the global default.
     /// `0` means unlimited.
     fn cap_for(&self, tenant: &[u8; 16]) -> u64 {
@@ -105,5 +114,49 @@ impl WritePolicy for TenantQuotaPolicy {
             let new_total = current.saturating_sub(freed) + value_len as u64;
             usage.insert(tenant, new_total);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zydecodb_engine::engine::{Engine, EngineConfig};
+
+    fn tenant_key(tenant: u8, client: &[u8]) -> Vec<u8> {
+        let mut k = vec![KS_USER];
+        k.extend_from_slice(&[tenant; 16]);
+        k.extend_from_slice(client);
+        k
+    }
+
+    #[test]
+    fn seeded_usage_enforces_cap_for_pre_existing_data() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut engine = Engine::open(EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal_dir: dir.path().join("wal"),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let policy = TenantQuotaPolicy::new(100, Arc::new(TenantLimits::default()));
+        let mut usage = std::collections::HashMap::new();
+        usage.insert([3u8; 16], 90u64); // 90 of 100 bytes used before restart
+        policy.seed_usage(usage);
+
+        // 11 more bytes crosses the cap: rejected even though this process
+        // never saw the earlier 90 bytes written.
+        let err = policy
+            .pre_write(&mut engine, &tenant_key(3, b"k"), 11, None, false)
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PolicyRejected(_)));
+        // 10 bytes exactly fits.
+        policy
+            .pre_write(&mut engine, &tenant_key(3, b"k"), 10, None, false)
+            .unwrap();
+        // A different tenant starts at its own zero.
+        policy
+            .pre_write(&mut engine, &tenant_key(4, b"k"), 100, None, false)
+            .unwrap();
     }
 }

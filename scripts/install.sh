@@ -1,11 +1,11 @@
 #!/bin/sh
 # ==============================================================================
-# ZydecoDB installer — https://zydecodb.com/install.sh
+# ZydecoDB installer — https://zydeco.dev/install.sh
 # ==============================================================================
 # Downloads the prebuilt zydecodb binary for this OS/arch from GitHub Releases,
 # verifies its sha256, and installs it onto your PATH.
 #
-#   curl -sSL https://zydecodb.com/install.sh | sh
+#   curl -sSL https://zydeco.dev/install.sh | sh
 #
 # Options (environment variables):
 #   ZYDECODB_VERSION      — install a specific tag (e.g. v0.9.0-beta.1).

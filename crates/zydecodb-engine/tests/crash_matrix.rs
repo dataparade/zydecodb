@@ -53,6 +53,28 @@ fn open(dir: &TempDir) -> Engine {
     .expect("engine open")
 }
 
+fn open_with_ship_and_changelog(dir: &TempDir) -> Engine {
+    let data = dir.path().join("data");
+    let wal = data.join("wal");
+    let ship = dir.path().join("ship");
+    let archive = dir.path().join("change_log");
+    std::fs::create_dir_all(&ship).unwrap();
+    std::fs::create_dir_all(&archive).unwrap();
+    Engine::open(EngineConfig {
+        data_dir: data,
+        wal_dir: wal,
+        ..Default::default()
+    })
+    .expect("engine open")
+    .with_shipping(Some(ship), zydecodb_engine::shipping::ShipMode::Copy)
+    .with_change_log(zydecodb_engine::change_log::ChangeLogConfig {
+        archive_dir: archive,
+        retention_secs: 3600,
+        retention_bytes: 64 * 1024 * 1024,
+    })
+    .expect("enable change log")
+}
+
 /// Crash modes the matrix exercises. Each maps to a `fail` actions string.
 #[derive(Debug, Clone, Copy)]
 enum Mode {
@@ -86,10 +108,32 @@ enum Trigger {
     /// The failpoint sits on the compaction path; the test must do enough
     /// flushes to trip the L0 compaction trigger.
     Compaction,
+    /// Seal the active WAL segment (fires segment-roll / ship / change-log
+    /// archive points when those subsystems are configured).
+    RollWal,
+    /// Capture a base snapshot into a subdirectory of the temp dir.
+    Snapshot,
 }
 
 /// Drive one (failpoint, mode) case end-to-end.
 fn run_case(failpoint: &str, mode: Mode, trigger: Trigger) {
+    let needs_ship = matches!(
+        failpoint,
+        SHIP_BEFORE_SEGMENT
+            | SHIP_AFTER_SEGMENT
+            | SHIP_BEFORE_LOG_APPEND
+            | SHIP_AFTER_LOG_APPEND
+            | CHANGELOG_BEFORE_ARCHIVE
+            | CHANGELOG_AFTER_ARCHIVE
+            | CHANGELOG_BEFORE_MANIFEST_RENAME
+            | CHANGELOG_AFTER_MANIFEST_RENAME
+            | WAL_BEFORE_SEGMENT_ROLL
+            | WAL_AFTER_SEGMENT_ROLL
+    );
+    run_case_inner(failpoint, mode, trigger, needs_ship);
+}
+
+fn run_case_inner(failpoint: &str, mode: Mode, trigger: Trigger, with_ship_changelog: bool) {
     let _guard = fail_lock().lock().unwrap_or_else(|p| p.into_inner());
     let scenario = fail::FailScenario::setup();
 
@@ -102,7 +146,11 @@ fn run_case(failpoint: &str, mode: Mode, trigger: Trigger) {
         (uk(b"pre_3"), b"c".to_vec()),
     ];
     {
-        let mut e = open(&dir);
+        let mut e = if with_ship_changelog {
+            open_with_ship_and_changelog(&dir)
+        } else {
+            open(&dir)
+        };
         for (k, v) in &pre {
             e.put(k.clone(), v.clone(), 0).expect("baseline put");
         }
@@ -113,11 +161,9 @@ fn run_case(failpoint: &str, mode: Mode, trigger: Trigger) {
         // Engine drops here; data is on disk.
     }
 
-    // Phase 2: arm the failpoint and attempt the offending op.
-    fail::cfg(failpoint, mode.actions()).unwrap_or_else(|e| {
-        panic!("failed to arm {}: {:?}", failpoint, e);
-    });
-
+    // Phase 2: open cleanly, then arm the failpoint and attempt the offending
+    // op. Arming after open avoids ship/changelog reconcile during
+    // `with_change_log` consuming the one-shot return action.
     let crash_key = uk(b"crash_key");
     let crash_val = b"crash_val".to_vec();
     // `outcome` records whichever call hit the failpoint, so the assertions
@@ -126,7 +172,14 @@ fn run_case(failpoint: &str, mode: Mode, trigger: Trigger) {
     // panic cases that need an even more specific state to trigger).
     let mut outcome: Result<(), EngineError> = Ok(());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut e = open(&dir);
+        let mut e = if with_ship_changelog {
+            open_with_ship_and_changelog(&dir)
+        } else {
+            open(&dir)
+        };
+        fail::cfg(failpoint, mode.actions()).unwrap_or_else(|err| {
+            panic!("failed to arm {}: {:?}", failpoint, err);
+        });
         let put_res = e.put(crash_key.clone(), crash_val.clone(), 0);
         if let Err(err) = &put_res {
             outcome = Err(EngineError::Io(err.to_string()));
@@ -160,6 +213,17 @@ fn run_case(failpoint: &str, mode: Mode, trigger: Trigger) {
                     }
                 }
             }
+            Trigger::RollWal => {
+                if let Err(err) = e.force_roll_wal_for_test() {
+                    outcome = Err(EngineError::Io(err.to_string()));
+                }
+            }
+            Trigger::Snapshot => {
+                let snap = dir.path().join("snap");
+                if let Err(err) = e.snapshot_to(&snap) {
+                    outcome = Err(EngineError::Io(err.to_string()));
+                }
+            }
         }
     }));
 
@@ -181,7 +245,11 @@ fn run_case(failpoint: &str, mode: Mode, trigger: Trigger) {
     fail::remove(failpoint);
 
     // Phase 3: reopen. Must succeed cleanly.
-    let mut e = open(&dir);
+    let mut e = if with_ship_changelog {
+        open_with_ship_and_changelog(&dir)
+    } else {
+        open(&dir)
+    };
 
     // a) All acked baseline writes must be visible.
     for (k, v) in &pre {
@@ -480,8 +548,101 @@ crash_case!(
     Trigger::Compaction
 );
 
-// Segment-roll points only fire when the active segment is full. Triggering
-// that in a unit test would require writing >64 MB of WAL, which is too
-// expensive for the per-PR matrix. They're covered by the soak run instead.
-// Their failpoint constants are still exported and assertable; see
-// `tests/format_versions.rs` (Phase 1.3) for static-shape coverage.
+// Segment roll via force_roll_wal_for_test (no 64MB write required).
+crash_case!(
+    wal_before_segment_roll_return,
+    WAL_BEFORE_SEGMENT_ROLL,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    wal_before_segment_roll_panic,
+    WAL_BEFORE_SEGMENT_ROLL,
+    Mode::Panic,
+    Trigger::RollWal
+);
+crash_case!(
+    wal_after_segment_roll_return,
+    WAL_AFTER_SEGMENT_ROLL,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    wal_after_segment_roll_panic,
+    WAL_AFTER_SEGMENT_ROLL,
+    Mode::Panic,
+    Trigger::RollWal
+);
+
+crash_case!(
+    ship_before_segment_return,
+    SHIP_BEFORE_SEGMENT,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    ship_before_segment_panic,
+    SHIP_BEFORE_SEGMENT,
+    Mode::Panic,
+    Trigger::RollWal
+);
+crash_case!(
+    ship_after_segment_return,
+    SHIP_AFTER_SEGMENT,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    ship_before_log_append_return,
+    SHIP_BEFORE_LOG_APPEND,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    ship_after_log_append_return,
+    SHIP_AFTER_LOG_APPEND,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    changelog_before_archive_return,
+    CHANGELOG_BEFORE_ARCHIVE,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    changelog_after_archive_return,
+    CHANGELOG_AFTER_ARCHIVE,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    changelog_before_manifest_rename_return,
+    CHANGELOG_BEFORE_MANIFEST_RENAME,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    changelog_after_manifest_rename_return,
+    CHANGELOG_AFTER_MANIFEST_RENAME,
+    Mode::Return,
+    Trigger::RollWal
+);
+crash_case!(
+    snapshot_before_publish_return,
+    SNAPSHOT_BEFORE_PUBLISH,
+    Mode::Return,
+    Trigger::Snapshot
+);
+crash_case!(
+    snapshot_after_publish_return,
+    SNAPSHOT_AFTER_PUBLISH,
+    Mode::Return,
+    Trigger::Snapshot
+);
+crash_case!(
+    snapshot_before_publish_panic,
+    SNAPSHOT_BEFORE_PUBLISH,
+    Mode::Panic,
+    Trigger::Snapshot
+);

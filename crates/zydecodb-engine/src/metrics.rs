@@ -99,13 +99,26 @@ pub struct Metrics {
     pub change_stream_events_total: IntCounter,
     pub change_stream_heartbeats_total: IntCounter,
     pub change_stream_disconnects_total: IntCounterVec,
+    /// Latest change-log seq minus the slowest subscriber resume seq (0 if none).
+    pub change_stream_consumer_lag_seqs: IntGauge,
     pub change_log_archive_segments: IntGauge,
     pub change_log_archive_bytes: IntGauge,
     pub change_log_earliest_seq: IntGauge,
     pub change_log_latest_seq: IntGauge,
 
-    #[allow(dead_code)]
-    errors_total: IntCounterVec,
+    // ---- Snapshots / restore ----
+    pub snapshot_duration_seconds: Histogram,
+    /// Offline/admin restore wall time. Scraped when restore runs with Metrics.
+    pub restore_duration_seconds: Histogram,
+
+    // ---- Transactions ----
+    pub tx_begin_total: IntCounter,
+    pub tx_commit_total: IntCounter,
+    pub tx_abort_total: IntCounter,
+    pub tx_timeout_total: IntCounter,
+
+    /// Errors by status-code label (e.g. `Unauthorized`, `Forbidden`).
+    pub errors_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -113,6 +126,16 @@ impl Metrics {
         let registry = Registry::new();
         let m = Self::build(registry, false);
         Arc::new(m)
+    }
+
+    /// Increment `zydecodb_errors_total` for a non-Ok wire status.
+    pub fn record_status_error(&self, status: crate::errors::Status) {
+        if matches!(status, crate::errors::Status::Ok) {
+            return;
+        }
+        self.errors_total
+            .with_label_values(&[&format!("{status:?}")])
+            .inc();
     }
 
     /// Like [`Self::new`], but registers result-cache series immediately.
@@ -412,6 +435,11 @@ impl Metrics {
             &["reason"],
         )
         .unwrap();
+        let change_stream_consumer_lag_seqs = IntGauge::with_opts(Opts::new(
+            "zydecodb_change_stream_consumer_lag_seqs",
+            "Change-stream lag: latest change-log seq minus slowest subscriber resume seq",
+        ))
+        .unwrap();
         let change_log_archive_segments = IntGauge::with_opts(Opts::new(
             "zydecodb_change_log_archive_segments",
             "Retained change-log archive segments",
@@ -430,6 +458,34 @@ impl Metrics {
         let change_log_latest_seq = IntGauge::with_opts(Opts::new(
             "zydecodb_change_log_latest_seq",
             "Latest retained change-log sequence",
+        ))
+        .unwrap();
+        let snapshot_duration_seconds = Histogram::with_opts(HistogramOpts::new(
+            "zydecodb_snapshot_duration_seconds",
+            "Wall-clock duration of Engine::snapshot_to",
+        ))
+        .unwrap();
+        let restore_duration_seconds = Histogram::with_opts(HistogramOpts::new(
+            "zydecodb_restore_duration_seconds",
+            "Wall-clock duration of admin restore",
+        ))
+        .unwrap();
+        let tx_begin_total =
+            IntCounter::with_opts(Opts::new("zydecodb_tx_begin_total", "Transactions begun"))
+                .unwrap();
+        let tx_commit_total = IntCounter::with_opts(Opts::new(
+            "zydecodb_tx_commit_total",
+            "Transactions committed",
+        ))
+        .unwrap();
+        let tx_abort_total = IntCounter::with_opts(Opts::new(
+            "zydecodb_tx_abort_total",
+            "Transactions aborted (rollback or failed commit)",
+        ))
+        .unwrap();
+        let tx_timeout_total = IntCounter::with_opts(Opts::new(
+            "zydecodb_tx_timeout_total",
+            "Transactions aborted due to timeout",
         ))
         .unwrap();
         let errors_total = IntCounterVec::new(
@@ -590,6 +646,9 @@ impl Metrics {
             .register(Box::new(change_stream_disconnects_total.clone()))
             .unwrap();
         registry
+            .register(Box::new(change_stream_consumer_lag_seqs.clone()))
+            .unwrap();
+        registry
             .register(Box::new(change_log_archive_segments.clone()))
             .unwrap();
         registry
@@ -600,6 +659,20 @@ impl Metrics {
             .unwrap();
         registry
             .register(Box::new(change_log_latest_seq.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(snapshot_duration_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(restore_duration_seconds.clone()))
+            .unwrap();
+        registry.register(Box::new(tx_begin_total.clone())).unwrap();
+        registry
+            .register(Box::new(tx_commit_total.clone()))
+            .unwrap();
+        registry.register(Box::new(tx_abort_total.clone())).unwrap();
+        registry
+            .register(Box::new(tx_timeout_total.clone()))
             .unwrap();
         registry.register(Box::new(errors_total.clone())).unwrap();
 
@@ -655,12 +728,25 @@ impl Metrics {
             change_stream_events_total,
             change_stream_heartbeats_total,
             change_stream_disconnects_total,
+            change_stream_consumer_lag_seqs,
             change_log_archive_segments,
             change_log_archive_bytes,
             change_log_earliest_seq,
             change_log_latest_seq,
+            snapshot_duration_seconds,
+            restore_duration_seconds,
+            tx_begin_total,
+            tx_commit_total,
+            tx_abort_total,
+            tx_timeout_total,
             errors_total,
         }
+    }
+
+    /// Observe admin restore wall time when a Metrics instance is available.
+    pub fn observe_restore(&self, duration: std::time::Duration) {
+        self.restore_duration_seconds
+            .observe(duration.as_secs_f64());
     }
 
     /// Render the registry in Prometheus text format. Includes any external
@@ -687,6 +773,13 @@ mod tests {
         assert!(out.contains("zydecodb_wal_bytes_written_total"));
         assert!(out.contains("zydecodb_sstable_flushes_total"));
         assert!(out.contains("zydecodb_memtable_size_bytes"));
+        assert!(out.contains("zydecodb_change_stream_consumer_lag_seqs"));
+        assert!(out.contains("zydecodb_snapshot_duration_seconds"));
+        assert!(out.contains("zydecodb_restore_duration_seconds"));
+        assert!(out.contains("zydecodb_tx_begin_total"));
+        assert!(out.contains("zydecodb_tx_commit_total"));
+        assert!(out.contains("zydecodb_tx_abort_total"));
+        assert!(out.contains("zydecodb_tx_timeout_total"));
         assert!(
             !out.contains("zydecodb_result_cache_hits_total"),
             "result-cache series stay off the scrape until enabled"

@@ -92,6 +92,10 @@ Fail-closed startup guards:
 
 - **Auth required + empty keys file + no bootstrap** → the server refuses to start (a server that can never authenticate anyone is a misconfiguration, not a service).
 - **`legacy_single_tenant = true` + any key with a non-zero tenant** → refused; the two key layouts must not be mixed. Set `legacy_single_tenant = false` for multi-tenant deployments.
+- **Group/world-readable `keys_file` or shipping/replica `hmac_key_file`** (Unix mode `& 0o077 != 0`) → refused; `chmod 600` the file.
+- **`data_dir` / `wal_dir` equal to `shipping.ship_dir` or `replica.from`** → refused (paths compared after canonicalize when possible).
+- **`ship_dir` / `replica.from` without `hmac_key_file`** → refused with an actionable generate/`chmod 600` message.
+- **Auth required + `max_bytes_per_tenant = 0`** → starts, but logs a warning to set a non-zero quota.
 
 Key verification is O(1): `admin keys create` stores a `secret_lookup` (sha256 of the secret) used as an index into the keystore, so auth performs exactly one argon2 verify regardless of how many keys exist. Keys minted before this field existed still verify via a linear scan — reissue them to get the fast path (the server logs a warning at startup when such keys are present).
 
@@ -147,6 +151,17 @@ enabled = true
 cert = "/etc/zydecodb/tls.crt"
 key  = "/etc/zydecodb/tls.key"
 ```
+
+#### TLS posture (1.0)
+
+- Implemented with **rustls** ([`security/tls.rs`](../crates/zydecodb/src/security/tls.rs)):
+  TLS **1.2+**, library default cipher suites, **no client-certificate (mTLS)** auth.
+- PEMs must be owner-readable only (`chmod 600`); serve refuses world-readable
+  secret files the same way as `keys.toml` / HMAC keys.
+- **Cert reload = process restart.** SIGHUP reloads API keys and tenant limits,
+  not TLS material. Rotate certs by installing new PEMs and restarting `serve`.
+- Prefer terminating TLS at a reverse proxy only when ZydecoDB stays on loopback
+  behind that proxy; otherwise enable `[tls]` on the data port.
 
 Dev self-signed cert:
 
@@ -339,6 +354,9 @@ Before exposing a ZydecoDB port beyond loopback:
 - [ ] `legacy_single_tenant = false` unless migrating an old volume
 - [ ] Firewall: `:9470` reachable only from app subnets; metrics port never published
 - [ ] Rate caps sized for your workload (`rate_limit_rps`, `max_connections`, `max_sort_buffer`, per-tenant quotas)
+- [ ] (Multi-party / external production) Seek an **external review** of this
+      threat model before others depend on it — process step, not a code gate.
+      Maintainer authz proof: [`INTERNAL.md`](INTERNAL.md#authorization-audit-matrix).
 
 ### Never do this
 
@@ -618,6 +636,22 @@ hardware fencing. If two nodes can write to physically separate stores, only you
 orchestrator's hard fencing prevents divergence. **Never deliberately run two
 primaries against the same shipped stream.**
 
+#### Promotion time
+
+CI drills (`promote_under_load`, fence timing fixtures) print `promote_ms` /
+`promote_timing_ms`. Order of magnitude on CI:
+
+| Step | Typical CI |
+|------|------------|
+| `replica promote` drain + epoch bump | **milliseconds** (often single-digit to low tens of ms when catch-up is already done) |
+| Catch-up RTO (before or after promote) | Time to apply remaining delivered segments (flush + replay under the engine lock) — grows with unshipped/unapplied WAL, not with total DB size |
+
+**Loss window** after a hard primary death = bytes still in the primary's
+**active (unsealed) segment**, plus anything the sidecar has not yet delivered.
+Watch `zydecodb_wal_unshipped_bytes` on the primary; it resets when a segment
+seals and ships. Acks in a sealed, shipped, HMAC-verified segment are in the
+promoted replica's durable window; acks only in the open segment can be lost.
+
 #### Notes & limits
 
 - Replication is **asynchronous**: a replica lags the primary by at most one
@@ -783,6 +817,21 @@ zydecodb_wal_unshipped_bytes
 Alert on this if it grows beyond your tolerance (it grows until the next segment
 seal, then drops). A graceful shutdown drives it to zero.
 
+#### Restore time expectations
+
+CI `restore_equivalence` / restore timing fixtures print `restore_ms`. Order of
+magnitude on CI (not a SLA — measure on your hardware):
+
+| Restore shape | Typical CI wall time | What dominates |
+|---------------|----------------------|----------------|
+| Empty / ~MB hardlink base (`admin restore --base` only, or tiny WAL) | **< 1 s** | Hardlink/copy of SSTables + manifest is mostly metadata |
+| Base + shipped WAL | Base time + WAL path | **WAL copy + HMAC/SHA-256 verify + replay** — grows with sealed segment bytes and `--to-seq` distance, not with cold SSTable size when hardlinking |
+
+Hardlink base restore ≈ directory metadata + inode links when snapshot and
+target share a filesystem; use copy across mounts (slower, byte-proportional).
+For capacity planning, time a restore of a production-sized snapshot + your
+typical shipped-WAL lag on the restore host; do not extrapolate only from CI.
+
 ### What this does NOT do (scope)
 
 - No object-store client, no async uploader, no encryption — the sidecar owns
@@ -908,3 +957,202 @@ zydecodb admin upgrade --config /etc/zydecodb/config.toml
 # Take a backup before any upgrade:
 zydecodb admin snapshot --config /etc/zydecodb/config.toml --out /backups/pre-upgrade
 ```
+
+## Alerting / paging
+
+Scrape `[metrics]` (`/metrics`). Thresholds below are starting points — tune to
+your RPO/RTO and disk. Metric names are part of the 1.0 contract (renames are
+breaking).
+
+| Metric | Suggested threshold | Meaning | Action |
+|--------|---------------------|---------|--------|
+| `zydecodb_wal_unshipped_bytes` | > 1 segment size or > your RPO bytes for > 2 seal intervals | Active WAL not yet sealed/shipped; primary-death loss window | Check seal/roll, disk on `ship_dir`, sidecar lag; graceful stop drives to 0 |
+| `zydecodb_replica_lag_seqs` | > 0 for > N minutes (N = your catch-up SLO) | Replica behind primary write seq | Check sidecar, `replica.from` disk, replica logs (HMAC/retention gap halts loudly) |
+| `zydecodb_replica_heartbeat_age_seconds` | > `--max-stale-secs` (default 10) / probe budget | Primary heartbeat stale (dead vs idle) | Confirm primary; if dead, hard-fence then [promote](#failover--promotion-assisted) |
+| `zydecodb_compaction_queue_depth` / `zydecodb_pending_compaction_bytes` | Depth > 0 sustained **and** pending bytes growing | Compaction falling behind; risk of L0 stall / `EngineBusy` | [Diagnose stuck compaction](#diagnose-stuck-compaction) |
+| `zydecodb_change_stream_disconnects_total` | Spike vs baseline (by `reason`) | Consumers dropping | Check client backpressure, `write_timeout_ms`, retention gaps → [Fell-behind change stream](#fell-behind-change-stream) |
+| Change-stream lag (archive window) | Consumer resume seq < `zydecodb_change_log_earliest_seq` | Consumer behind retention → `Conflict` on resume | Bump retention or re-snapshot consumer |
+| `zydecodb_errors_total{code="Unauthorized"}` | Sustained rate > expected (bad clients / key rotation) | Auth failures | Verify keys file + SIGHUP reload; revoke leaked keys; check burst (`EngineBusy`) |
+| `zydecodb_wal_fsync_duration_seconds` | p99 ≫ normal disk (e.g. > 100 ms on NVMe) | Durability path slow; write latency and group-commit stall | Check disk health, IO saturation, `durability` mode |
+
+## Day-2 runbooks
+
+Operator index (details live in the linked sections):
+
+| Runbook | Where |
+|---------|--------|
+| Backup / restore / PITR | [Recovery / restore](#recovery--restore), [Restore time expectations](#restore-time-expectations) |
+| Promote / fence | [Failover / promotion](#failover--promotion-assisted), [Promotion time](#promotion-time) |
+| Rotate API keys | [Rotate API keys](#rotate-api-keys) (below) |
+| Upgrade | [Upgrading](#upgrading) |
+| Stuck compaction | [Diagnose stuck compaction](#diagnose-stuck-compaction) (below) |
+| Fell-behind change stream | [Fell-behind change stream](#fell-behind-change-stream) (below) |
+| Alerting | [Alerting / paging](#alerting--paging) |
+
+### Rotate API keys
+
+1. Create the replacement key (prints the secret **once**):
+
+   ```bash
+   zydecodb admin keys create \
+     --id backend-v2 --role read_write \
+     --keys-file /etc/zydecodb/keys.toml
+   ```
+
+2. Deploy the new secret to clients (`ZYDECODB_API_KEY` / driver config). Keep
+   the old key valid until cutover completes.
+
+3. Reload the running server without downtime:
+
+   ```bash
+   kill -HUP "$(pidof zydecodb)"   # or your unit's reload → SIGHUP
+   ```
+
+   SIGHUP reloads `keys.toml` (new keys usable immediately; revoked keys drop
+   sessions on the next request). Tenant limit changes apply the same way.
+
+4. **Validate** the new key before revoking the old one: open a fresh client
+   session with the new secret (`SessionInit` / driver connect) and run a
+   cheap authenticated read (e.g. `Ping` with auth required, or `Get`/`Find`).
+   Confirm `admin keys list` shows both ids.
+
+5. Revoke the old key and SIGHUP again:
+
+   ```bash
+   zydecodb admin keys revoke --id backend --keys-file /etc/zydecodb/keys.toml
+   kill -HUP "$(pidof zydecodb)"
+   ```
+
+6. Confirm revoke: a client still holding the old secret gets `Unauthorized`
+   (`session revoked` / failed `SessionInit`); audit log shows no successes for
+   the old `key_id`; `zydecodb_errors_total{code="Unauthorized"}` is not elevated
+   from stragglers past the cutover window.
+
+Keep `keys.toml` at `chmod 600`. Serve refuses group/world-readable key and HMAC
+files.
+
+#### Rotate shipping HMAC
+
+Shipping HMAC is **not** hot-reloaded (unlike API keys). Order:
+
+1. Generate a new key file (`head -c 32 /dev/urandom > ship.hmac.new && chmod 600`).
+2. Copy the **same** bytes to every replica host that reads the ship stream.
+3. Update `hmac_key_file` on primary + all replicas to the new path (or atomically
+   replace the file in place on all hosts).
+4. **Rolling restart:** restart replicas first (they must accept the new HMAC),
+   then the primary (so new `shipped.log` lines use the new key).
+5. Validate: replica continues ingesting (`zydecodb_replica_lag_seqs` not stuck;
+   no HMAC verify errors in logs). Remove the old key file only after that.
+
+Authz matrix (opcode × role × tenant): [`INTERNAL.md`](INTERNAL.md#authorization-audit-matrix).
+
+### Diagnose stuck compaction
+
+1. **Metrics:** `zydecodb_compaction_queue_depth`, `zydecodb_compaction_worker_busy`,
+   `zydecodb_pending_compaction_bytes`, `zydecodb_live_sstables_by_level{level="0"}`,
+   `zydecodb_immutable_memtable_count`. Growing pending bytes + L0 file count with
+   worker busy stuck at 0 ⇒ worker not running or planner not scheduling.
+2. **Writes:** clients seeing `EngineBusy` / stalls often means L0 write-stall
+   threshold hit — compaction must drain L0 before write admission recovers.
+3. **Offline drain:** stop serve, then force work:
+
+   ```bash
+   zydecodb admin upgrade --config /etc/zydecodb/config.toml
+   ```
+
+   That flushes memtables and runs compaction to completion (takes the data_dir
+   lock). Use when online compaction cannot catch up.
+4. **Config:** check `poll_compaction_ms` (maintenance thread cadence), disk
+   full on `data_dir`, and under `[fair]` whether one tenant's L0 debt (Fork B)
+   is stalling writes while global compaction looks idle.
+
+### Fell-behind change stream
+
+A resume token older than the retained archive returns **`Conflict`** — the
+server will not skip the gap.
+
+1. Confirm retention: `[change_streams] retention_secs` / `retention_bytes`, and
+   gauges `zydecodb_change_log_earliest_seq` / `zydecodb_change_log_latest_seq` /
+   `zydecodb_change_log_archive_bytes`.
+2. If consumers routinely lag: **raise archive retention** (time and/or bytes),
+   restart or SIGHUP is not enough for retention knobs — update config and
+   restart serve so the archive keeps more sealed segments.
+3. **Re-snapshot the consumer:** treat the gap as fatal for that token. Take a
+   fresh consistent read of the collection (or app-level snapshot), then open
+   `Watch` **without** the stale resume token (or with a token at/after
+   `earliest_seq`). Do not invent sequences.
+4. Disconnect spikes: `zydecodb_change_stream_disconnects_total` by `reason`
+   (`write_timeout`, revoke, shutdown, …) — fix slow consumers or raise
+   `write_timeout_ms` only if the consumer is healthy but briefly slow.
+
+## Performance
+
+Reference numbers from `scripts/ref-workloads.sh` (release binary). **Hardware
+caption (maintainer workstation, 2026-07-27):** AMD Ryzen 5 3600 (6C/12T),
+62 GiB RAM, NVMe SSD, Linux 6.8 x86_64. Seed `42`, `OPS=2000` (heavy workloads
+use `OPS/4`). Re-run before marketing a new release; do not treat GitHub Actions
+runners as this class of hardware.
+
+| Workload | ops/s | p50 (µs) | p99 (µs) | RSS peak (MiB) |
+|----------|------:|---------:|---------:|---------------:|
+| `point_get` | 15400 | 27 | 146 | 7.3 |
+| `find_indexed` | 6900 | 107 | 271 | 10.0 |
+| `find_unindexed` | 3140 | 276 | 544 | 10.4 |
+| `upsert` | 860 | 188 | 7680 | 15.5 |
+| `tx_commit` | 230 | 4200 | 7690 | 16.6 |
+| `aggregate` | 2230 | 429 | 861 | 16.6 |
+| `watch_fanout` (4 subs) | 65 | 15100 | 21900 | 55.6 |
+
+Raw JSON: [`soak-baselines/ref-workloads-local.json`](soak-baselines/ref-workloads-local.json).
+Harness definitions: [`INTERNAL.md`](INTERNAL.md#reference-workloads-published-numbers).
+
+### Engine 90-minute soak (stability headline)
+
+Archived paced run `memo6-90m` (`HOURS=1.5`, `OPS=3000`, block cache 640 MB):
+mean ~2666 ops/s, steady p99 ~158 µs (max sample p99 382 µs), RSS max ~971 MiB,
+compaction write amp ~1.9. Stability analyzer exit 0. Repro and gates:
+[`INTERNAL.md`](INTERNAL.md#soak-testing).
+
+### Release checklist (pre-tag)
+
+Do **not** tag an RC until these are green (local equivalent OK). Tag publish
+(`release.yml`) does **not** re-run the 90m soak — gates are pre-tag only.
+
+- [ ] `HOURS=1.5 OPS=3000 ./scripts/soak.sh` then
+      `python3 scripts/analyze-soak.py --mode stability <OUT_DIR>/metrics.jsonl`
+      exits 0 — or green [`.github/workflows/release-soak.yml`](../.github/workflows/release-soak.yml)
+- [ ] `MODE=both ./scripts/tenant-isolation-soak.sh` exits 0 (or green
+      `release-soak.yml` / nightly on the RC commit)
+- [ ] (RC) 24h **uncapped** VPS soak archived under
+      `docs/soak-baselines/rc-<version>-24h-uncapped.jsonl` (+ `notes.md` with HW).
+      Use `scripts/vps-soak.sh` (`OPS=0`). `scripts/run-engine-ga-24h.sh` is a
+      **paced** (`OPS=3000`) confirmation, not the uncapped bar.
+- [ ] Reference workloads refreshed if you claim new GUIDE numbers:
+      `OPS=2000 scripts/ref-workloads.sh`
+
+Nightly regression (not a tag gate): `.github/workflows/bench-nightly.yml`
+fails if engine microbench `p99_us` or `rss_bytes` exceeds baseline by more than
+20% (with absolute floors for GHA noise). See [`INTERNAL.md`](INTERNAL.md#bench-regression-nightly).
+
+## Resource limits defaults
+
+| Knob | Default | Notes |
+|------|---------|--------|
+| Memtable flush threshold | **64 MiB** | Engine constant; fair mode memtable budget derives from this unless overridden |
+| `block_cache_mb` | **256** | 32 under `[runtime] profile = "low_footprint"` if still at default |
+| `max_open_readers` | **128** | 32 under low_footprint |
+| `max_connections` | **256** | Global; Docker example uses 128 |
+| `rate_limit_rps` | **1000** | Per connection; Docker example uses 200 |
+| `auth_burst_limit` | **10** | Failed `SessionInit` per IP per minute |
+| `max_sort_buffer` | **10000** | Docs buffered per sort / multi-write select |
+| `[aggregation] max_scan_docs` | **100000** | |
+| `[aggregation] max_groups` | **10000** | |
+| `[aggregation] max_memory_bytes` | **16 MiB** | |
+| `[aggregation] max_result_bytes` | **4 MiB** | |
+| `[change_streams] max_subscriptions` | **128** | Process-wide; feature off until `enabled = true` |
+| `[change_streams] max_subscriptions_per_tenant` | **8** | |
+| `max_bytes_per_tenant` | **0** (unlimited) | Set non-zero in production when auth is on; see example.toml recommendations |
+
+`require_auth = "auto"` (default) requires auth off-loopback. Startup also refuses
+world-readable `keys_file` / HMAC key files, overlapping `data_dir`/`wal_dir` with
+`shipping.ship_dir` or `replica.from`, and shipping/replica without `hmac_key_file`.

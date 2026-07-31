@@ -55,6 +55,7 @@ impl Engine {
     /// (open it with an empty WAL to read state as of the snapshot); combine it
     /// with shipped WAL for point-in-time restore.
     pub fn snapshot_to(&mut self, dir: &Path) -> EngineResult<u64> {
+        let started = Instant::now();
         self.force_flush()?;
         self.drain_background_work()?;
         self.sync_manifest()?;
@@ -69,7 +70,11 @@ impl Engine {
         let manifest_src = self.cfg.data_dir.join("MANIFEST");
         let manifest_dst = dir.join("MANIFEST");
         std::fs::copy(&manifest_src, &manifest_dst)?;
+        // The MANIFEST copy must be durable before SNAPMETA publishes this
+        // directory as a restorable base; SNAPMETA stays the last step.
+        OpenOptions::new().write(true).open(&manifest_dst)?.sync_all()?;
 
+        crate::failpoints::failpoint_result(crate::failpoints::SNAPSHOT_BEFORE_PUBLISH)?;
         let snapshot_seq = self.current_seq();
         let snapmeta = dir.join("SNAPMETA");
         let mut f = OpenOptions::new()
@@ -80,18 +85,26 @@ impl Engine {
         f.write_all(format!("{{\"snapshot_seq\":{snapshot_seq}}}\n").as_bytes())?;
         f.sync_all()?;
         Self::fsync_dir(dir)?;
+        crate::failpoints::failpoint_result(crate::failpoints::SNAPSHOT_AFTER_PUBLISH)?;
+        if let Some(m) = &self.metrics {
+            m.snapshot_duration_seconds
+                .observe(started.elapsed().as_secs_f64());
+        }
         tracing::info!(snapshot_seq, dir = %dir.display(), "base snapshot written");
         Ok(snapshot_seq)
     }
 
     /// Hardlink `src` to `dst`, falling back to a full copy when hardlinking is
-    /// not possible (e.g. across filesystems).
+    /// not possible (e.g. across filesystems). A hardlink shares already-durable
+    /// inode contents, but a copy creates new bytes that must be fsynced before
+    /// the caller publishes the containing snapshot/restore.
     pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> EngineResult<()> {
         match std::fs::hard_link(src, dst) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             Err(_) => {
                 std::fs::copy(src, dst)?;
+                OpenOptions::new().write(true).open(dst)?.sync_all()?;
                 Ok(())
             }
         }

@@ -62,17 +62,25 @@ tls.key
 # Empty stub left over from an earlier packaging experiment
 /.github/workflows/publish-python.yml
 
-# Website / Marketing (deployed from this tree via scripts/deploy-website.sh;
+# Website / Marketing (deployed from this tree via website/deploy-website.sh;
 # keep the marketing site and ops scripts local unless explicitly force-added)
 /website/
 /scripts/*
 !/scripts/install.sh
-!/scripts/deploy-website.sh
 !/scripts/tenant-isolation-soak.sh
+!/scripts/soak.sh
+!/scripts/analyze-soak.py
+!/scripts/vps-soak.sh
+!/scripts/run-engine-ga-24h.sh
+!/scripts/crash-soak.sh
+!/scripts/ref-workloads.sh
+!/scripts/bench-regression.sh
 
 # Internal / Archived Docs
 /ROADMAP.md
 /1.0-Roadmap.md
 /docs/archive/
-/docs/soak-baselines/
+# Committed baselines live under docs/soak-baselines/; ignore local scratch only
+/docs/soak-baselines/local/
+/docs/soak-baselines/*.tmp
 .cargo-home/

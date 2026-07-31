@@ -14,9 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zydecodb_document::binary::ValueView;
 use zydecodb_document::store::VK_ZDOC;
-use zydecodb_document::wire::{
-    self, WatchPayload, WATCH_OP_DELETE, WATCH_OP_UPSERT,
-};
+use zydecodb_document::wire::{self, WatchPayload, WATCH_OP_DELETE, WATCH_OP_UPSERT};
 use zydecodb_engine::change_log::{self, LogicalChangeKind, ResumeToken};
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{RequestEnvelope, ResponseEnvelope};
@@ -27,6 +25,9 @@ use zydecodb_engine::keys::KS_USER;
 pub struct WatchRegistry {
     global: AtomicUsize,
     per_tenant: Mutex<HashMap<[u8; 16], usize>>,
+    /// Per-subscription resume cursor (id → after_seq) for consumer-lag gauge.
+    subscriber_seqs: Mutex<HashMap<usize, u64>>,
+    next_sub_id: AtomicUsize,
 }
 
 impl WatchRegistry {
@@ -58,6 +59,44 @@ impl WatchRegistry {
             }
         }
     }
+
+    /// Register a subscriber cursor; returns an id for later updates/release.
+    pub fn register_cursor(&self, after_seq: u64) -> usize {
+        let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        self.subscriber_seqs.lock().unwrap().insert(id, after_seq);
+        id
+    }
+
+    pub fn update_cursor(&self, id: usize, after_seq: u64) {
+        if let Some(slot) = self.subscriber_seqs.lock().unwrap().get_mut(&id) {
+            *slot = after_seq;
+        }
+    }
+
+    pub fn unregister_cursor(&self, id: usize) {
+        self.subscriber_seqs.lock().unwrap().remove(&id);
+    }
+
+    /// Slowest subscriber resume seq, if any subscribers are registered.
+    pub fn min_resume_seq(&self) -> Option<u64> {
+        self.subscriber_seqs.lock().unwrap().values().copied().min()
+    }
+}
+
+fn update_consumer_lag(engine: &SharedEngine, registry: &WatchRegistry) {
+    let guard = engine.read();
+    let Some(m) = guard.metrics() else {
+        return;
+    };
+    let latest = guard
+        .change_log_manifest()
+        .and_then(|man| man.latest_seq())
+        .unwrap_or(0);
+    let lag = match registry.min_resume_seq() {
+        Some(min) => latest.saturating_sub(min),
+        None => 0,
+    };
+    m.change_stream_consumer_lag_seqs.set(lag as i64);
 }
 
 fn tenant_prefix(session: &SessionState, legacy_single_tenant: bool) -> Vec<u8> {
@@ -104,8 +143,7 @@ pub fn run_watch_stream<S: Read + Write>(
             return Ok(());
         }
     };
-    if let Some(resp) = crate::security::check_collection_prefix_acl(session, &payload.collection)
-    {
+    if let Some(resp) = crate::security::check_collection_prefix_acl(session, &payload.collection) {
         write_response(stream, &resp)?;
         return Ok(());
     }
@@ -117,7 +155,11 @@ pub fn run_watch_stream<S: Read + Write>(
         cfg_cs.max_subscriptions,
         cfg_cs.max_subscriptions_per_tenant,
     ) {
-        write_err(stream, Status::EngineBusy, "change stream subscription limit")?;
+        write_err(
+            stream,
+            Status::EngineBusy,
+            "change stream subscription limit",
+        )?;
         return Ok(());
     }
     {
@@ -130,6 +172,7 @@ pub fn run_watch_stream<S: Read + Write>(
         registry,
         tenant,
         engine,
+        cursor_id: None,
         reason: "peer_close",
     };
 
@@ -165,7 +208,11 @@ pub fn run_watch_stream<S: Read + Write>(
             Ok(token) => {
                 if token.database_id != database_id {
                     watch_guard.reason = "bad_token";
-                    write_err(stream, Status::ProtocolError, "resume token database mismatch")?;
+                    write_err(
+                        stream,
+                        Status::ProtocolError,
+                        "resume token database mismatch",
+                    )?;
                     return Ok(());
                 }
                 if token.tenant_prefix != prefix {
@@ -175,7 +222,11 @@ pub fn run_watch_stream<S: Read + Write>(
                 }
                 if token.collection_id != collection_id {
                     watch_guard.reason = "forbidden";
-                    write_err(stream, Status::Forbidden, "resume token collection mismatch")?;
+                    write_err(
+                        stream,
+                        Status::Forbidden,
+                        "resume token collection mismatch",
+                    )?;
                     return Ok(());
                 }
                 let earliest = {
@@ -217,6 +268,9 @@ pub fn run_watch_stream<S: Read + Write>(
     let write_timeout = Duration::from_millis(cfg_cs.write_timeout_ms.max(1));
     let mut last_frame = Instant::now();
     let mut cursor_token = start_token;
+    let cursor_id = registry.register_cursor(after_seq);
+    watch_guard.cursor_id = Some(cursor_id);
+    update_consumer_lag(engine, registry);
 
     loop {
         if *shutdown.lock().unwrap() {
@@ -318,6 +372,10 @@ pub fn run_watch_stream<S: Read + Write>(
             last_frame = Instant::now();
             emitted += 1;
         }
+        if emitted > 0 {
+            registry.update_cursor(cursor_id, after_seq);
+        }
+        update_consumer_lag(engine, registry);
 
         if emitted == 0 {
             if last_frame.elapsed() >= heartbeat {
@@ -332,7 +390,8 @@ pub fn run_watch_stream<S: Read + Write>(
                 }
                 last_frame = Instant::now();
             }
-            let _ = commit.wait_durable_advance(after_seq, heartbeat.min(Duration::from_millis(500)));
+            let _ =
+                commit.wait_durable_advance(after_seq, heartbeat.min(Duration::from_millis(500)));
         }
     }
 }
@@ -341,12 +400,17 @@ struct WatchGuard<'a> {
     registry: &'a WatchRegistry,
     tenant: [u8; 16],
     engine: &'a SharedEngine,
+    cursor_id: Option<usize>,
     reason: &'static str,
 }
 
 impl Drop for WatchGuard<'_> {
     fn drop(&mut self) {
+        if let Some(id) = self.cursor_id.take() {
+            self.registry.unregister_cursor(id);
+        }
         self.registry.release(&self.tenant);
+        update_consumer_lag(self.engine, self.registry);
         let guard = self.engine.read();
         if let Some(m) = guard.metrics() {
             m.change_stream_subscriptions.dec();
@@ -362,7 +426,7 @@ fn stored_to_json(stored: &[u8]) -> Result<Vec<u8>, String> {
         return Err("empty stored document".into());
     };
     if kind == VK_ZDOC {
-        let value = ValueView::new(payload).to_value();
+        let value = ValueView::new(payload).to_value().map_err(|e| e.to_string())?;
         return serde_json::to_vec(&value).map_err(|e| e.to_string());
     }
     Ok(payload.to_vec())

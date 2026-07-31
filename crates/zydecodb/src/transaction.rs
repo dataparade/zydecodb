@@ -140,6 +140,12 @@ fn stage_ack(tx: &TransactionState) -> ResponseEnvelope {
     ))
 }
 
+fn with_tx_metrics(engine: &SharedEngine, f: impl FnOnce(&zydecodb_engine::metrics::Metrics)) {
+    if let Some(m) = engine.read().metrics() {
+        f(m);
+    }
+}
+
 impl TransactionState {
     pub fn begin(
         engine: &SharedEngine,
@@ -251,6 +257,10 @@ pub fn handle_control(
     tx: &mut Option<TransactionState>,
     next_tx_id: &mut u64,
 ) -> ResponseEnvelope {
+    // Auth gate before any control-path side effects (including no-op Rollback).
+    if security.require_auth && !session.authenticated {
+        return ResponseEnvelope::error(Status::Unauthorized, "authentication required");
+    }
     match req.command {
         Command::Begin => {
             if tx.is_some() {
@@ -269,6 +279,7 @@ pub fn handle_control(
                         state.snapshot.seq_upper(),
                     ));
                     *tx = Some(state);
+                    with_tx_metrics(engine, |m| m.tx_begin_total.inc());
                     resp
                 }
                 Err(e) => e,
@@ -281,7 +292,9 @@ pub fn handle_control(
                     "Rollback payload must be empty",
                 );
             }
-            *tx = None;
+            if tx.take().is_some() {
+                with_tx_metrics(engine, |m| m.tx_abort_total.inc());
+            }
             ResponseEnvelope::ok(vec![])
         }
         Command::Commit => {
@@ -295,18 +308,22 @@ pub fn handle_control(
                 return aborted("no active transaction");
             };
             if state.expired() {
+                with_tx_metrics(engine, |m| m.tx_timeout_total.inc());
                 return aborted("transaction aborted: timed out");
             }
             if let Err(e) = state.ensure_session(session, security) {
+                with_tx_metrics(engine, |m| m.tx_abort_total.inc());
                 return e;
             }
             match commit_transaction(engine, catalog, &state) {
                 Ok(seq) => {
                     commit.commit(seq, false);
+                    with_tx_metrics(engine, |m| m.tx_commit_total.inc());
                     ResponseEnvelope::ok(wire::encode_commit_response(seq))
                 }
                 Err(e) => {
                     // Transaction is already cleared (taken); surface error.
+                    with_tx_metrics(engine, |m| m.tx_abort_total.inc());
                     err_response(&e)
                 }
             }
@@ -318,7 +335,7 @@ pub fn handle_control(
 /// Stage or read inside an open transaction. Returns `None` when the command
 /// should fall through to the normal auto-commit path (Ping/Stats).
 pub fn handle_in_transaction(
-    _engine: &SharedEngine,
+    engine: &SharedEngine,
     catalog: &SharedCatalog,
     req: &RequestEnvelope,
     session: &SessionState,
@@ -326,6 +343,7 @@ pub fn handle_in_transaction(
     tx: &mut TransactionState,
 ) -> Option<ResponseEnvelope> {
     if tx.expired() {
+        with_tx_metrics(engine, |m| m.tx_timeout_total.inc());
         return Some(aborted("transaction aborted: timed out"));
     }
     if let Err(e) = tx.ensure_session(session, security) {

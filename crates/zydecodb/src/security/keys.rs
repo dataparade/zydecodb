@@ -307,7 +307,36 @@ impl KeyStore {
             tenant: self.tenants.clone(),
         };
         let text = toml::to_string_pretty(&file).map_err(|e| KeyError::Parse(e.to_string()))?;
-        fs::write(&self.path, text).map_err(|e| KeyError::Io(e.to_string()))
+        // Atomic publish: tmp file with mode 0600 set AT CREATION (the old
+        // write-then-chmod left a window where the secrets file existed with
+        // umask-default permissions), fsync, rename over the destination,
+        // then fsync the directory so the rename survives power loss.
+        let tmp = self.path.with_file_name(format!(
+            "{}.tmp",
+            self.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+        ));
+        {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            // Owner-only; `zydecodb serve` refuses group/world-readable keys files.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp).map_err(|e| KeyError::Io(e.to_string()))?;
+            use std::io::Write;
+            f.write_all(text.as_bytes())
+                .and_then(|_| f.sync_all())
+                .map_err(|e| KeyError::Io(e.to_string()))?;
+        }
+        fs::rename(&tmp, &self.path).map_err(|e| KeyError::Io(e.to_string()))?;
+        if let Some(parent) = self.path.parent() {
+            fs::File::open(parent)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| KeyError::Io(format!("fsync keys dir: {e}")))?;
+        }
+        Ok(())
     }
 }
 

@@ -222,10 +222,16 @@ impl RequestEnvelope {
 /// Result of parsing a request envelope header on the live server path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestHeader {
-    Known { command: Command, len: usize },
+    Known {
+        command: Command,
+        len: usize,
+    },
     /// Recognized framing, unrecognized opcode. Caller must still read `len`
     /// payload bytes to stay synchronized, then reply with `ProtocolError`.
-    Unknown { opcode: u8, len: usize },
+    Unknown {
+        opcode: u8,
+        len: usize,
+    },
 }
 
 /// Parse a 6-byte request header, distinguishing unknown opcodes from hard

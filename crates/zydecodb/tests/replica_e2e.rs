@@ -3,7 +3,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::free_addr;
+use common::{free_addr, write_secret_file};
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -47,9 +47,9 @@ fn named_base_config(dir: &TempDir, name: &str, listen: SocketAddr) -> Config {
         listen_unix: None,
         runtime: Default::default(),
         fair: Default::default(),
-    aggregation: Default::default(),
+        aggregation: Default::default(),
         change_streams: Default::default(),
-        }
+    }
 }
 
 fn put_frame(key: &[u8], value: &[u8]) -> Vec<u8> {
@@ -111,7 +111,7 @@ fn replica_ingests_shipped_wal_and_is_read_only() {
 
     // Shared shipping HMAC key (required whenever shipping/replication is on).
     let hmac_key = tmp.path().join("ship.hmac");
-    std::fs::write(&hmac_key, b"e2e-shipping-hmac-key").unwrap();
+    write_secret_file(&hmac_key, b"e2e-shipping-hmac-key-material-32b!!");
 
     // --- Primary: ship WAL into ship_dir. ---
     let primary_addr = free_addr();
@@ -195,7 +195,7 @@ fn promotion_bumps_epoch_and_fences_old_primary() {
     // stream. serve must refuse before binding a socket to avoid split-brain.
     let old_addr = free_addr();
     let hmac_key = tmp.path().join("ship.hmac");
-    std::fs::write(&hmac_key, b"e2e-shipping-hmac-key").unwrap();
+    write_secret_file(&hmac_key, b"e2e-shipping-hmac-key-material-32b!!");
     let mut old_cfg = named_base_config(&tmp, "old_primary", old_addr);
     old_cfg.shipping = ShippingConfig {
         ship_dir: Some(ship.clone()),

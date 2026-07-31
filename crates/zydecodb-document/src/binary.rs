@@ -1,3 +1,4 @@
+use crate::error::{DocError, DocResult};
 use serde_json::Value;
 use std::cmp::Ordering;
 pub const TYPE_NULL: u8 = 0;
@@ -221,8 +222,23 @@ impl<'a> ValueView<'a> {
         Some(current)
     }
 
-    pub fn to_value(&self) -> Value {
-        match self.type_byte() {
+    /// Maximum nesting depth when materializing a stored ZDoc document back
+    /// into a `serde_json::Value`. Legitimate document writes pass through
+    /// serde_json's own 128-level parse cap (plus a small wrapper margin), so
+    /// 256 never rejects real data — it exists to stop stack exhaustion from
+    /// bytes that reached the store without a parse cap (raw-KV overlap,
+    /// legacy data, corruption).
+    pub fn to_value(&self) -> DocResult<Value> {
+        self.to_value_at_depth(0)
+    }
+
+    fn to_value_at_depth(&self, depth: usize) -> DocResult<Value> {
+        if depth >= MAX_ZDOC_DEPTH {
+            return Err(DocError::Protocol(format!(
+                "document nesting exceeds {MAX_ZDOC_DEPTH} levels"
+            )));
+        }
+        Ok(match self.type_byte() {
             TYPE_NULL => Value::Null,
             TYPE_BOOL_FALSE => Value::Bool(false),
             TYPE_BOOL_TRUE => Value::Bool(true),
@@ -239,7 +255,7 @@ impl<'a> ValueView<'a> {
                 let arr = self.as_array().unwrap();
                 let mut v = Vec::with_capacity(arr.len());
                 for i in 0..arr.len() {
-                    v.push(arr.get(i).unwrap().to_value());
+                    v.push(arr.get(i).unwrap().to_value_at_depth(depth + 1)?);
                 }
                 Value::Array(v)
             }
@@ -248,14 +264,18 @@ impl<'a> ValueView<'a> {
                 let mut map = serde_json::Map::new();
                 for i in 0..obj.len() {
                     let (k, v) = obj.get_at(i).unwrap();
-                    map.insert(k.to_string(), v.to_value());
+                    map.insert(k.to_string(), v.to_value_at_depth(depth + 1)?);
                 }
                 Value::Object(map)
             }
             _ => Value::Null,
-        }
+        })
     }
 }
+
+/// Depth bound for [`ValueView::to_value`]; also the ceiling the update path
+/// enforces on grafted documents so a stored body can always be read back.
+pub const MAX_ZDOC_DEPTH: usize = 256;
 
 pub struct ObjectView<'a> {
     data: &'a [u8],
@@ -344,5 +364,35 @@ impl<'a> ArrayView<'a> {
         let pos = 9 + index * 4;
         let v_off = u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap());
         Some(ValueView::new(&self.data[v_off as usize..]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a nested Value `n` levels deep programmatically — bypassing
+    /// serde_json's 128-level parse cap, the same way a document can reach
+    /// the store uncapped (raw-KV overlap, legacy bytes).
+    fn deep_value(n: usize) -> Value {
+        let mut v = Value::from(1);
+        for _ in 0..n {
+            let mut m = serde_json::Map::new();
+            m.insert("d".to_string(), v);
+            v = Value::Object(m);
+        }
+        v
+    }
+
+    #[test]
+    fn to_value_errors_beyond_depth_cap_instead_of_recursing() {
+        let bytes = ZDocBuilder::from_value(&deep_value(MAX_ZDOC_DEPTH + 50));
+        let err = ValueView::new(&bytes).to_value().unwrap_err();
+        assert!(matches!(err, DocError::Protocol(_)), "got {err:?}");
+
+        // Comfortably below the cap (and above serde's 128 parse cap, so
+        // legitimate documents are unaffected): still materializes.
+        let ok = ZDocBuilder::from_value(&deep_value(200));
+        assert!(ValueView::new(&ok).to_value().is_ok());
     }
 }

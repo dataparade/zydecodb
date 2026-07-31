@@ -1,6 +1,8 @@
 use crate::config::Config;
+use crate::security::audit::log_security_event;
 use crate::security::keys::{parse_tenant_hex, KeyError, KeyRole, KeyStore};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use zydecodb_document::catalog::Catalog;
 use zydecodb_engine::engine::{Engine, EngineConfig};
 use zydecodb_engine::keys::KS_USER;
@@ -13,6 +15,11 @@ pub fn keys_create(
     prefixes: Vec<String>,
 ) -> Result<(), KeyError> {
     let secret = KeyStore::create_key(&keys_file, &id, role, &tenant, prefixes)?;
+    let role_s = format!("{role:?}");
+    log_security_event(
+        "key_create",
+        &[("key_id", &id), ("role", &role_s), ("tenant", &tenant)],
+    );
     println!("API key created (save this — it will not be shown again):");
     println!("{secret}");
     Ok(())
@@ -28,6 +35,7 @@ pub fn keys_list(keys_file: PathBuf) -> Result<(), KeyError> {
 
 pub fn keys_revoke(keys_file: PathBuf, id: String) -> Result<(), KeyError> {
     KeyStore::revoke_key(&keys_file, &id)?;
+    log_security_event("key_revoke", &[("key_id", &id)]);
     println!("revoked key {id}");
     Ok(())
 }
@@ -46,12 +54,35 @@ pub fn tenant_set_limit(
 }
 
 /// Hardlink `src` to `dst`, falling back to a full copy across filesystems.
+/// A copy creates brand-new bytes that must be fsynced before the restore
+/// directory can be treated as complete; a hardlink shares an already-durable
+/// inode.
 fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     match std::fs::hard_link(src, dst) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) => std::fs::copy(src, dst).map(|_| ()),
+        Err(_) => {
+            std::fs::copy(src, dst)?;
+            fsync_file_io(dst)
+        }
     }
+}
+
+fn fsync_file_io(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.sync_all())
+}
+
+fn fsync_file(path: &Path) -> Result<(), String> {
+    fsync_file_io(path).map_err(|e| format!("fsync {}: {}", path.display(), e))
+}
+
+fn fsync_dir(dir: &Path) -> Result<(), String> {
+    std::fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("fsync dir {}: {}", dir.display(), e))
 }
 
 /// Restore a database into `out` from a base snapshot plus shipped WAL, stopping
@@ -69,9 +100,27 @@ pub fn restore(
     to_time: Option<u64>,
     out: &Path,
 ) -> Result<(), String> {
+    let started = Instant::now();
+    // Half-written snapshots never publish SNAPMETA; refuse them as a base.
+    let snapmeta = base.join("SNAPMETA");
+    if !snapmeta.is_file() {
+        return Err(format!(
+            "snapshot base {} is not restorable (missing SNAPMETA)",
+            base.display()
+        ));
+    }
+
     let out_wal = out.join("wal");
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&out_wal).map_err(|e| e.to_string())?;
+
+    // Marker stays until shutdown succeeds so a killed restore refuses Engine::open.
+    // It must be durable before any data bytes land: if the write is lost in a
+    // crash, a half-restored directory would open as if it were complete.
+    let restore_marker = out.join(zydecodb_engine::engine::RESTORE_IN_PROGRESS_MARKER);
+    std::fs::write(&restore_marker, b"1").map_err(|e| e.to_string())?;
+    fsync_file(&restore_marker)?;
+    fsync_dir(out)?;
 
     // 1. Lay down the base snapshot: hardlink SSTables (immutable), copy MANIFEST.
     for entry in std::fs::read_dir(base).map_err(|e| e.to_string())? {
@@ -83,6 +132,9 @@ pub fn restore(
             link_or_copy(&entry.path(), &dst).map_err(|e| e.to_string())?;
         } else if name == "MANIFEST" {
             std::fs::copy(entry.path(), &dst).map_err(|e| e.to_string())?;
+            // Durable before WAL segments land: the MANIFEST is what makes the
+            // laid-down SSTables interpretable on open.
+            fsync_file(&dst)?;
         }
     }
 
@@ -103,16 +155,51 @@ pub fn restore(
         (None, None) => None,
     };
 
-    // 4. Open at the ceiling, then shut down to flush replayed data + mark clean.
+    // 4. Open at the ceiling (allowing the in-progress marker), then shut down
+    //    cleanly and only then remove the marker.
     let cfg = EngineConfig {
         data_dir: out.to_path_buf(),
-        wal_dir: out_wal,
+        wal_dir: out_wal.clone(),
         wal_replay_max_seq: ceiling,
+        allow_restore_in_progress: true,
         ..Default::default()
     };
     let mut engine = Engine::open(cfg).map_err(|e| e.to_string())?;
     let restored_seq = engine.current_seq();
     engine.shutdown().map_err(|e| e.to_string())?;
+    // PITR: shutdown flushed the ceiling into SSTables. Drop installed WAL
+    // segments so a later open cannot replay past-ceiling records that were
+    // still present in the shipped stream. A wipe failure is fatal: leaving
+    // segments behind would silently replay past the restore point.
+    if ceiling.is_some() {
+        let rd = std::fs::read_dir(&out_wal).map_err(|e| e.to_string())?;
+        for entry in rd {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("wal-") && name.ends_with(".log") {
+                std::fs::remove_file(entry.path())
+                    .map_err(|e| format!("restore: wipe WAL segment: {e}"))?;
+            }
+        }
+        fsync_dir(&out_wal)?;
+    }
+    // Failure to remove the marker leaves the conservative "restore incomplete"
+    // state (open refuses) — surface it instead of silently continuing.
+    std::fs::remove_file(&restore_marker)
+        .map_err(|e| format!("restore: remove crash marker: {e}"))?;
+    fsync_dir(out)?;
+    let elapsed = started.elapsed();
+    // CLI restore is offline (no scrape endpoint). Log duration; the
+    // `zydecodb_restore_duration_seconds` histogram lives on Metrics for
+    // programmatic callers that can invoke `Metrics::observe_restore`.
+    tracing::info!(
+        restore_duration_ms = elapsed.as_millis() as u64,
+        restored_seq,
+        ceiling = ?ceiling,
+        out = %out.display(),
+        "restore complete"
+    );
     println!(
         "restored {} to seq {restored_seq} (ceiling {ceiling:?})",
         out.display()
@@ -245,6 +332,21 @@ pub fn drop_tenant_on_engine(
     if compact {
         engine.compact_all().map_err(|e| e.to_string())?;
     }
+
+    let tenant_hex = tenant
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let deleted_s = deleted.to_string();
+    let removed_s = removed.to_string();
+    log_security_event(
+        "drop_tenant",
+        &[
+            ("tenant", &tenant_hex),
+            ("deleted_keys", &deleted_s),
+            ("removed_collections", &removed_s),
+        ],
+    );
 
     Ok(DropTenantResult {
         deleted_keys: deleted,

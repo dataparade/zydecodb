@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zydecodb_engine::engine::EngineConfig;
 use zydecodb_engine::tenant_fair::FairConfig;
@@ -317,7 +317,81 @@ pub fn load_hmac_key(path: &PathBuf) -> Result<Vec<u8>, String> {
     if bytes.iter().all(|b| b.is_ascii_whitespace()) {
         return Err(format!("hmac_key_file {} is empty", path.display()));
     }
+    // HMAC with a short key degrades to guessable segment tags: anyone who can
+    // write to the ship dir can forge a shipped.log entry a replica trusts.
+    if bytes.len() < 32 {
+        return Err(format!(
+            "hmac_key_file {} holds {} bytes; HMAC keys must be at least 32 bytes \
+             (e.g. `head -c 32 /dev/urandom > {}`)",
+            path.display(),
+            bytes.len(),
+            path.display()
+        ));
+    }
     Ok(bytes)
+}
+
+/// Refuse secret files that are group/world-accessible on Unix. Missing files
+/// are skipped (other startup paths already handle absence).
+fn refuse_insecure_secret_file(path: &Path, label: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(format!("cannot stat {label} {}: {e}", path.display()));
+            }
+        };
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "refusing to start: {label} {} is group/world-accessible \
+                 (mode {:04o}); run `chmod 600 {}` so only the owner can read it",
+                path.display(),
+                mode & 0o777,
+                path.display(),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, label);
+    }
+    Ok(())
+}
+
+/// True when `a` and `b` refer to the same directory (canonicalize when both
+/// exist; otherwise compare cleaned path components).
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        return ca == cb;
+    }
+    let a: PathBuf = a.components().collect();
+    let b: PathBuf = b.components().collect();
+    a == b
+}
+
+fn refuse_path_overlap(
+    left_label: &str,
+    left: &Path,
+    right_label: &str,
+    right: Option<&Path>,
+) -> Result<(), String> {
+    let Some(right) = right else {
+        return Ok(());
+    };
+    if paths_equal(left, right) {
+        return Err(format!(
+            "refusing to start: {left_label} ({}) must not equal {right_label} ({}) — \
+             give the engine its own data/wal directories, separate from the ship/replica \
+             staging path",
+            left.display(),
+            right.display(),
+        ));
+    }
+    Ok(())
 }
 
 /// Operational HTTP endpoint (Prometheus `/metrics`, `/healthz`, `/readyz`).
@@ -568,6 +642,90 @@ impl Config {
         }
     }
 
+    /// Production startup guards for `zydecodb serve`. Call before bind.
+    ///
+    /// Refuses world-readable secret files (Unix), overlapping data/ship/replica
+    /// directories, and shipping/replica without an HMAC key. Warns when auth is
+    /// required but `max_bytes_per_tenant` is unlimited.
+    pub fn validate_serve_startup(&self) -> Result<(), String> {
+        refuse_insecure_secret_file(&self.security.keys_file, "security.keys_file")?;
+        if let Some(path) = self.shipping.hmac_key_file.as_ref() {
+            refuse_insecure_secret_file(path, "shipping.hmac_key_file")?;
+        }
+        if let Some(path) = self.replica.hmac_key_file.as_ref() {
+            refuse_insecure_secret_file(path, "replica.hmac_key_file")?;
+        }
+
+        if self.shipping.ship_dir.is_some() && self.shipping.hmac_key_file.is_none() {
+            return Err(
+                "shipping.ship_dir is set but shipping.hmac_key_file is missing — \
+                 shipped manifests must be HMAC-authenticated. Generate a key with \
+                 `head -c 32 /dev/urandom > /etc/zydecodb/ship.hmac && chmod 600 \
+                 /etc/zydecodb/ship.hmac`, set hmac_key_file to that path, and share \
+                 the same file with every replica"
+                    .into(),
+            );
+        }
+        if self.replica.from.is_some() && self.replica.hmac_key_file.is_none() {
+            return Err(
+                "replica.from is set but replica.hmac_key_file is missing — the shipped \
+                 stream must be HMAC-authenticated. Set hmac_key_file to the same path \
+                 used by the primary's [shipping].hmac_key_file (chmod 600)"
+                    .into(),
+            );
+        }
+
+        refuse_path_overlap(
+            "data_dir",
+            &self.data_dir,
+            "shipping.ship_dir",
+            self.shipping.ship_dir.as_deref(),
+        )?;
+        refuse_path_overlap(
+            "wal_dir",
+            &self.wal_dir,
+            "shipping.ship_dir",
+            self.shipping.ship_dir.as_deref(),
+        )?;
+        refuse_path_overlap(
+            "data_dir",
+            &self.data_dir,
+            "replica.from",
+            self.replica.from.as_deref(),
+        )?;
+        refuse_path_overlap(
+            "wal_dir",
+            &self.wal_dir,
+            "replica.from",
+            self.replica.from.as_deref(),
+        )?;
+
+        // An explicit `require_auth = false` on a routable bind is full public
+        // read/write access. Warn loudly (but do not refuse — some operators
+        // legitimately run behind a private network boundary).
+        if matches!(self.security.require_auth, RequireAuth::False)
+            && !self.listen.ip().is_loopback()
+        {
+            tracing::warn!(
+                listen = %self.listen,
+                "security.require_auth = false is set explicitly and the listen address is \
+                 not loopback: every reachable client has FULL unauthenticated read/write \
+                 access. This is only acceptable on a strictly private network — prefer \
+                 require_auth = true (or auto) for any routable bind"
+            );
+        }
+
+        if self.effective_require_auth() && self.security.quotas.max_bytes_per_tenant == 0 {
+            tracing::warn!(
+                "authentication is required but security.quotas.max_bytes_per_tenant = 0 \
+                 (unlimited). Set a non-zero per-tenant byte quota for production \
+                 (e.g. 1073741824 for 1 GiB) so one tenant cannot fill the disk"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Build the engine open config (serve + offline admin share this path).
     pub fn to_engine_config(&self) -> EngineConfig {
         let block_cache_bytes = self.block_cache_mb.saturating_mul(1024 * 1024);
@@ -599,6 +757,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+
+    /// tracing::warn in validate_serve_startup is process-global; serialize tests
+    /// that exercise it so they do not interleave.
+    static VALIDATE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn fair_toml_deserializes_and_maps_to_engine() {
@@ -624,6 +788,88 @@ l0_write_stall_threshold = 8
         assert_eq!(eng.fair.tenant_count, 4);
         assert_eq!(eng.fair.memtable_total_bytes, 32 * 1024 * 1024);
         assert_eq!(eng.l0_write_stall_threshold, Some(8));
+    }
+
+    #[test]
+    fn validate_refuses_ship_dir_without_hmac() {
+        let _g = VALIDATE_LOCK.lock().unwrap();
+        let mut cfg = Config::local_default_with_home(Path::new("/tmp/zydeco-validate-home"));
+        cfg.shipping.ship_dir = Some(PathBuf::from("/var/lib/zydecodb/ship"));
+        cfg.shipping.hmac_key_file = None;
+        let err = cfg.validate_serve_startup().unwrap_err();
+        assert!(err.contains("hmac_key_file"), "{err}");
+        assert!(err.contains("chmod 600"), "{err}");
+    }
+
+    #[test]
+    fn load_hmac_key_rejects_short_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ship.hmac");
+        fs::write(&path, b"short-key").unwrap();
+        let err = load_hmac_key(&path).unwrap_err();
+        assert!(err.contains("at least 32 bytes"), "{err}");
+
+        fs::write(&path, [b'k'; 32]).unwrap();
+        assert_eq!(load_hmac_key(&path).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn validate_refuses_data_dir_equal_ship_dir() {
+        let _g = VALIDATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let mut cfg = Config::local_default_with_home(dir.path());
+        cfg.data_dir = shared.clone();
+        cfg.wal_dir = dir.path().join("wal");
+        fs::create_dir_all(&cfg.wal_dir).unwrap();
+        cfg.shipping.ship_dir = Some(shared);
+        cfg.shipping.hmac_key_file = Some(dir.path().join("ship.hmac"));
+        fs::write(cfg.shipping.hmac_key_file.as_ref().unwrap(), b"k").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                cfg.shipping.hmac_key_file.as_ref().unwrap(),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let err = cfg.validate_serve_startup().unwrap_err();
+        assert!(err.contains("must not equal"), "{err}");
+        assert!(err.contains("shipping.ship_dir"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_refuses_world_readable_keys_file() {
+        let _g = VALIDATE_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::local_default_with_home(dir.path());
+        cfg.security.keys_file = dir.path().join("keys.toml");
+        fs::write(&cfg.security.keys_file, b"").unwrap();
+        fs::set_permissions(&cfg.security.keys_file, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = cfg.validate_serve_startup().unwrap_err();
+        assert!(err.contains("group/world-accessible"), "{err}");
+        assert!(err.contains("chmod 600"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_accepts_owner_only_secret_files() {
+        let _g = VALIDATE_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::local_default_with_home(dir.path());
+        cfg.data_dir = dir.path().join("data");
+        cfg.wal_dir = dir.path().join("wal");
+        fs::create_dir_all(&cfg.data_dir).unwrap();
+        fs::create_dir_all(&cfg.wal_dir).unwrap();
+        cfg.security.keys_file = dir.path().join("keys.toml");
+        fs::write(&cfg.security.keys_file, b"").unwrap();
+        fs::set_permissions(&cfg.security.keys_file, fs::Permissions::from_mode(0o600)).unwrap();
+        cfg.validate_serve_startup().expect("owner-only keys ok");
     }
 }
 

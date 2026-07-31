@@ -8,9 +8,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 use tempfile::TempDir;
-use zydecodb_document::wire::{
-    self, WatchFrame, WatchPayload, WATCH_OP_DELETE, WATCH_OP_UPSERT,
-};
+use zydecodb_document::wire::{self, WatchFrame, WatchPayload, WATCH_OP_DELETE, WATCH_OP_UPSERT};
 use zydecodb_engine::errors::Status;
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope, ENVELOPE_HEADER_LEN};
 
@@ -209,7 +207,10 @@ fn watch_heartbeat_arrives_when_idle() {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 continue;
             }
             Err(e) => panic!("read failed: {e}"),
@@ -267,7 +268,10 @@ fn aggregate_rejects_unsupported_and_respects_read_acl_shape() {
         collection: "sales".into(),
         pipeline: bad.as_bytes().to_vec(),
     };
-    let resp = roundtrip(&mut s, &RequestEnvelope::new(Command::Aggregate, p.encode()));
+    let resp = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(Command::Aggregate, p.encode()),
+    );
     assert_ne!(resp.status, Status::Ok);
 
     let good = r#"[{"$group":{"_id":"$team","n":{"$count":{}}}}]"#;
@@ -275,7 +279,10 @@ fn aggregate_rejects_unsupported_and_respects_read_acl_shape() {
         collection: "sales".into(),
         pipeline: good.as_bytes().to_vec(),
     };
-    let resp = roundtrip(&mut s, &RequestEnvelope::new(Command::Aggregate, p.encode()));
+    let resp = roundtrip(
+        &mut s,
+        &RequestEnvelope::new(Command::Aggregate, p.encode()),
+    );
     assert_eq!(resp.status, Status::Ok);
 
     drop(s);

@@ -67,6 +67,27 @@ pub fn index_key(
     k
 }
 
+/// Best-effort parse of an index key for fuzz/tests. Never panics. Returns
+/// `(collection_id, index_id, fields_consumed, doc_id_suffix)` when the fixed
+/// header is present; `encoded_fields` walk uses [`crate::encoding::try_decode_fields`].
+pub fn try_parse_index_key(prefix_len: usize, key: &[u8]) -> Option<(u32, u32, usize, Vec<u8>)> {
+    let header = prefix_len + 1 + 4 + 4;
+    if key.len() < header || key.get(prefix_len) != Some(&REC_INDEX) {
+        return None;
+    }
+    let collection_id = u32::from_be_bytes(key[prefix_len + 1..prefix_len + 5].try_into().ok()?);
+    let index_id = u32::from_be_bytes(key[prefix_len + 5..prefix_len + 9].try_into().ok()?);
+    let rest = &key[header..];
+    // Walk fields greedily; leftover bytes are the doc_id suffix.
+    let mut best = (0usize, rest.to_vec());
+    for end in 0..=rest.len() {
+        if crate::encoding::try_decode_fields(&rest[..end]).is_ok() {
+            best = (end, rest[end..].to_vec());
+        }
+    }
+    Some((collection_id, index_id, best.0, best.1))
+}
+
 /// Smallest byte string strictly greater than every key having `prefix` as a
 /// prefix (the exclusive upper bound for a prefix scan). An all-`0xFF` prefix
 /// returns empty, which the engine's scan treats as unbounded.

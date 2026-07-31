@@ -51,11 +51,15 @@ fsync_interval_ms = 100
 # hmac_key_file = "/etc/zydecodb/ship.hmac"
 
 [security]
-# auto = require auth when listen is not loopback
+# Safe default: require auth whenever listen is not loopback. Prefer leaving
+# this as "auto" rather than false; set true explicitly for networked binds.
 require_auth = "auto"
-keys_file = "/etc/zydecodb/keys.toml"
+keys_file = "/etc/zydecodb/keys.toml"   # must be chmod 600 (serve refuses group/world-readable)
 allow_unauthenticated_ping = true
 legacy_single_tenant = true
+# Resource-limit defaults (see docs/GUIDE.md#resource-limits-defaults):
+# max_connections=256, rate_limit_rps=1000, auth_burst_limit=10,
+# max_sort_buffer=10000; memtable flush 64 MiB; block_cache_mb above (256).
 max_connections = 256
 rate_limit_rps = 1000
 auth_burst_limit = 10
@@ -71,7 +75,12 @@ enabled = true
 log_client_key = false
 
 [security.quotas]
-# 0 = unlimited
+# 0 = unlimited. With require_auth on, serve warns when this stays 0.
+# Recommended production starting points:
+#   1073741824   = 1 GiB per tenant
+#   10737418240  = 10 GiB per tenant
+#   107374182400 = 100 GiB per tenant
+# Size to disk and tenant count; override per tenant via [[tenant]] in keys.toml.
 max_bytes_per_tenant = 0
 
 # Dense multi-instance boxes: shrink cache / open readers / compaction poll when

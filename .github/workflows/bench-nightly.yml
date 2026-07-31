@@ -1,0 +1,31 @@
+# Short put/get microbench vs committed baseline. Coarse 20% gate (GHA is noisy).
+name: Bench regression nightly
+
+on:
+  schedule:
+    # 04:45 UTC daily
+    - cron: "45 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run bench-regression (COMPARE vs baseline)
+        env:
+          COMPARE: "1"
+          THRESHOLD_PCT: "20"
+          OPS: "50000"
+          OUT: ${{ runner.temp }}/bench-regression.json
+        run: ./scripts/bench-regression.sh
+      - name: Upload bench trend artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-regression-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench-regression.json
+          if-no-files-found: ignore

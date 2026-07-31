@@ -1,0 +1,72 @@
+[
+  {
+    "workload": "point_get",
+    "ops": 2000,
+    "elapsed_ms": 129,
+    "ops_per_sec": 15408.431960844464,
+    "p50_us": 27,
+    "p99_us": 146,
+    "rss_kb_peak": 7476,
+    "notes": "KV Get against 10k preloaded keys"
+  },
+  {
+    "workload": "find_indexed",
+    "ops": 500,
+    "elapsed_ms": 72,
+    "ops_per_sec": 6919.127070197629,
+    "p50_us": 107,
+    "p99_us": 271,
+    "rss_kb_peak": 10208,
+    "notes": "Find on users.by_age secondary index"
+  },
+  {
+    "workload": "find_unindexed",
+    "ops": 500,
+    "elapsed_ms": 159,
+    "ops_per_sec": 3140.7780716101297,
+    "p50_us": 276,
+    "p99_us": 544,
+    "rss_kb_peak": 10692,
+    "notes": "Find without usable secondary index (collection scan)"
+  },
+  {
+    "workload": "upsert",
+    "ops": 2000,
+    "elapsed_ms": 2337,
+    "ops_per_sec": 855.7215015283917,
+    "p50_us": 188,
+    "p99_us": 7679,
+    "rss_kb_peak": 15876,
+    "notes": "Update upsert=true on rotating email keys"
+  },
+  {
+    "workload": "tx_commit",
+    "ops": 500,
+    "elapsed_ms": 2205,
+    "ops_per_sec": 226.6613513431359,
+    "p50_us": 4200,
+    "p99_us": 7686,
+    "rss_kb_peak": 17044,
+    "notes": "Begin → DocPut → Commit per op"
+  },
+  {
+    "workload": "aggregate",
+    "ops": 500,
+    "elapsed_ms": 224,
+    "ops_per_sec": 2231.2250566609564,
+    "p50_us": 429,
+    "p99_us": 861,
+    "rss_kb_peak": 17044,
+    "notes": "$group sum over 1k docs / 10 groups"
+  },
+  {
+    "workload": "watch_fanout",
+    "ops": 200,
+    "elapsed_ms": 3059,
+    "ops_per_sec": 65.37110965678914,
+    "p50_us": 15130,
+    "p99_us": 21870,
+    "rss_kb_peak": 56980,
+    "notes": "4 Watch subscribers; write + drain one event each"
+  }
+]

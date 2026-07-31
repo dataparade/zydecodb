@@ -375,7 +375,7 @@ fn parse_doc(stored: &[u8], doc_id: &[u8]) -> Option<serde_json::Value> {
     let kind = stored[0];
     let payload = crate::store::strip_value_kind(stored);
     let mut v = if kind == crate::store::VK_ZDOC {
-        crate::binary::ValueView::new(payload).to_value()
+        crate::binary::ValueView::new(payload).to_value().ok()?
     } else {
         serde_json::from_slice(payload).ok()?
     };

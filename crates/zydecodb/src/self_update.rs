@@ -19,6 +19,8 @@ pub struct UpdateOptions {
     pub version: Option<String>,
     pub force: bool,
     pub yes: bool,
+    /// Skip GitHub Artifact Attestation verify (airgap / no `gh`). SHA-256 still required.
+    pub skip_attestation: bool,
     /// Override GitHub API base (…/releases). Tests inject a local server.
     pub api_base: Option<String>,
     /// Override download base (…/releases/download).
@@ -36,6 +38,7 @@ impl Default for UpdateOptions {
             version: None,
             force: false,
             yes: false,
+            skip_attestation: false,
             api_base: None,
             download_base: None,
             install_path: None,
@@ -249,12 +252,11 @@ pub fn parse_sha256_sidecar(text: &str, archive_path: &Path) -> Result<String> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let hex = parts
-            .next()
-            .ok_or_else(|| err("checksum file empty"))?;
+        let hex = parts.next().ok_or_else(|| err("checksum file empty"))?;
         let name = parts.next().unwrap_or(want_name);
         let name = name.trim_start_matches('*');
-        if name == want_name || Path::new(name).file_name().and_then(|s| s.to_str()) == Some(want_name)
+        if name == want_name
+            || Path::new(name).file_name().and_then(|s| s.to_str()) == Some(want_name)
         {
             if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(err("invalid sha256 hex in checksum file"));
@@ -279,9 +281,7 @@ pub fn parse_sha256_sidecar(text: &str, archive_path: &Path) -> Result<String> {
             }
         }
     }
-    Err(err(format!(
-        "checksum file does not mention {want_name}"
-    )))
+    Err(err(format!("checksum file does not mention {want_name}")))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -303,10 +303,7 @@ pub fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if name != "zydecodb" {
             continue;
         }
@@ -347,10 +344,8 @@ pub fn atomic_replace(install_path: &Path, new_bin: &Path) -> Result<()> {
                 || e.raw_os_error() == Some(26) // ETXTBSY on Linux
                 || e.to_string().contains("Text file busy");
             if busy {
-                return Err(err(
-                    "cannot replace the running binary (text file busy). \
-                     Stop `zydecodb serve` and retry `zydecodb update`",
-                ));
+                return Err(err("cannot replace the running binary (text file busy). \
+                     Stop `zydecodb serve` and retry `zydecodb update`"));
             }
             // Fallback: move current aside, then place new.
             let bak = parent.join("zydecodb.old");
@@ -381,18 +376,26 @@ pub fn atomic_replace(install_path: &Path, new_bin: &Path) -> Result<()> {
     }
 }
 
-fn maybe_attest(archive_path: &Path) {
+/// Verify GitHub Artifact Attestation for the downloaded archive.
+/// SHA-256 is already required before this runs; attestation is the second bar.
+fn require_attest(archive_path: &Path) -> Result<()> {
     let Some(gh) = which("gh") else {
-        return;
+        return Err(err(
+            "gh CLI not found — install GitHub CLI (https://cli.github.com) for attestation \
+             verify, or re-run with --skip-attestation (SHA-256 still verified)",
+        ));
     };
-    // Older gh builds lack `attestation`; skip quietly.
     let probe = Command::new(&gh)
         .args(["attestation", "--help"])
-        .output();
-    if !matches!(probe, Ok(ref o) if o.status.success()) {
-        return;
+        .output()
+        .map_err(|e| err(format!("could not run gh: {e}")))?;
+    if !probe.status.success() {
+        return Err(err(
+            "gh attestation subcommand unavailable — upgrade GitHub CLI, or re-run with \
+             --skip-attestation (SHA-256 still verified)",
+        ));
     }
-    match Command::new(gh)
+    let out = Command::new(gh)
         .args([
             "attestation",
             "verify",
@@ -401,20 +404,16 @@ fn maybe_attest(archive_path: &Path) {
             REPO,
         ])
         .output()
-    {
-        Ok(out) if out.status.success() => {
-            eprintln!("Attestation verified.");
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!(
-                "warning: gh attestation verify failed (continuing after sha256): {}",
-                stderr.trim()
-            );
-        }
-        Err(e) => {
-            eprintln!("warning: could not run gh attestation verify: {e}");
-        }
+        .map_err(|e| err(format!("could not run gh attestation verify: {e}")))?;
+    if out.status.success() {
+        eprintln!("Attestation verified.");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(err(format!(
+            "gh attestation verify failed (refusing to install): {}",
+            stderr.trim()
+        )))
     }
 }
 
@@ -510,7 +509,10 @@ pub fn run(opts: UpdateOptions) -> Result<UpdateOutcome> {
     }
 
     if !opts.yes {
-        let prompt = format!("Install zydecodb {} ({target})?", tag.trim_start_matches('v'));
+        let prompt = format!(
+            "Install zydecodb {} ({target})?",
+            tag.trim_start_matches('v')
+        );
         if !confirm_tty(&prompt)? {
             return Err(err("update cancelled"));
         }
@@ -541,7 +543,11 @@ pub fn run(opts: UpdateOptions) -> Result<UpdateOutcome> {
         verify_sha256(&archive_path, &text)?;
     }
     eprintln!("Checksum verified.");
-    maybe_attest(&archive_path);
+    if opts.skip_attestation {
+        eprintln!("Skipping attestation verify (--skip-attestation).");
+    } else {
+        require_attest(&archive_path)?;
+    }
 
     let extracted = extract_binary(&archive_path, tmp.path())?;
     let install_path = match opts.install_path {
@@ -610,15 +616,15 @@ mod tests {
     #[test]
     fn sha256_sidecar_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("zydecodb-v0.10.0-x86_64-unknown-linux-musl.tar.gz");
+        let archive = dir
+            .path()
+            .join("zydecodb-v0.10.0-x86_64-unknown-linux-musl.tar.gz");
         let payload = b"hello-zydecodb-archive";
         fs::write(&archive, payload).unwrap();
         let mut hasher = Sha256::new();
         hasher.update(payload);
         let hex = hex_encode(&hasher.finalize());
-        let sidecar = format!(
-            "{hex}  zydecodb-v0.10.0-x86_64-unknown-linux-musl.tar.gz\n"
-        );
+        let sidecar = format!("{hex}  zydecodb-v0.10.0-x86_64-unknown-linux-musl.tar.gz\n");
         verify_sha256(&archive, &sidecar).unwrap();
         // Single-entry sidecar with a different filename still verifies.
         verify_sha256(&archive, &format!("{hex}  other.tar.gz\n")).unwrap();
@@ -644,7 +650,9 @@ mod tests {
             header.set_size(data.len() as u64);
             header.set_mode(0o755);
             header.set_cksum();
-            builder.append_data(&mut header, "zydecodb", &data[..]).unwrap();
+            builder
+                .append_data(&mut header, "zydecodb", &data[..])
+                .unwrap();
             builder.finish().unwrap();
         }
 
@@ -733,6 +741,7 @@ mod tests {
             version: None,
             force: true,
             yes: true,
+            skip_attestation: true,
             api_base: Some(api_base.clone()),
             download_base: Some(download_base.clone()),
             install_path: Some(install.clone()),
@@ -746,6 +755,7 @@ mod tests {
             check: true,
             version: Some("v9.9.9".into()),
             force: false,
+            skip_attestation: true,
             yes: true,
             api_base: Some(api_base),
             download_base: Some(download_base),

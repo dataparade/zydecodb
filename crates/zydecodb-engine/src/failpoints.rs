@@ -67,6 +67,29 @@ pub const APPLY_AFTER_FSYNC_BEFORE_PUBLISH: &str = "apply::after_fsync_before_pu
 /// Owner thread: catalog swap done, about to unlink obsolete SSTables/WAL.
 pub const APPLY_AFTER_PUBLISH_BEFORE_UNLINK: &str = "apply::after_publish_before_unlink";
 
+/// Shipping: before copying/hardlinking the sealed segment into `ship_dir`.
+pub const SHIP_BEFORE_SEGMENT: &str = "ship::before_segment";
+/// Shipping: after segment bytes + ship_dir fsync, before `shipped.log` append.
+pub const SHIP_AFTER_SEGMENT: &str = "ship::after_segment";
+/// Shipping: before appending a line to `shipped.log`.
+pub const SHIP_BEFORE_LOG_APPEND: &str = "ship::before_log_append";
+/// Shipping: after `shipped.log` fsync + ship_dir fsync.
+pub const SHIP_AFTER_LOG_APPEND: &str = "ship::after_log_append";
+
+/// Snapshot: before writing SNAPMETA / finalizing the snapshot tree.
+pub const SNAPSHOT_BEFORE_PUBLISH: &str = "snapshot::before_publish";
+/// Snapshot: after SNAPMETA + snapshot dir fsync.
+pub const SNAPSHOT_AFTER_PUBLISH: &str = "snapshot::after_publish";
+
+/// Change-log: before hardlink/copy of a sealed WAL segment into the archive.
+pub const CHANGELOG_BEFORE_ARCHIVE: &str = "changelog::before_archive";
+/// Change-log: after archived segment fsync, before manifest rewrite.
+pub const CHANGELOG_AFTER_ARCHIVE: &str = "changelog::after_archive";
+/// Change-log: before renaming `manifest.json.tmp` into place.
+pub const CHANGELOG_BEFORE_MANIFEST_RENAME: &str = "changelog::before_manifest_rename";
+/// Change-log: after manifest rename + archive_dir fsync.
+pub const CHANGELOG_AFTER_MANIFEST_RENAME: &str = "changelog::after_manifest_rename";
+
 /// Convenience: build the injected-error `Err` arm for a `fail_point!` site.
 /// Centralizing this keeps every injection site producing the same shape of
 /// `EngineError::Io("injected: <name>")` string, which the crash matrix tests

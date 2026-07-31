@@ -11,7 +11,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -36,6 +36,25 @@ pub fn ensure_dirs(tmp: &TempDir) -> (PathBuf, PathBuf) {
     (data_dir, wal_dir)
 }
 
+/// Write a secret file and restrict it to owner-only (`0600`) so `serve`
+/// startup validation accepts it on Unix.
+pub fn write_secret_file(path: &Path, bytes: impl AsRef<[u8]>) {
+    std::fs::write(path, bytes).unwrap();
+    chmod_owner_only(path);
+}
+
+pub fn chmod_owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// Minimal server config (auth off) on `listen` with temp data/wal dirs.
 pub fn base_config(tmp: &TempDir, listen: SocketAddr) -> Config {
     let (data_dir, wal_dir) = ensure_dirs(tmp);
@@ -53,6 +72,8 @@ pub fn base_config(tmp: &TempDir, listen: SocketAddr) -> Config {
         replica: Default::default(),
         security: SecurityConfig {
             require_auth: RequireAuth::False,
+            // Avoid host /etc/zydecodb/keys.toml — serve refuses world-readable secrets.
+            keys_file: tmp.path().join("keys.toml"),
             ..Default::default()
         },
         tls: Default::default(),

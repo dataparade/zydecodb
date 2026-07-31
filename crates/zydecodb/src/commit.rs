@@ -106,7 +106,11 @@ impl CommitCoordinator {
 
     /// Highest sequence known fsynced (change streams must not emit beyond this).
     pub fn durable_seq(&self) -> u64 {
-        self.state.lock().unwrap().synced_seq.max(self.wal_sync.synced_seq())
+        self.state
+            .lock()
+            .unwrap()
+            .synced_seq
+            .max(self.wal_sync.synced_seq())
     }
 
     /// Block until `seq` is fsynced, or `timeout` elapses, or shutdown.
