@@ -21,6 +21,8 @@ clients/go/user_backend
 /soak-runs/**/wal/
 /soak-runs/**/*.log
 /soak-runs/**/*.jsonl
+/soak-runs/**/*.json
+/soak-runs/**/*.txt
 
 # Python
 __pycache__/
