@@ -1,10 +1,13 @@
 # Pre-RC release gates: 90m paced soak (stability) + tenant-isolation (MODE=both).
-# workflow_dispatch only — not on every PR and not on tag publish.
+# Weekly schedule so silent regressions (e.g. compaction write amp) surface
+# within days, not weeks; also workflow_dispatch for pre-tag checks.
 # Checklist: green run of this workflow (or equivalent local) before tags.
 name: Release soak (pre-RC)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 0" # Sundays 06:00 UTC
 
 jobs:
   soak-90m:
