@@ -115,12 +115,15 @@ impl SnapshotHandle {
     /// the opaque document revision for optimistic concurrency.
     pub fn get_with_seq(&self, key: &[u8]) -> EngineResult<Option<(Vec<u8>, u64)>> {
         let now = now_ms();
-        if let Some(v) = get_from_memtable_with_seq(&self.active, key, self.seq_upper, now)? {
-            return Ok(Some(v));
+        // A hit in any source shadows everything older, even when it resolves
+        // to None (tombstone or expired): the delete/expiry is newer than
+        // anything below, so falling through would resurrect a stale value.
+        if let Some((ik, entry)) = first_visible_in_memtable(&self.active, key, self.seq_upper) {
+            return Ok(resolve_with_seq(&ik, &entry, now));
         }
         for mt in self.immutables.iter().rev() {
-            if let Some(v) = get_from_memtable_with_seq(mt, key, self.seq_upper, now)? {
-                return Ok(Some(v));
+            if let Some((ik, entry)) = first_visible_in_memtable(mt, key, self.seq_upper) {
+                return Ok(resolve_with_seq(&ik, &entry, now));
             }
         }
         // Newest SSTable first — catalog is newest-last (matches Engine::snapshot_get).
@@ -131,10 +134,17 @@ impl SnapshotHandle {
             if !sst.might_contain(key) {
                 continue;
             }
-            if let Some((ik, entry)) = sst.get_latest(key)? {
-                if ik.seq <= self.seq_upper {
-                    return Ok(resolve_with_seq(&ik, &entry, now));
-                }
+            let found = if self.seq_upper == u64::MAX {
+                sst.get_latest(key)?
+            } else {
+                // Bounded ceiling: this table's newest entry for the key may
+                // be newer than the ceiling. Walk the key's block range for
+                // the newest visible version — skipping the table outright
+                // would surface a too-old version from an older table.
+                newest_visible_in_sstable(sst, key, self.seq_upper)?
+            };
+            if let Some((ik, entry)) = found {
+                return Ok(resolve_with_seq(&ik, &entry, now));
             }
         }
         Ok(None)
@@ -226,17 +236,17 @@ impl<'a> Iterator for OwnedRangeIter<'a> {
     }
 }
 
-fn get_from_memtable_with_seq(
+/// First entry for `user_key` visible at `seq_upper`, raw (tombstones
+/// included) so the caller can distinguish "not here" from "deleted here" —
+/// resolving inside the helper would conflate the two and let deleted keys
+/// fall through to older sources.
+fn first_visible_in_memtable(
     mt: &Memtable,
     user_key: &[u8],
     seq_upper: u64,
-    now: u64,
-) -> EngineResult<Option<(Vec<u8>, u64)>> {
+) -> Option<(InternalKey, Entry)> {
     if seq_upper == u64::MAX {
-        if let Some((ik, entry)) = mt.get_latest(user_key) {
-            return Ok(resolve_with_seq(ik, entry, now));
-        }
-        return Ok(None);
+        return mt.get_latest(user_key).map(|(k, e)| (k.clone(), e.clone()));
     }
     use std::ops::Bound;
     let lower = InternalKey::new(user_key.to_vec(), u64::MAX, EntryKind::Value);
@@ -245,10 +255,30 @@ fn get_from_memtable_with_seq(
         .range::<InternalKey, _>((Bound::Included(lower), Bound::Unbounded))
     {
         if k.user_key.as_slice() != user_key {
-            return Ok(None);
+            return None;
         }
         if k.seq <= seq_upper {
-            return Ok(resolve_with_seq(k, e, now));
+            return Some((k.clone(), e.clone()));
+        }
+    }
+    None
+}
+
+/// Newest entry for `user_key` in this table with seq ≤ `seq_upper`, raw.
+/// Mirrors `Engine::newest_visible_in_sstable` for the owned-snapshot path.
+fn newest_visible_in_sstable(
+    reader: &Arc<SstableReader>,
+    user_key: &[u8],
+    seq_upper: u64,
+) -> EngineResult<Option<(InternalKey, Entry)>> {
+    let hi = crate::engine::Engine::next_user_key(user_key);
+    let mut it = reader.clone().range_iter(user_key.to_vec(), hi)?;
+    while let Some((ik, entry)) = it.next()? {
+        if ik.user_key.as_slice() != user_key {
+            continue;
+        }
+        if ik.seq <= seq_upper {
+            return Ok(Some((ik, entry)));
         }
     }
     Ok(None)
