@@ -43,9 +43,14 @@ from typing import Iterable
 # that lets real regressions slip.
 
 TODO_RSS_BYTES_CEILING: int | None = None
-TODO_OPEN_FDS_CEILING: int | None = None
-TODO_IMMUTABLE_MEMTABLE_MEAN_CEILING: float | None = None
-TODO_IMMUTABLE_MEMTABLE_MAX_CEILING: int | None = None
+# Baseline: ga24-fixed-20260801 (24h @ 3k ops, 255M ops). Observed max 33 FDs;
+# ceiling ~45% above (FDs arrive in lumps: sstable readers + WAL + manifest).
+TODO_OPEN_FDS_CEILING: int | None = 48
+# Baseline: same run — paced 3k ops never sustains flush backlog (mean 0.00).
+TODO_IMMUTABLE_MEMTABLE_MEAN_CEILING: float | None = 1.0
+# Baseline: same run — observed max 0; allow freeze-while-flushing transient
+# (one immutable plus one more mid-freeze), catch real backlog above that.
+TODO_IMMUTABLE_MEMTABLE_MAX_CEILING: int | None = 2
 TODO_P99_US_CEILING: int | None = 500
 TODO_P999_US_CEILING: int | None = 2000
 # Rare tail on timed ops (scan drain, cache cold miss). 50ms poll cadence means
@@ -63,8 +68,12 @@ TARGET_FILE_BYTES: int = 64 * 1024 * 1024
 L2_FILE_COUNT_SLACK: int = 2
 TODO_RSS_BYTES_STABILITY_CEILING: int | None = None
 # Headroom beyond configured caches when deriving RSS from soak header (MB).
-# 128 MB memtable + 128 MB engine/WAL/allocator (MEMO6: metadata via reader cap).
-DEFAULT_RSS_HEADROOM_MB = 256
+# Baseline ga24-fixed-20260801 (24h @ 3k ops): RSS plateaus at ~1076 MB by
+# hour 3 and stays flat for 21h (no leak), with transient spikes to 1142 MB
+# (~66 MB of allocator/compaction scratch above the plateau). 512 MB puts the
+# derived ceiling ~17% above that observed max, per the 20-30% rule applied to
+# a workload whose metadata term already scales with live sstables.
+DEFAULT_RSS_HEADROOM_MB = 512
 # Estimated pinned index+bloom per open reader (MB), for derived RSS ceiling
 # when the run's live sstable count is unknown.
 DEFAULT_PER_READER_METADATA_MB = 1.5

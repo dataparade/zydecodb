@@ -18,7 +18,7 @@ use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -68,6 +68,10 @@ pub struct CompactionScheduler {
     worker_failed: Arc<AtomicBool>,
     last_error: Mutex<Option<String>>,
     compaction_needed: Arc<AtomicBool>,
+    /// Results sent by the worker but not yet drained by the engine owner.
+    /// While nonzero the catalog lags the worker: a plan made now can name
+    /// inputs an undrained apply is about to remove, so submission must wait.
+    results_pending: Arc<AtomicUsize>,
     /// Best plan seen while the worker was busy (single-slot coalescing).
     pending: Mutex<Option<WorkItem>>,
     join_handle: Option<JoinHandle<()>>,
@@ -86,11 +90,13 @@ impl CompactionScheduler {
         let worker_failed = Arc::new(AtomicBool::new(false));
         let last_error = Mutex::new(None);
         let compaction_needed = Arc::new(AtomicBool::new(false));
+        let results_pending = Arc::new(AtomicUsize::new(0));
         let busy_flag = worker_busy.clone();
+        let pending_flag = results_pending.clone();
 
         let join_handle = thread::Builder::new()
             .name("zydecodb-compaction".into())
-            .spawn(move || compaction_worker_loop(work_rx, result_tx, busy_flag))
+            .spawn(move || compaction_worker_loop(work_rx, result_tx, busy_flag, pending_flag))
             .expect("spawn compaction worker");
 
         CompactionScheduler {
@@ -100,6 +106,7 @@ impl CompactionScheduler {
             worker_failed,
             last_error,
             compaction_needed,
+            results_pending,
             pending: Mutex::new(None),
             join_handle: Some(join_handle),
         }
@@ -206,6 +213,14 @@ impl CompactionScheduler {
             );
             return false;
         }
+        // The worker may have finished between the caller's gate check and
+        // this call: busy clears only after results_pending increments, so
+        // observing zero here guarantees no undrained result exists. A plan
+        // made while a result was in flight names inputs the pending apply
+        // is about to remove — drop it; the next poll re-plans fresh.
+        if self.results_pending.load(Ordering::Acquire) > 0 {
+            return false;
+        }
         self.submit_work(WorkItem {
             job,
             input_metas,
@@ -225,8 +240,23 @@ impl CompactionScheduler {
         if self.worker_busy.load(Ordering::Acquire) {
             return false;
         }
+        // Same interlock as try_submit: never submit while a finished job's
+        // result is undrained. The staged plan predates the pending apply;
+        // the drain's clear_staged drops it.
+        if self.results_pending.load(Ordering::Acquire) > 0 {
+            return false;
+        }
         let item = self.pending.lock().expect("compaction pending lock").take();
         item.map(|i| self.submit_work(i)).unwrap_or(false)
+    }
+
+    /// True while the worker has finished jobs whose results the engine owner
+    /// has not drained yet. Submitting in this window plans against a catalog
+    /// that lags the worker: the plan can name inputs the undrained apply is
+    /// about to remove, and the job then re-reads those dead files (still
+    /// reachable via cached reader fds) and writes duplicate-range outputs.
+    pub fn has_undrained_results(&self) -> bool {
+        self.results_pending.load(Ordering::Acquire) > 0
     }
 
     fn submit_work(&self, item: WorkItem) -> bool {
@@ -244,6 +274,9 @@ impl CompactionScheduler {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
+        }
+        if !out.is_empty() {
+            self.results_pending.fetch_sub(out.len(), Ordering::AcqRel);
         }
         out
     }
@@ -272,6 +305,7 @@ fn compaction_worker_loop(
     work_rx: Receiver<WorkerCommand>,
     result_tx: Sender<Result<CompactionExecuteResult, String>>,
     worker_busy: Arc<AtomicBool>,
+    results_pending: Arc<AtomicUsize>,
 ) {
     while let Ok(cmd) = work_rx.recv() {
         match cmd {
@@ -297,11 +331,15 @@ fn compaction_worker_loop(
                     })
                     .map_err(|e| e.to_string())
                 }));
-                worker_busy.store(false, Ordering::Release);
                 let result = match result {
                     Ok(r) => r,
                     Err(_) => Err("background compaction panicked".to_string()),
                 };
+                // Count before clearing busy and before send: observing
+                // (not busy, zero pending) must guarantee the channel is
+                // empty and the engine is free to plan again.
+                results_pending.fetch_add(1, Ordering::AcqRel);
+                worker_busy.store(false, Ordering::Release);
                 let _ = result_tx.send(result);
             }
         }

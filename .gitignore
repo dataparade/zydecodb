@@ -87,3 +87,5 @@ tls.key
 /docs/soak-baselines/local/
 /docs/soak-baselines/*.tmp
 .cargo-home/
+/soak-runs/bin/
+/soak-runs/scratch-head/

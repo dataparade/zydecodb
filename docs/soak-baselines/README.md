@@ -9,6 +9,7 @@ and [`INTERNAL.md`](../INTERNAL.md#reference-workloads-published-numbers).
 | `memo4-90m.jsonl` | 90m @ 3k ops | Earlier perf baseline |
 | `memo6-6m-v2.jsonl` | 6m @ 3k ops | Beta-candidate snapshot |
 | `memo6-90m.jsonl` | 90m @ 3k ops | Stability gate reference |
+| `memo5-ga-24h.jsonl` | 24h @ 3k ops | GA paced gate reference; post write-amp fix (amp 2.89, 255M ops, 0 errors) |
 | `ref-workloads-local.json` | `ref-workloads` OPS=2000 | Source for GUIDE Performance table |
 | `bench-baseline.json` | `bench-regression` 50k ops | Nightly COMPARE=1 baseline |
 | `rc-<ver>-24h-uncapped.jsonl` | VPS `OPS=0` 24h | Per-RC archive (add with `notes.md`) |

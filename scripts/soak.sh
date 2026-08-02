@@ -76,12 +76,21 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 echo "building engine-soak (release)..." >&2
 ( cd "$REPO_ROOT" && cargo build --release -p zydecodb-engine --bin engine-soak ) >&2
 
-BIN="$REPO_ROOT/target/release/engine-soak"
+# Resolve the binary from the target dir cargo ACTUALLY used (an inherited
+# CARGO_TARGET_DIR — e.g. an IDE sandbox cache — wins over the pin above, and
+# the hardcoded path can silently be a stale binary from a previous build).
+BIN="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | grep -o '"target_directory":"[^"]*"' | head -1 \
+    | cut -d'"' -f4)/release/engine-soak"
 if [[ ! -x "$BIN" ]]; then
-    # Fall back to the workspace target dir cargo actually used.
-    BIN="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
-        | grep -o '"target_directory":"[^"]*"' | head -1 \
-        | cut -d'"' -f4)/release/engine-soak"
+    echo "ERROR: freshly built engine-soak not found at $BIN" >&2
+    exit 1
+fi
+# Refuse to run a binary older than the newest engine source file.
+NEWEST_SRC="$(find "$REPO_ROOT/crates/zydecodb-engine/src" -name '*.rs' -newer "$BIN" | head -1)"
+if [[ -n "$NEWEST_SRC" ]]; then
+    echo "ERROR: $BIN is older than $NEWEST_SRC — refusing to soak a stale binary" >&2
+    exit 1
 fi
 
 set +e

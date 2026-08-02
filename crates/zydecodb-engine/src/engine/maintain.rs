@@ -238,6 +238,16 @@ impl Engine {
     }
 
     pub(crate) fn maybe_submit_compaction(&mut self) -> bool {
+        // Never plan or submit while finished work is still flowing through
+        // the result channel or the apply worker: the catalog lags in that
+        // window, so a plan made now can name inputs a pending apply is about
+        // to remove. The next poll_compaction drains, publishes, then plans.
+        if self.compaction_scheduler.has_undrained_results()
+            || self.apply_scheduler.pending_applies() > 0
+            || self.apply_scheduler.ready_count() > 0
+        {
+            return false;
+        }
         if self.compaction_scheduler.try_submit_staged() {
             return true;
         }
@@ -485,8 +495,12 @@ impl Engine {
         self.process_deferred_unlinks()?;
         self.refresh_topology_gauges();
         if apply.flush_max_seq.is_some() {
+            // Flag only — never submit from here. This runs mid-batch inside
+            // drain_catalog_apply: sibling applies already taken from the
+            // ready queue are invisible to the submission gate, so a plan
+            // made now can name inputs a later apply in this batch is about
+            // to remove. poll_compaction submits after the pipeline drains.
             self.request_compaction();
-            self.maybe_submit_compaction();
         }
         Ok(())
     }
@@ -667,5 +681,175 @@ impl Engine {
         self.archive_sealed_segment_result(sealed_id, sealed_max)?;
         self.active_wal_id += 1;
         self.open_new_wal_segment()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::compaction::CompactionConfig;
+    use crate::engine::{Engine, EngineConfig};
+    use crate::metrics::Metrics;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Regression: a plan made while the compaction worker is busy names
+    /// inputs the in-flight job is about to remove. If such a plan is
+    /// submitted in the window between worker completion and catalog
+    /// publish, it re-reads dead files (still reachable through cached
+    /// reader fds after unlink) and writes duplicate-range outputs — the
+    /// 2f84fe2 write-amp regression. Submission must hold off until the
+    /// catalog has caught up with the worker.
+    #[test]
+    fn no_submission_while_catalog_lags_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut compaction = CompactionConfig::default();
+        compaction.target_file_bytes = 64 * 1024;
+        compaction.l1_target_bytes = 1024 * 1024;
+        let engine = Engine::open(EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal_dir: dir.path().join("wal"),
+            memtable_flush_threshold: 16 * 1024,
+            compaction,
+            ..Default::default()
+        })
+        .expect("engine open");
+        let metrics = Metrics::new();
+        let mut engine = engine.with_metrics(Arc::clone(&metrics));
+
+        // Exactly four flushes -> four L0 files -> L0 trigger. Freeze and
+        // drain the flush worker only; draining compaction here would close
+        // the window the test probes.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for f in 0..4u32 {
+            // ~13 KB per round: under the 16 KB freeze threshold so each
+            // round yields exactly one L0 file.
+            for i in 0..100u32 {
+                let mut key = vec![crate::keys::KS_USER];
+                key.extend_from_slice(format!("k{:05}", f * 1000 + i).as_bytes());
+                engine.put(key, vec![b'v'; 128], 0).expect("put");
+            }
+            engine.maybe_freeze();
+            engine.drain_flush().expect("flush");
+        }
+        assert_eq!(
+            metrics.live_sstables_by_level.with_label_values(&["0"]).get(),
+            4,
+            "expected four L0 files"
+        );
+
+        // Job 1 is in flight (submitted by the put/poll path above or by
+        // this call); a second call stages the same input set while busy.
+        engine.maybe_submit_compaction();
+        engine.maybe_submit_compaction();
+
+        // Wait for the worker to finish; the result now sits undrained and
+        // the catalog still shows the job's inputs as live.
+        while engine.compaction_scheduler.is_worker_busy() {
+            assert!(Instant::now() < deadline, "job never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            engine.compaction_scheduler.has_undrained_results(),
+            "L0 job result drained before the test could probe the window"
+        );
+
+        // The gate must refuse: submitting now would plan against the stale
+        // catalog and duplicate the in-flight job's work.
+        assert!(
+            !engine.maybe_submit_compaction(),
+            "submitted while catalog lagged the worker"
+        );
+
+        engine.drain_compaction().expect("drain");
+        let l0_jobs = metrics
+            .compaction_jobs_by_input_level
+            .with_label_values(&["0"])
+            .get();
+        assert_eq!(l0_jobs, 1, "same input set applied more than once");
+    }
+
+    /// Regression: applies drained from the ready queue in one batch are
+    /// published one by one. A flush apply published before a sibling
+    /// compaction apply must not trigger compaction submission: the gate
+    /// cannot see the sibling (already taken from the ready queue), so a
+    /// plan made mid-batch names inputs the sibling is about to remove.
+    #[test]
+    fn no_submission_mid_apply_batch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut compaction = CompactionConfig::default();
+        compaction.target_file_bytes = 64 * 1024;
+        compaction.l1_target_bytes = 1024 * 1024;
+        let engine = Engine::open(EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal_dir: dir.path().join("wal"),
+            memtable_flush_threshold: 16 * 1024,
+            compaction,
+            ..Default::default()
+        })
+        .expect("engine open");
+        let metrics = Metrics::new();
+        let mut engine = engine.with_metrics(Arc::clone(&metrics));
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for f in 0..4u32 {
+            for i in 0..100u32 {
+                let mut key = vec![crate::keys::KS_USER];
+                key.extend_from_slice(format!("k{:05}", f * 1000 + i).as_bytes());
+                engine.put(key, vec![b'v'; 128], 0).expect("put");
+            }
+            engine.maybe_freeze();
+            engine.drain_flush().expect("flush");
+        }
+
+        // L0 job in flight (submitted by this call or a flush publish);
+        // wait for the worker, result undrained.
+        engine.maybe_submit_compaction();
+        while engine.compaction_scheduler.is_worker_busy() {
+            assert!(Instant::now() < deadline, "job never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // A fifth flush, driven manually so its apply batches with the
+        // pending compaction apply instead of draining early.
+        let mut key = vec![crate::keys::KS_USER];
+        key.extend_from_slice(b"k99999");
+        engine.put(key, vec![b'v'; 128], 0).expect("put");
+        // Under the freeze threshold; freeze by hand (as force_flush does).
+        if !engine.active.is_empty() {
+            let frozen = std::mem::replace(
+                &mut engine.active,
+                Arc::new(crate::memtable::Memtable::new()),
+            );
+            engine.immutable.push_back(frozen);
+        }
+        assert!(engine.try_submit_flush(), "flush should submit");
+        while engine.flush_scheduler.is_worker_busy() {
+            assert!(Instant::now() < deadline, "flush never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Submit both applies to the apply worker without draining; the
+        // flush apply is first in FIFO order.
+        for r in engine.flush_scheduler.poll_results() {
+            engine.submit_flush_apply(r.expect("flush result")).expect("flush apply");
+        }
+        for r in engine.compaction_scheduler.poll_results() {
+            engine.submit_compaction_apply(r.expect("compaction result")).expect("compaction apply");
+        }
+        // Both ready, neither drained: one batched drain publishes
+        // [flush, compaction] from a single ready vec.
+        while engine.apply_scheduler.pending_applies() > 0 {
+            assert!(Instant::now() < deadline, "applies never became ready");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(engine.apply_scheduler.ready_count(), 2, "applies not batched");
+        engine.drain_catalog_apply().expect("batched drain");
+
+        engine.drain_compaction().expect("drain");
+        let l0_jobs = metrics
+            .compaction_jobs_by_input_level
+            .with_label_values(&["0"])
+            .get();
+        assert_eq!(l0_jobs, 1, "same input set applied more than once");
     }
 }
