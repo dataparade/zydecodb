@@ -1,0 +1,61 @@
+# Model-based differential testing: a few hundred seeds/night of short
+# deterministic op sequences against the reference-model oracle. A failure
+# files an issue containing just the seed — `scripts/model-repro.sh <seed>`
+# replays it exactly.
+name: Model nightly
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: model-nightly
+  cancel-in-progress: false
+
+jobs:
+  model-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run seed sweep
+        run: scripts/model-nightly.sh 256 10000
+      - name: File issue on divergence
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          fails="$(cat /tmp/model-nightly-failures.jsonl)"
+          seeds="$(echo "$fails" | grep -o '"seed":[0-9]*' | cut -d: -f2 | sort -u | tr '\n' ' ')"
+          for seed in $seeds; do
+            if gh issue list --state open --search "model divergence seed $seed" --limit 1 | grep -q .; then
+              echo "issue already open for seed $seed; skipping"
+              continue
+            fi
+            detail="$(echo "$fails" | grep "\"seed\":$seed" | head -1)"
+            body="engine-model nightly found a divergence.
+
+          Reproduce exactly:
+          \`\`\`
+          scripts/model-repro.sh $seed
+          \`\`\`
+
+          Divergence line:
+          \`\`\`json
+          $detail
+          \`\`\`
+
+          Per SQLite law: commit the failing sequence as a test under
+          \`crates/zydecodb-engine/tests/\` BEFORE fixing."
+            gh issue create --title "model divergence: seed $seed" --label "bug" --body "$body"
+          done
+      - name: Upload failure details
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-divergences
+          path: /tmp/model-nightly-failures.jsonl
+          if-no-files-found: ignore

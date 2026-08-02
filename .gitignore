@@ -78,6 +78,8 @@ tls.key
 !/scripts/ref-workloads.sh
 !/scripts/bench-regression.sh
 !/scripts/bisect-amp.sh
+!/scripts/model-repro.sh
+!/scripts/model-nightly.sh
 
 # Internal / Archived Docs
 /ROADMAP.md
