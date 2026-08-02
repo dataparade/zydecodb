@@ -275,6 +275,12 @@ fn main() {
 
     install_panic_hook();
 
+    // rustls cannot auto-pick a process CryptoProvider when the dependency
+    // graph enables both aws-lc-rs and ring (feature unification); without an
+    // explicit install, enabling TLS aborts the server at startup. In-process
+    // tests install their own provider, which masked this in CI.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Serve {
