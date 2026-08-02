@@ -1,0 +1,54 @@
+# Weekly workload-variant soak rotation. The GA gate (release-soak.yml) holds
+# the paced reference workload; this matrix rotates through the workload axes
+# the reference does not cover. Gate per variant: harness exits clean with
+# zero op errors and a clean shutdown. A failure means a reproducible seed
+# gets filed, per SQLite law.
+name: Soak variants
+
+on:
+  schedule:
+    - cron: "0 7 * * 3" # Wednesdays 07:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: soak-variants
+  cancel-in-progress: false
+
+jobs:
+  variant:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: megabyte-values
+            soak_env: "VAL_MIN=1048576 VAL_MAX=4194304 PUT_PCT=60 GET_PCT=35"
+          - name: delete-heavy
+            soak_env: "PUT_PCT=45 GET_PCT=25" # DEL = 30%
+          - name: scan-heavy
+            soak_env: "PUT_PCT=45 GET_PCT=25 SCAN_PCT=30"
+          - name: hot-key-contention
+            soak_env: "HOT_PCT=100"
+          - name: cold-wide
+            soak_env: "HOT_PCT=5"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Soak variant ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          env ${{ matrix.soak_env }} HOURS=0.33 OPS=2000 \
+            scripts/soak.sh --no-analyze
+      - name: Gate on summary
+        run: |
+          set -euo pipefail
+          summary="$(cat soak-runs/*/metrics.jsonl | grep '"kind":"summary"' | tail -1)"
+          echo "$summary"
+          echo "$summary" | python3 -c "
+          import json, sys
+          s = json.loads(sys.stdin.read())
+          assert s['errors'] == 0, f\"op errors: {s['errors']}\"
+          assert s['shutdown_ok'], 'shutdown failed'
+          print(f\"variant clean: {s['total_ops']} ops, {s['avg_ops_per_sec']:.0f} ops/s\")
+          "
