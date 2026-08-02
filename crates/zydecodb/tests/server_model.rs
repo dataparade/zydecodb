@@ -23,7 +23,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcCommand, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -113,6 +114,9 @@ impl Client {
         Self::roundtrip_raw(&mut self.stream, req)
     }
 
+    /// EngineBusy means the per-connection rate limiter rejected the request
+    /// BEFORE dispatch — the op definitely did not apply, so a bounded retry
+    /// is safe and exercises client backpressure.
     fn put(&mut self, key: &[u8], value: &[u8]) -> std::io::Result<Status> {
         let p = PutPayload {
             routing_key: [0u8; 16],
@@ -121,7 +125,14 @@ impl Client {
             key: key.to_vec(),
             value: value.to_vec(),
         };
-        Ok(self.roundtrip(&RequestEnvelope::new(Command::Put, p.encode()))?.0)
+        for _ in 0..100 {
+            let st = self.roundtrip(&RequestEnvelope::new(Command::Put, p.encode()))?.0;
+            if st != Status::EngineBusy {
+                return Ok(st);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Ok(Status::EngineBusy)
     }
 
     fn get(&mut self, key: &[u8]) -> std::io::Result<(Status, Vec<u8>)> {
@@ -130,7 +141,14 @@ impl Client {
             snapshot_seq: 0,
             key: key.to_vec(),
         };
-        self.roundtrip(&RequestEnvelope::new(Command::Get, p.encode()))
+        for _ in 0..100 {
+            let (st, body) = self.roundtrip(&RequestEnvelope::new(Command::Get, p.encode()))?;
+            if st != Status::EngineBusy {
+                return Ok((st, body));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Ok((Status::EngineBusy, vec![]))
     }
 
     fn del(&mut self, key: &[u8]) -> std::io::Result<Status> {
@@ -139,7 +157,14 @@ impl Client {
             snapshot_seq: 0,
             key: key.to_vec(),
         };
-        Ok(self.roundtrip(&RequestEnvelope::new(Command::Del, p.encode()))?.0)
+        for _ in 0..100 {
+            let st = self.roundtrip(&RequestEnvelope::new(Command::Del, p.encode()))?.0;
+            if st != Status::EngineBusy {
+                return Ok(st);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Ok(Status::EngineBusy)
     }
 
     fn simple(&mut self, cmd: Command) -> std::io::Result<(Status, Vec<u8>)> {
@@ -171,7 +196,7 @@ block_cache_mb = 64
 [security]
 require_auth = "true"
 keys_file = "{keys}"
-rate_limit_rps = 1000000
+rate_limit_rps = 4000
 legacy_single_tenant = true
 
 [security.quotas]
@@ -282,6 +307,126 @@ fn key_of(id: u64) -> Vec<u8> {
     format!("smkey-{id:05}").into_bytes()
 }
 
+// ---- adversarial clients ---------------------------------------------------
+//
+// These run concurrently with the correctness oracle. They must never crash,
+// hang, or contaminate the well-behaved client; the oracle's post-crash
+// full-keyspace verify is the assertion that they didn't. Bad-credential
+// floods are deliberately NOT here: the auth burst limiter is per-IP, all
+// clients share 127.0.0.1, and tripping it would block the oracle client too
+// (that axis is covered by rate_limit_evasion.rs).
+
+fn adversary_garbage(stop: Arc<AtomicBool>, addr: Arc<Mutex<SocketAddr>>, seed: u64) {
+    let mut rng = Xor(seed);
+    while !stop.load(Ordering::Relaxed) {
+        let addr = *addr.lock().unwrap();
+        if let Ok(mut s) = TcpStream::connect(addr) {
+            s.set_write_timeout(Some(Duration::from_millis(500))).ok();
+            let mode = rng.range(0, 2);
+            match mode {
+                // Raw garbage where a TLS ClientHello belongs.
+                0 => {
+                    let n = rng.range(1, 200) as usize;
+                    let mut buf = vec![0u8; n];
+                    for b in buf.iter_mut() {
+                        *b = rng.next() as u8;
+                    }
+                    s.write_all(&buf).ok();
+                }
+                // First byte of a TLS handshake, then silence and close.
+                1 => {
+                    s.write_all(&[0x16, 0x03, 0x01]).ok();
+                    std::thread::sleep(Duration::from_millis(rng.range(5, 100)));
+                }
+                // A plaintext wire frame (valid shape, no TLS) with a huge
+                // declared payload — pre-auth cap must reject it.
+                _ => {
+                    let mut f = vec![0x01u8, 0x02];
+                    f.extend_from_slice(&u32::MAX.to_be_bytes());
+                    s.write_all(&f).ok();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(rng.range(0, 10)));
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn adversary_flooder(
+    stop: Arc<AtomicBool>,
+    addr: Arc<Mutex<SocketAddr>>,
+    root: PathBuf,
+    secret: String,
+    seed: u64,
+) {
+    let mut rng = Xor(seed);
+    let cert = root.join("tls.crt");
+    while !stop.load(Ordering::Relaxed) {
+        let a = *addr.lock().unwrap();
+        let Ok(mut c) = Client::connect(a, &cert, &secret) else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        // Blast until the per-connection limiter pushes back or the server
+        // dies under us; junk keys live outside the model keyspace.
+        for i in 0..2000u32 {
+            let k = format!("advk-{:06}", rng.range(0, 10_000)).into_bytes();
+            match c.put(&k, b"x") {
+                Ok(Status::Ok) | Ok(Status::EngineBusy) => {}
+                Ok(_) | Err(_) => break,
+            }
+            if i % 64 == 0 && stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+    }
+}
+
+fn adversary_postauth_malformed(
+    stop: Arc<AtomicBool>,
+    addr: Arc<Mutex<SocketAddr>>,
+    root: PathBuf,
+    secret: String,
+    seed: u64,
+) {
+    let mut rng = Xor(seed);
+    let cert = root.join("tls.crt");
+    while !stop.load(Ordering::Relaxed) {
+        let a = *addr.lock().unwrap();
+        let Ok(mut c) = Client::connect(a, &cert, &secret) else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        match rng.range(0, 2) {
+            // Unknown opcode: server answers ProtocolError, stays connected.
+            0 => {
+                let mut raw = vec![0x01u8, 0x77];
+                raw.extend_from_slice(&3u32.to_be_bytes());
+                raw.extend_from_slice(b"abc");
+                if c.stream.write_all(&raw).is_ok() {
+                    let mut header = [0u8; ENVELOPE_HEADER_LEN];
+                    c.stream.read_exact(&mut header).ok();
+                }
+            }
+            // Bad protocol version byte.
+            1 => {
+                let mut raw = vec![0xEEu8, 0x02];
+                raw.extend_from_slice(&0u32.to_be_bytes());
+                c.stream.write_all(&raw).ok();
+            }
+            // Valid header, truncated payload, immediate close.
+            _ => {
+                let mut raw = vec![0x01u8, 0x02];
+                raw.extend_from_slice(&500u32.to_be_bytes());
+                raw.extend_from_slice(b"short");
+                c.stream.write_all(&raw).ok();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(rng.range(0, 5)));
+    }
+}
+
 fn describe(o: &Option<Vec<u8>>) -> String {
     match o {
         None => "<absent>".into(),
@@ -309,6 +454,10 @@ fn server_model_wire_oracle() {
 
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
+    if std::env::var("SERVER_MODEL_KEEP").is_ok() {
+        eprintln!("server-model keeping artifacts at {}", root.display());
+        std::mem::forget(tmp);
+    }
     std::fs::create_dir_all(root.join("data")).unwrap();
     std::fs::create_dir_all(root.join("wal")).unwrap();
 
@@ -339,6 +488,26 @@ fn server_model_wire_oracle() {
     let (mut srv, _) = spawn_server(&root, generation);
     let mut client = wait_ready(&root, srv.addr, &secret, &mut srv.child);
 
+    // Adversarial pressure concurrent with the oracle: malformed pre-auth
+    // bytes, TLS dribble, per-connection flooding, post-auth protocol abuse.
+    let adv_stop = Arc::new(AtomicBool::new(false));
+    let shared_addr = Arc::new(Mutex::new(srv.addr));
+    let adversaries_on = std::env::var("SERVER_MODEL_NO_ADV").is_err();
+    let mut adv_handles = Vec::new();
+    if adversaries_on {
+        let (a, b, c) = (adv_stop.clone(), shared_addr.clone(), root.clone());
+        adv_handles.push(std::thread::spawn(move || adversary_garbage(a, b, seed ^ 0xA1)));
+        adv_handles.push(std::thread::spawn({
+            let (a, b, r, s) = (adv_stop.clone(), shared_addr.clone(), root.clone(), secret.clone());
+            move || adversary_flooder(a, b, r, s, seed ^ 0xF10D)
+        }));
+        adv_handles.push(std::thread::spawn({
+            let (a, b, r, s) = (adv_stop.clone(), shared_addr.clone(), root.clone(), secret.clone());
+            move || adversary_postauth_malformed(a, b, r, s, seed ^ 0xBAAD)
+        }));
+        let _ = c;
+    }
+
     let mut op_counter = 0u64;
     let mut crashes = 0u64;
     let mut txns = 0u64;
@@ -356,6 +525,7 @@ fn server_model_wire_oracle() {
             generation += 1;
             let (mut next, _) = spawn_server(&root, generation);
             client = wait_ready(&root, next.addr, &secret, &mut next.child);
+            *shared_addr.lock().unwrap() = next.addr;
             srv = next;
             for id in 0..keyspace {
                 let k = key_of(id);
@@ -381,6 +551,7 @@ fn server_model_wire_oracle() {
                 op_counter += 1;
                 match client.put(&k, &v) {
                     Ok(Status::Ok) => model.confirm_put(&k, v),
+                    Ok(Status::EngineBusy) => {} // rejected pre-dispatch: not applied
                     Ok(st) => panic!("step {step}: put status {st:?}"),
                     Err(_) => model.maybe_put(&k, v), // response lost; maybe applied
                 }
@@ -392,6 +563,7 @@ fn server_model_wire_oracle() {
                 match client.get(&k) {
                     Ok((Status::Ok, body)) => model.check_and_collapse(step, &k, &Some(body)),
                     Ok((Status::NotFound, _)) => model.check_and_collapse(step, &k, &None),
+                    Ok((Status::EngineBusy, _)) => {} // rejected pre-dispatch
                     Ok((st, _)) => panic!("step {step}: get status {st:?}"),
                     Err(_) => {} // transport error: no information gained
                 }
@@ -402,6 +574,7 @@ fn server_model_wire_oracle() {
                 let k = key_of(id);
                 match client.del(&k) {
                     Ok(Status::Ok) => model.confirm_del(&k),
+                    Ok(Status::EngineBusy) => {} // rejected pre-dispatch
                     Ok(st) => panic!("step {step}: del status {st:?}"),
                     Err(_) => model.maybe_del(&k),
                 }
@@ -422,19 +595,34 @@ fn server_model_wire_oracle() {
                         ids.push(id);
                     }
                 }
+                let mut staging_failed = false;
                 for &id in &ids {
                     let k = key_of(id);
                     if rng.range(0, 99) < 75 {
                         let v = make_val(op_counter, &mut rng);
                         op_counter += 1;
                         let st = client.put(&k, &v).expect("staged put transport");
+                        if st == Status::EngineBusy {
+                            staging_failed = true;
+                            break;
+                        }
                         assert_eq!(st, Status::Ok, "step {step}: staged put rejected");
                         staged.push((k, Some(v)));
                     } else {
                         let st = client.del(&k).expect("staged del transport");
+                        if st == Status::EngineBusy {
+                            staging_failed = true;
+                            break;
+                        }
                         assert_eq!(st, Status::Ok, "step {step}: staged del rejected");
                         staged.push((k, None));
                     }
+                }
+                if staging_failed {
+                    // Rate-limited mid-staging: abandon cleanly.
+                    let (st, _) = client.simple(Command::Rollback).expect("rollback transport");
+                    assert_eq!(st, Status::Ok);
+                    continue;
                 }
                 // Read-your-writes: first staged key must serve the staged value.
                 let (probe_k, probe_v) = staged[0].clone();
@@ -516,7 +704,11 @@ fn server_model_wire_oracle() {
         }
     }
 
-    // Graceful stop of the last generation.
+    // Stop adversaries, then the last server generation.
+    adv_stop.store(true, Ordering::Relaxed);
+    for h in adv_handles {
+        h.join().unwrap();
+    }
     srv.child.kill().ok();
     srv.child.wait().ok();
 
