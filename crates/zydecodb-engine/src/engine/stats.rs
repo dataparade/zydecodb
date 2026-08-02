@@ -241,6 +241,14 @@ impl Engine {
         self.seq.peek().saturating_sub(1)
     }
 
+    /// Highest WAL sequence known to be fsynced (the group-commit durability
+    /// watermark). Writes at or below this survive a process crash; anything
+    /// newer may be lost. Exposed for crash-recovery oracles and durability
+    /// lag reporting.
+    pub fn last_synced_seq(&self) -> u64 {
+        self.wal_sync.synced_seq()
+    }
+
     #[cfg(test)]
     pub fn immutable_len(&self) -> usize {
         self.immutable.len()
