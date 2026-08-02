@@ -554,6 +554,7 @@ impl SstableReader {
             return Ok(None);
         };
         let owner = crate::tenant_fair::tenant_from_user_key(user_key);
+        let bi = self.earliest_block_for_key(index, bi, user_key, true, owner)?;
         for entry in &index[bi..] {
             if entry.first_user_key.as_slice() > user_key {
                 break;
@@ -564,6 +565,33 @@ impl SstableReader {
             }
         }
         Ok(None)
+    }
+
+    /// A key's version run can straddle a block boundary: the block index
+    /// records only each block's FIRST key, so when the candidate block's
+    /// first key IS `user_key`, the key's newest entries may sit in the
+    /// previous block's tail. Walk back to the earliest consecutive block
+    /// containing the key; otherwise the caller serves a stale older
+    /// version (and compaction would drop the newest). No-op when the key
+    /// is not boundary-aligned.
+    fn earliest_block_for_key(
+        &self,
+        index: &[IndexEntry],
+        mut bi: usize,
+        user_key: &[u8],
+        populate_cache: bool,
+        cache_owner: Option<crate::tenant_fair::TenantId>,
+    ) -> EngineResult<usize> {
+        while bi > 0 && index[bi].first_user_key.as_slice() == user_key {
+            let prev = &index[bi - 1];
+            let block = self.read_block(prev, populate_cache, cache_owner)?;
+            if scan_block_for_latest(block.as_slice(), user_key)?.is_some() {
+                bi -= 1;
+            } else {
+                break;
+            }
+        }
+        Ok(bi)
     }
 
     fn candidate_block(index: &[IndexEntry], user_key: &[u8]) -> Option<usize> {
@@ -625,7 +653,15 @@ impl SstableReader {
     /// from cache/disk; does NOT materialize the full table.
     pub fn range_iter(self: Arc<Self>, lo: Vec<u8>, hi: Vec<u8>) -> EngineResult<SstableRangeIter> {
         let index = self.index_arc();
-        let start_block = Self::range_start_block(&index, &lo);
+        let mut start_block = Self::range_start_block(&index, &lo);
+        // Same boundary-straddle guard as get_latest: when lo aligns with a
+        // block's first key, that key's newest versions may live in the
+        // previous block's tail. Entries below lo are filtered per-entry
+        // during iteration, so starting earlier is safe.
+        if !lo.is_empty() {
+            start_block =
+                self.earliest_block_for_key(&index, start_block, &lo, false, None)?;
+        }
         Ok(SstableRangeIter {
             reader: self,
             index,
@@ -888,6 +924,68 @@ mod tests {
         let (k, e) = reader.get_latest(&uk(b"d")).unwrap().unwrap();
         assert_eq!(k.kind, EntryKind::Tombstone);
         assert!(e.is_tombstone());
+    }
+
+    #[test]
+    fn key_spanning_block_boundary_serves_newest_version() {
+        // One hot key with enough versions to straddle at least one 16KB
+        // block boundary (2000 versions x ~47B > 5 blocks). The block index
+        // records only each block's first key, so a lookup landing on a
+        // block whose first key is the target used to miss the newer
+        // versions sitting in the previous block's tail.
+        let mut pairs = Vec::new();
+        pairs.push((
+            InternalKey::new(uk(b"aaa-before"), 1, EntryKind::Value),
+            Entry::value(b"before".to_vec(), None),
+        ));
+        let versions = 2000u64;
+        for seq in 1..=versions {
+            pairs.push((
+                InternalKey::new(uk(b"hot"), seq, EntryKind::Value),
+                Entry::value(format!("v{seq:06}").into_bytes(), None),
+            ));
+        }
+        pairs.push((
+            InternalKey::new(uk(b"zzz-after"), versions + 1, EntryKind::Value),
+            Entry::value(b"after".to_vec(), None),
+        ));
+        let pairs = sorted_pairs(pairs);
+        let sst = build(&pairs, true);
+        let reader = std::sync::Arc::new(SstableReader::open(sst.bytes).unwrap());
+
+        // Point lookup must return the newest version, not a mid-run one.
+        let (k, e) = reader.get_latest(&uk(b"hot")).unwrap().unwrap();
+        assert_eq!(k.seq, versions);
+        assert_eq!(
+            e.value.as_deref(),
+            Some(format!("v{versions:06}").as_bytes())
+        );
+
+        // Bounded range scan starting exactly at the straddling key must
+        // yield every version, newest first.
+        let mut it = reader
+            .clone()
+            .range_iter(uk(b"hot"), {
+                let mut hi = uk(b"hot");
+                *hi.last_mut().unwrap() += 1;
+                hi
+            })
+            .unwrap();
+        let mut seen = 0u64;
+        let mut last_seq = u64::MAX;
+        while let Some((k, _)) = crate::iter::EntryIterator::next(&mut it).unwrap() {
+            assert_eq!(k.user_key, uk(b"hot"));
+            assert!(k.seq < last_seq, "versions must arrive newest-first");
+            last_seq = k.seq;
+            seen += 1;
+        }
+        assert_eq!(seen, versions);
+
+        // Neighbors unaffected.
+        let (_, e) = reader.get_latest(&uk(b"aaa-before")).unwrap().unwrap();
+        assert_eq!(e.value.as_deref(), Some(b"before".as_ref()));
+        let (_, e) = reader.get_latest(&uk(b"zzz-after")).unwrap().unwrap();
+        assert_eq!(e.value.as_deref(), Some(b"after".as_ref()));
     }
 
     #[test]
