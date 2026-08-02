@@ -9,7 +9,7 @@ on:
 jobs:
   fuzz-nightly:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -37,11 +37,14 @@ jobs:
             fuzz_update
             fuzz_aggregate
             fuzz_index_key
+            zdoc_valueview
           )
+          # Multi-hour total budget: 11 targets x 900s ~= 2.75h. The corpus
+          # cache makes each night start smarter than the last.
           for t in "${targets[@]}"; do
             echo "==> fuzz $t"
             mkdir -p "corpus/$t"
-            cargo fuzz run "$t" -- -max_total_time=180 -artifact_prefix="artifacts/${t}-"
+            cargo fuzz run "$t" -- -max_total_time=900 -artifact_prefix="artifacts/${t}-"
           done
       - name: Save fuzz corpus
         if: always()

@@ -74,3 +74,9 @@ name = "fuzz_index_key"
 path = "fuzz_targets/fuzz_index_key.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "zdoc_valueview"
+path = "fuzz_targets/zdoc_valueview.rs"
+test = false
+doc = false
