@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 24h *paced* confirmation soak (OPS=3000). Not the RC uncapped bar.
 # For release-candidate uncapped capacity, use scripts/vps-soak.sh with OPS=0
-# and archive under docs/soak-baselines/rc-<version>-24h-uncapped.jsonl.
+# and archive under docs/soak-baselines/rc/<version>/24h-uncapped.jsonl.
 # Run only after a green 90m stability soak.
 set -euo pipefail
 

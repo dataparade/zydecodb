@@ -278,9 +278,9 @@ CI: `.github/workflows/tenant-isolation-soak.yml` runs `MODE=both` on a nightly 
 HOURS=0.1 OPS=3000 OUT_DIR=soak-runs/quick scripts/soak.sh --no-analyze
 
 # 90-minute release gate
-HOURS=1.5 OPS=3000 OUT_DIR=soak-runs/phase1-memo6-90m scripts/soak.sh --no-analyze
-python3 scripts/analyze-soak.py --mode stability soak-runs/phase1-memo6-90m/metrics.jsonl
-python3 scripts/analyze-soak.py --mode perf soak-runs/phase1-memo6-90m/metrics.jsonl   # informational
+HOURS=1.5 OPS=3000 OUT_DIR=soak-runs/ga-90m scripts/soak.sh --no-analyze
+python3 scripts/analyze-soak.py --mode stability soak-runs/ga-90m/metrics.jsonl
+python3 scripts/analyze-soak.py --mode perf soak-runs/ga-90m/metrics.jsonl   # informational
 
 # 24h uncapped on a clean VPS
 export VPS_HOST=your.server.ip
@@ -289,6 +289,7 @@ scripts/vps-soak.sh deploy
 scripts/vps-soak.sh start    # default: HOURS=24 OPS=0 SAMPLE_EVERY=60
 scripts/vps-soak.sh status
 scripts/vps-soak.sh analyze  # pull metrics + run analyzer locally
+# promote: docs/soak-baselines/rc/<version>/24h-uncapped.jsonl (+ notes.md)
 ```
 
 ### Environment variables (`scripts/soak.sh`)
@@ -315,7 +316,8 @@ Under `OUT_DIR/`:
 - `stderr.log` — errors
 - `data/`, `wal/` — engine state (gitignored; delete after forensics)
 
-Archived baselines: [`soak-baselines/`](soak-baselines/).
+Archived baselines: [`soak-baselines/`](soak-baselines/) (current gates, `rc/<ver>/`,
+historical under `archive/`). `soak-runs/` is ephemeral scratch — promote only.
 
 ### Analyzer modes
 

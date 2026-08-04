@@ -178,7 +178,8 @@ but runtime compatibility is the wire — not lockstep minors. Full policy:
 - [ ] 90m paced soak + `analyze-soak.py --mode stability` exit 0
       (or green `.github/workflows/release-soak.yml`)
 - [ ] `MODE=both` tenant-isolation soak exit 0 (same workflow / nightly on RC commit)
-- [ ] (RC) 24h uncapped VPS soak archived under `docs/soak-baselines/`
+- [ ] (RC) 24h uncapped VPS soak archived under
+      `docs/soak-baselines/rc/<version>/` (`24h-uncapped.jsonl` + `notes.md`)
 
 Bump versions in `Cargo.toml`, `clients/python/pyproject.toml`, and
 `clients/typescript/package.json` on the release commit. Update

@@ -1108,7 +1108,8 @@ Harness definitions: [`INTERNAL.md`](INTERNAL.md#reference-workloads-published-n
 
 ### Engine 90-minute soak (stability headline)
 
-Archived paced run `memo6-90m` (`HOURS=1.5`, `OPS=3000`, block cache 640 MB):
+Archived paced run [`ga-90m.jsonl`](soak-baselines/ga-90m.jsonl)
+(`HOURS=1.5`, `OPS=3000`, block cache 640 MB):
 mean ~2666 ops/s, steady p99 ~158 µs (max sample p99 382 µs), RSS max ~971 MiB,
 compaction write amp ~1.9. Stability analyzer exit 0. Repro and gates:
 [`INTERNAL.md`](INTERNAL.md#soak-testing).
@@ -1124,7 +1125,7 @@ Do **not** tag an RC until these are green (local equivalent OK). Tag publish
 - [ ] `MODE=both ./scripts/tenant-isolation-soak.sh` exits 0 (or green
       `release-soak.yml` / nightly on the RC commit)
 - [ ] (RC) 24h **uncapped** VPS soak archived under
-      `docs/soak-baselines/rc-<version>-24h-uncapped.jsonl` (+ `notes.md` with HW).
+      `docs/soak-baselines/rc/<version>/24h-uncapped.jsonl` (+ `notes.md` with HW).
       Use `scripts/vps-soak.sh` (`OPS=0`). `scripts/run-engine-ga-24h.sh` is a
       **paced** (`OPS=3000`) confirmation, not the uncapped bar.
 - [ ] Reference workloads refreshed if you claim new GUIDE numbers:
