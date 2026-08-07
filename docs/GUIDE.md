@@ -1116,8 +1116,12 @@ compaction write amp ~1.9. Stability analyzer exit 0. Repro and gates:
 
 ### Release checklist (pre-tag)
 
-Do **not** tag an RC until these are green (local equivalent OK). Tag publish
-(`release.yml`) does **not** re-run the 90m soak — gates are pre-tag only.
+Do **not** tag an RC or `1.0.0` until these are green (local equivalent OK).
+Tag publish (`release.yml`) does **not** re-run the long soaks — gates are
+pre-tag only. After `1.0.0-rc.N`, also complete the [RC bake](#rc-bake) before
+the final `1.0.0` tag.
+
+**Stability / capacity**
 
 - [ ] `HOURS=1.5 OPS=3000 ./scripts/soak.sh` then
       `python3 scripts/analyze-soak.py --mode stability <OUT_DIR>/metrics.jsonl`
@@ -1128,8 +1132,34 @@ Do **not** tag an RC until these are green (local equivalent OK). Tag publish
       `docs/soak-baselines/rc/<version>/24h-uncapped.jsonl` (+ `notes.md` with HW).
       Use `scripts/vps-soak.sh` (`OPS=0`). `scripts/run-engine-ga-24h.sh` is a
       **paced** (`OPS=3000`) confirmation, not the uncapped bar.
+- [ ] (RC) Multi-day paced endurance soak archived (e.g.
+      `docs/soak-baselines/rc/<version>/72h-paced.jsonl`) with stability
+      analyzer exit 0
 - [ ] Reference workloads refreshed if you claim new GUIDE numbers:
       `OPS=2000 scripts/ref-workloads.sh`
+
+**Correctness / supply chain**
+
+- [ ] Wire conformance green: `cargo run -p zydecodb-document --bin gen_conformance`
+      then `git diff --exit-code -- clients/conformance/vectors.json`, plus
+      driver conformance tests (see CI `wire-conformance` job)
+- [ ] Restore drill:
+      `cargo test -p zydecodb --release --test restore_equivalence --test pitr_restore`
+      and
+      `cargo test -p zydecodb --release --features failpoints --test admin_snapshot_crash`
+- [ ] Failover drill: `cargo test -p zydecodb --release --test promote_under_load`
+      (promote-under-load, retention gap, fenced ex-primary)
+- [ ] Fuzz nightlies green on the RC commit (or local `cargo fuzz` budget)
+- [ ] `cargo audit` clean (CI `cargo-audit` job)
+
+### RC bake
+
+After tagging `1.0.0-rc.N`, wait **at least one week** and re-run before `1.0.0`:
+
+- [ ] 24h paced soak on the tagged RC commit (`OPS=3000`), stability exit 0
+- [ ] Restore drill (same commands as pre-tag)
+- [ ] Failover drill (same commands as pre-tag)
+- [ ] Fix-forward only: bugs produce `rc.N+1`, never a retag
 
 Nightly regression (not a tag gate): `.github/workflows/bench-nightly.yml`
 fails if engine microbench `p99_us` or `rss_bytes` exceeds baseline by more than

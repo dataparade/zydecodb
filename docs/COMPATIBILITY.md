@@ -172,7 +172,7 @@ but runtime compatibility is the wire — not lockstep minors. Full policy:
 
 ## Cutting a release
 
-**Pre-tag gates** (mandatory before any RC / 1.0 tag) — see
+**Pre-tag gates** (mandatory before any RC / 1.0 tag) — full list in
 [`GUIDE.md` Release checklist](GUIDE.md#release-checklist-pre-tag):
 
 - [ ] 90m paced soak + `analyze-soak.py --mode stability` exit 0
@@ -180,6 +180,9 @@ but runtime compatibility is the wire — not lockstep minors. Full policy:
 - [ ] `MODE=both` tenant-isolation soak exit 0 (same workflow / nightly on RC commit)
 - [ ] (RC) 24h uncapped VPS soak archived under
       `docs/soak-baselines/rc/<version>/` (`24h-uncapped.jsonl` + `notes.md`)
+- [ ] (RC) Multi-day paced endurance soak archived with stability exit 0
+- [ ] Wire conformance + restore drill + failover drill + `cargo audit` clean
+- [ ] After `rc.N`: [RC bake](GUIDE.md#rc-bake) (≥1 week) before final `1.0.0`
 
 Bump versions in `Cargo.toml`, `clients/python/pyproject.toml`, and
 `clients/typescript/package.json` on the release commit. Update
