@@ -158,8 +158,8 @@ but runtime compatibility is the wire — not lockstep minors. Full policy:
 
 | Line | Drivers | Wire |
 |------|---------|------|
-| `1.x` (upcoming) | Python / npm / Go `1.x*` | `proto_version = 1` |
-| `0.11.x` (current) | Python / npm / Go `0.11.x*` | `proto_version = 1` |
+| `1.x` (RC: `1.0.0-rc.1`) | Python / npm / Go `1.x*` | `proto_version = 1` |
+| `0.11.x` | Python / npm / Go `0.11.x*` | `proto_version = 1` |
 | `0.10.x` | Python / npm / Go `0.10.x*` | `proto_version = 1` |
 | `0.9.x` | Python / npm / Go `0.9.x*` | `proto_version = 1` |
 
@@ -211,19 +211,33 @@ The release workflow then:
 
 ```bash
 # Go — pin the module version (not @latest)
-go get github.com/dataparade/zydecodb/clients/go@v0.11.0   # current
-# go get github.com/dataparade/zydecodb/clients/go@v1.0.0  # after 1.0
+go get github.com/dataparade/zydecodb/clients/go@v1.0.0-rc.1
+# go get github.com/dataparade/zydecodb/clients/go@v1.0.0  # after stable 1.0
 
-# Python
-pip install zydecodb==0.11.0
+# Python (PEP 440: 1.0.0-rc.1 → 1.0.0rc1)
+pip install zydecodb==1.0.0rc1
 
-# TypeScript
-npm install zydecodb@0.11.0
+# TypeScript (npm dist-tag `beta` for hyphenated pre-releases)
+npm install zydecodb@1.0.0-rc.1
 ```
 
 Unified releases still ship matching `X.Y.Z` tags for convenience. After 1.0,
-any 1.x driver may talk to any 1.x server on wire v1 (see
-[`COMPATIBILITY.md`](COMPATIBILITY.md)).
+any 1.x driver may talk to any 1.x server on wire v1.
+
+## Post-1.0 release cadence
+
+The 0.9→0.11-in-a-week pace ends at 1.0. After `v1.0.0`:
+
+| Bump | When |
+|------|------|
+| **Patch** (`1.0.x`) | Bug fixes, security fixes, docs, test/CI hardening that do not change wire, on-disk formats, or public driver APIs. May include internal perf work that preserves behavior. |
+| **Minor** (`1.x.0`) | Additive only: new opcodes/status bytes (fail closed on older servers), new optional config, new driver helpers. No breaks to existing encodings or APIs. |
+| **Major** (`2.0.0`) | Anything that breaks the [compatibility promise](#compatibility-matrix-wire-v1) — wire shape changes, on-disk format breaks without N/N-1 read, or public driver API removals. |
+
+Rhythm: prefer fewer, well-baked releases over continuous minors. Every tag still
+runs the [pre-tag checklist](GUIDE.md#release-checklist-pre-tag). RCs
+(`1.y.0-rc.N`) are for major/minor trains that need a bake week; patches may
+ship directly when the change is small and proven.
 
 ## Updating the server binary
 
