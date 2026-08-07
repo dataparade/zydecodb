@@ -6,10 +6,38 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-08-07
+
+First release candidate for 1.0. The 1.x compatibility promise is stated in
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md): wire `proto_version = 1` is
+frozen (additive opcodes/status bytes only); on-disk SSTable/WAL/manifest v2
+formats and the official driver APIs do not break without a major bump.
+
+### Server
+
+- Durability and DoS hardening from the P0–P2 audit (WAL/manifest fsync
+  ordering, quota seed-on-open, pre-auth frame caps, TLS handshake deadlines,
+  ZDoc depth guards, rate-limit bounds).
+- Compaction: close stale-catalog submission windows that doubled write amp.
+- SSTable reads: block-boundary walk-back so newest versions (and tombstones)
+  are not missed when a key straddles blocks.
+- Owned snapshots: memtable tombstones shadow older SST values; bounded
+  ceilings walk visible versions inside a table instead of skipping it.
+- Explicit `rustls` CryptoProvider install in the server binary (TLS no longer
+  aborts at startup under feature unification).
+
+### Testing / release proof
+
+- Model-based differential tester (`engine-model`) + nightly seed sweep.
+- Expanded fuzz budget and ZDoc `ValueView` target; crash-soak fault axes;
+  weekly soak variants; server wire oracle with adversarial clients.
+- RC soak archives under `docs/soak-baselines/rc/0.11.0/`: 24h uncapped
+  (~33k ops/s) and 72h paced (stability all pass, amp ~2.89).
+
 ### Compatibility
 
-- Wire `proto_version = 1` freeze language updated for the upcoming 1.x line:
-  unknown opcodes return `ProtocolError` without closing the connection; unused
+- Wire `proto_version = 1` freeze language updated for the 1.x line: unknown
+  opcodes return `ProtocolError` without closing the connection; unused
   write-flag bits are rejected. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
   and [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 - Compatibility policy moves from lockstep driver/server minors to a wire-v1
