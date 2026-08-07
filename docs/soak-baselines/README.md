@@ -25,7 +25,8 @@ Per-version uncapped VPS soaks live under `rc/<version>/`:
 | Path | Notes |
 |------|-------|
 | `rc/0.11.0/24h-uncapped.jsonl` | Capacity archive @ `e80de81`; ~33k ops/s mean, amp 3.35 |
-| `rc/0.11.0/notes.md` | Hardware + how to read uncapped analyzer gates |
+| `rc/0.11.0/72h-paced.jsonl` | Endurance archive @ `e80de81`; amp 2.89 plateau, stability all pass |
+| `rc/0.11.0/notes.md` | Hardware + results for both RC soaks |
 
 ### Archiving a new RC 24h uncapped soak
 

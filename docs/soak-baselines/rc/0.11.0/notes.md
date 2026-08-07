@@ -1,5 +1,7 @@
 # RC 0.11.0 soak notes
 
+Commit under test: `e80de81` (owned-snapshot tombstone/ceiling fix).
+
 ## Uncapped capacity (VPS, OPS=0, 24h)
 
 | | |
@@ -7,7 +9,6 @@
 | Host | DigitalOcean droplet `ubuntu-s-8vcpu-16gb-nyc1` (`146.190.78.233`) |
 | Specs | 8 vCPU, 16 GiB RAM, 309 GiB disk, no swap |
 | OS / kernel | Ubuntu 24.04, Linux 6.8.0-124-generic |
-| Commit | `e80de81` (owned-snapshot tombstone/ceiling fix) |
 | Artifact | `docs/soak-baselines/rc/0.11.0/24h-uncapped.jsonl` |
 | Mix | soak.sh defaults under OPS=0 (70% put / 25% get / 5% del, 80% hot, 64–1024B) |
 
@@ -40,5 +41,20 @@ graceful `EngineBusy` under compaction backlog.
 
 ## Paced endurance (local, OPS=3000, 72h)
 
-Still in progress at archive time — see `soak-runs/rc-gate-72h-20260803T031022Z/`.
-Archive separately when complete.
+| | |
+|---|---|
+| Artifact | `docs/soak-baselines/rc/0.11.0/72h-paced.jsonl` |
+| Mix | 55% put / 25% get / 20% del, 80% hot, 64–1024B, seed `16045690984503098046` |
+| Samples | 4314 (~71.9h wall) |
+
+### Results
+
+- **~760M ops**, mean **~2930 ops/s** (target 3000)
+- Write amp max **2.90** (plateau ~2.89 from day one — matches `ga-24h-paced`)
+- RSS max **1.15 GB**, mean ~1.0 GB (derived stability ceiling passed)
+- Open FDs max **33** (ceiling 48)
+- Flush backlog never sustained (immutable mean/max 0)
+- Stability analyzer: **OK — no ceiling breaches**
+
+Endurance claim: paced GA mix holds a flat RSS/amp/FD plateau across a multi-day
+run on the release-candidate tree.
