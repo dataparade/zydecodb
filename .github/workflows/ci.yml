@@ -57,7 +57,7 @@ jobs:
           cargo run -p zydecodb-document --bin gen_conformance
           git diff --exit-code -- clients/conformance/vectors.json
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Python codec vs vectors
@@ -91,7 +91,7 @@ jobs:
       - name: Build server
         run: cargo build -p zydecodb --bin zydecodb
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install driver + test deps
