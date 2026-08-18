@@ -24,8 +24,8 @@
 //!
 //! Determinism: a single seeded Lcg (same constants as the determinism
 //! tests and engine-soak) drives every choice. TTL introduces wall-clock
-//! dependence by nature; it is made replay-safe by spinning until wall
-//! time is past expiry + slack, so later observations are time-stable.
+//! dependence by nature; it is made replay-safe by sleeping past expiry
+//! then spinning only if the sleep returned early.
 //!
 //! Output: one JSON object per line (header, progress, divergences, summary).
 //! Exit 0 = no divergence; exit 1 = divergence found (line printed with the
@@ -629,18 +629,19 @@ impl Harness {
                     }
                 }
             }
-            // TTL (3%): short-expiry put, then wait until wall time is clearly
-            // past expiry so later observations are time-stable. A one-shot
-            // sleep can return early under GHA load and split live_at vs
-            // engine.scan across the deadline (expected N, got N-k).
+            // TTL (3%): short-expiry put, then wait until wall time is past
+            // expiry so later observations are time-stable. Sleep 80ms first;
+            // spin only if the sleep returned early (GHA load) so we do not
+            // add ~200ms to every TTL and blow the nightly budget.
             76..=78 => {
                 let id = self.rng.next_u64() % self.args.keyspace;
                 let val = self.make_val(step);
                 let expiry = now_ms() + 60;
                 let seq = self.put_checked(key_of(id), val.clone(), expiry);
                 self.model.put_expiring(key_of(id), seq, 0, val, expiry);
-                while now_ms() < expiry.saturating_add(200) {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                while now_ms() < expiry.saturating_add(20) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
             // Flush (5%)
