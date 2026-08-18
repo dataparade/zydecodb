@@ -84,6 +84,7 @@ tls.key
 # Internal / Archived Docs
 /ROADMAP.md
 /1.0-Roadmap.md
+/1.1-Roadmap.md
 /docs/archive/
 # Committed baselines live under docs/soak-baselines/; ignore local scratch only
 /docs/soak-baselines/local/
