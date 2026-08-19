@@ -67,6 +67,21 @@ fn wait_or_shutdown(shutdown: &Mutex<bool>, wake: &Condvar, dur: Duration) -> bo
     *guard
 }
 
+fn apply_key_reload(
+    keys_file: &std::path::Path,
+    keys: &arc_swap::ArcSwap<crate::security::keys::KeyStore>,
+    tenant_limits: &crate::security::limits::TenantLimits,
+) {
+    match crate::security::keys::KeyStore::load(keys_file) {
+        Ok(store) => {
+            tenant_limits.reload(store.tenant_records());
+            keys.store(Arc::new(store));
+            info!("reloaded keys and per-tenant limits");
+        }
+        Err(e) => warn!(error = %e, "key reload failed"),
+    }
+}
+
 /// Acquire a connection slot and spawn a `zydecodb-conn` thread to serve a freshly
 /// accepted TCP stream. Releases the slot if the limit is hit or the spawn fails.
 #[allow(clippy::too_many_arguments)] // Full shared server context for one connection.
@@ -174,12 +189,18 @@ fn spawn_uds_conn(
     }
 }
 
+type KeysReload = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone)]
 pub struct Server {
     shutdown: Arc<Mutex<bool>>,
     /// Paired with `shutdown` so background timer threads can block on
     /// `wait_timeout` and wake instantly when shutdown is signaled (instead of
     /// busy-polling a boolean). Notified on the signal-driven shutdown path.
     wake: Arc<Condvar>,
+    /// Installed by `run` so a keys-file change can be applied without SIGHUP
+    /// (tests, and the signal thread share this closure).
+    keys_reload: Arc<Mutex<Option<KeysReload>>>,
 }
 
 impl Default for Server {
@@ -193,11 +214,21 @@ impl Server {
         Server {
             shutdown: Arc::new(Mutex::new(false)),
             wake: Arc::new(Condvar::new()),
+            keys_reload: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn shutdown_flag(&self) -> Arc<Mutex<bool>> {
         Arc::clone(&self.shutdown)
+    }
+
+    /// Reload keys and tenant limits from the configured keys file.
+    ///
+    /// Same work as SIGHUP. No-op until `run` has started.
+    pub fn reload_keys(&self) {
+        if let Some(f) = self.keys_reload.lock().unwrap().clone() {
+            f();
+        }
     }
 
     pub fn run(&self, config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -215,6 +246,13 @@ impl Server {
         config.validate_serve_startup()?;
 
         let security = Arc::new(SecurityRuntime::from_config(&config)?);
+        let keys_reload_fn: KeysReload = {
+            let keys_file = config.security.keys_file.clone();
+            let keys = Arc::clone(&security.keys);
+            let tenant_limits = Arc::clone(&security.tenant_limits);
+            Arc::new(move || apply_key_reload(&keys_file, &keys, &tenant_limits))
+        };
+        *self.keys_reload.lock().unwrap() = Some(Arc::clone(&keys_reload_fn));
         if security.require_auth {
             info!("authentication required for this listen address");
         }
@@ -678,22 +716,13 @@ impl Server {
             let shutdown = Arc::clone(&self.shutdown);
             let wake = Arc::clone(&self.wake);
             let poller = Arc::clone(&poller);
-            let tenant_limits = Arc::clone(&security.tenant_limits);
-            let security_keys = Arc::clone(&security.keys);
-            let keys_file = config.security.keys_file.clone();
+            let keys_reload_fn = Arc::clone(&keys_reload_fn);
             thread::Builder::new()
                 .name("zydecodb-signal".into())
                 .spawn(move || {
                     for sig in signals.forever() {
                         if sig == signal_hook::consts::SIGHUP {
-                            match crate::security::keys::KeyStore::load(&keys_file) {
-                                Ok(store) => {
-                                    tenant_limits.reload(store.tenant_records());
-                                    security_keys.store(Arc::new(store));
-                                    info!("reloaded keys and per-tenant limits on SIGHUP");
-                                }
-                                Err(e) => warn!(error = %e, "SIGHUP reload failed"),
-                            }
+                            keys_reload_fn();
                             continue;
                         }
                         info!(

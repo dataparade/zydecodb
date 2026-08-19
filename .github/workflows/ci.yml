@@ -241,12 +241,14 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
         run: |
           for t in decode_envelope fuzz_dispatch wal_parser fuzz_filter fuzz_update; do
-            cargo fuzz run "$t" -- -runs=1000 -max_total_time=60
+            cargo +nightly fuzz run "$t" -- -runs=1000 -max_total_time=60
           done
-        working-directory: fuzz
   miri:
     runs-on: ubuntu-latest
     continue-on-error: true
+    env:
+      # rust-toolchain.toml pins 1.91; miri is a nightly-only component.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
