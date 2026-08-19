@@ -167,7 +167,7 @@ hand-maintained reference client). No server required:
 
 ```bash
 cd clients/go
-go test ./proto_conformance_test.go ./proto.go ./errors.go
+go test .
 # or: go test ./...
 ```
 

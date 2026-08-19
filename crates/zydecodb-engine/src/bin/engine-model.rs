@@ -263,16 +263,23 @@ impl Harness {
             serde_json_string(detail)
         );
         self.log(&line);
-        eprintln!("DIVERGENCE at step {} (seed {}): {} — {}", step, self.args.seed, op, detail);
+        eprintln!(
+            "DIVERGENCE at step {} (seed {}): {} — {}",
+            step, self.args.seed, op, detail
+        );
         std::process::exit(1);
     }
 
     fn eng(&self) -> &Engine {
-        self.engine.as_ref().expect("engine live outside crash window")
+        self.engine
+            .as_ref()
+            .expect("engine live outside crash window")
     }
 
     fn eng_mut(&mut self) -> &mut Engine {
-        self.engine.as_mut().expect("engine live outside crash window")
+        self.engine
+            .as_mut()
+            .expect("engine live outside crash window")
     }
 
     fn open_engine(&self) -> Engine {
@@ -483,7 +490,10 @@ impl Harness {
             self.divergence(
                 step,
                 "crash",
-                &format!("replay fabricated writes: recovered seq {} > ack {}", recovered, ack),
+                &format!(
+                    "replay fabricated writes: recovered seq {} > ack {}",
+                    recovered, ack
+                ),
             );
         }
         if recovered < durable {
@@ -505,7 +515,11 @@ impl Harness {
         };
         if got != expected {
             let detail = diff_summary(&expected, &got);
-            self.divergence(step, "crash", &format!("state != model at seq {}: {}", recovered, detail));
+            self.divergence(
+                step,
+                "crash",
+                &format!("state != model at seq {}: {}", recovered, detail),
+            );
         }
         // A resume token taken before the crash must still work after it:
         // the stream must contain exactly the recovered ops after the token.
@@ -697,7 +711,11 @@ impl Harness {
             // (the newest version is never GC'd).
             93..=95 => {
                 let ack = self.eng().current_seq();
-                let ceiling = if ack == 0 { 0 } else { self.rng.next_u64() % (ack + 1) };
+                let ceiling = if ack == 0 {
+                    0
+                } else {
+                    self.rng.next_u64() % (ack + 1)
+                };
                 let snap = self.eng().snapshot_at(ceiling);
                 for _ in 0..8 {
                     let id = self.rng.next_u64() % self.args.keyspace;
@@ -707,9 +725,7 @@ impl Harness {
                     match snap.get(&key) {
                         Ok(got) => {
                             let ok = got == at_ceiling
-                                || (got.is_none()
-                                    && at_ceiling.is_some()
-                                    && at_ceiling != at_ack);
+                                || (got.is_none() && at_ceiling.is_some() && at_ceiling != at_ack);
                             if !ok {
                                 self.divergence(
                                     step,
@@ -757,7 +773,11 @@ impl Harness {
 fn describe(v: &Option<Vec<u8>>) -> String {
     match v {
         None => "None".into(),
-        Some(b) => format!("Some({} bytes, prefix {:?})", b.len(), &b[..b.len().min(12)]),
+        Some(b) => format!(
+            "Some({} bytes, prefix {:?})",
+            b.len(),
+            &b[..b.len().min(12)]
+        ),
     }
 }
 
@@ -770,7 +790,12 @@ fn diff_summary(expected: &BTreeMap<Vec<u8>, Vec<u8>>, got: &BTreeMap<Vec<u8>, V
         match got.get(k) {
             None => return format!("missing key {:?}", k),
             Some(gv) if gv != v => {
-                return format!("key {:?}: expected {} bytes, got {} bytes", k, v.len(), gv.len())
+                return format!(
+                    "key {:?}: expected {} bytes, got {} bytes",
+                    k,
+                    v.len(),
+                    gv.len()
+                )
             }
             _ => {}
         }

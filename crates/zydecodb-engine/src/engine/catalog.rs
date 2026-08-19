@@ -72,7 +72,10 @@ impl Engine {
         std::fs::copy(&manifest_src, &manifest_dst)?;
         // The MANIFEST copy must be durable before SNAPMETA publishes this
         // directory as a restorable base; SNAPMETA stays the last step.
-        OpenOptions::new().write(true).open(&manifest_dst)?.sync_all()?;
+        OpenOptions::new()
+            .write(true)
+            .open(&manifest_dst)?
+            .sync_all()?;
 
         crate::failpoints::failpoint_result(crate::failpoints::SNAPSHOT_BEFORE_PUBLISH)?;
         let snapshot_seq = self.current_seq();

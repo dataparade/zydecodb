@@ -426,7 +426,9 @@ fn stored_to_json(stored: &[u8]) -> Result<Vec<u8>, String> {
         return Err("empty stored document".into());
     };
     if kind == VK_ZDOC {
-        let value = ValueView::new(payload).to_value().map_err(|e| e.to_string())?;
+        let value = ValueView::new(payload)
+            .to_value()
+            .map_err(|e| e.to_string())?;
         return serde_json::to_vec(&value).map_err(|e| e.to_string());
     }
     Ok(payload.to_vec())

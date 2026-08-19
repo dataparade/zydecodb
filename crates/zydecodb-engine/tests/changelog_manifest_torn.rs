@@ -120,7 +120,8 @@ fn failed_persist_never_claims_segment_and_retry_repairs() {
         use std::io::Write;
         let mut f = std::fs::File::create(&seg_path).unwrap();
         f.write_all(&1u64.to_be_bytes()).unwrap();
-        f.write_all(&[zydecodb_engine::wal::WAL_FORMAT_VERSION]).unwrap();
+        f.write_all(&[zydecodb_engine::wal::WAL_FORMAT_VERSION])
+            .unwrap();
         for rec in [
             zydecodb_engine::wal::WalRecord::put(1, 0, b"k1".to_vec(), b"v1".to_vec()),
             zydecodb_engine::wal::WalRecord::put(2, 0, b"k2".to_vec(), b"v2".to_vec()),

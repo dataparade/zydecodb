@@ -357,9 +357,7 @@ pub fn read_shipped_log(ship_dir: &Path) -> EngineResult<Vec<ShippedEntry>> {
                 }
                 return Err(EngineError::Io(format!(
                     "shipped.log line {}: out of order segment_id {} (<= {})",
-                    lineno,
-                    entry.segment_id,
-                    last.segment_id
+                    lineno, entry.segment_id, last.segment_id
                 )));
             }
         }

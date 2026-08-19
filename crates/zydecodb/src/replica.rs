@@ -161,7 +161,9 @@ fn fsync_dir(dir: &Path) -> EngineResult<()> {
 fn write_atomic_durable(dst: &Path, contents: &str) -> EngineResult<()> {
     let tmp = dst.with_file_name(format!(
         "{}.tmp",
-        dst.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+        dst.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
     ));
     {
         let mut f = std::fs::File::create(&tmp)?;

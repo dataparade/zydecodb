@@ -131,8 +131,7 @@ impl Engine {
     /// layout (e.g. legacy un-prefixed single-tenant keys) are skipped, just
     /// as the policy's own accounting ignores them.
     pub fn tenant_usage_bytes(&self) -> EngineResult<std::collections::HashMap<[u8; 16], u64>> {
-        let mut usage: std::collections::HashMap<[u8; 16], u64> =
-            std::collections::HashMap::new();
+        let mut usage: std::collections::HashMap<[u8; 16], u64> = std::collections::HashMap::new();
         let iter = self.scan(vec![keys::KS_USER], vec![keys::KS_USER + 1])?;
         for item in iter {
             let (key, value) = item?;

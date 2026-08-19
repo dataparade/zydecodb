@@ -303,7 +303,10 @@ fn replica_soak_failover_cycles() {
             eng.shutdown().unwrap();
         }
         let out = replica::promote(&ship_dir, &replica_wal, &replica_data).unwrap();
-        assert!(out.new_epoch > out.previous_epoch, "cycle {cycle}: epoch must advance");
+        assert!(
+            out.new_epoch > out.previous_epoch,
+            "cycle {cycle}: epoch must advance"
+        );
 
         // Serve the promoted node and verify equivalence: every write acked
         // in the LAST cycle, plus a random sample across all history.
@@ -337,7 +340,8 @@ fn replica_soak_failover_cycles() {
                     let (st, body) = request(verify_server.addr, &get_frame(k))
                         .expect("promoted node must answer");
                     assert_eq!(
-                        st, STATUS_OK,
+                        st,
+                        STATUS_OK,
                         "cycle {cycle}: acked key {:?} lost in failover",
                         String::from_utf8_lossy(k)
                     );
@@ -348,9 +352,7 @@ fn replica_soak_failover_cycles() {
                         .strip_prefix("val-")
                         .and_then(|r| r.split('-').next())
                         .and_then(|n| n.parse().ok())
-                        .unwrap_or_else(|| {
-                            panic!("cycle {cycle}: unknown value format: {body_s}")
-                        });
+                        .unwrap_or_else(|| panic!("cycle {cycle}: unknown value format: {body_s}"));
                     assert!(
                         served_n >= floor,
                         "cycle {cycle}: key {:?} serves n={} but acked n={} — acked write lost",
@@ -358,7 +360,9 @@ fn replica_soak_failover_cycles() {
                         served_n,
                         floor
                     );
-                    let known = hist[k].iter().any(|(n, v)| *n == served_n && *v == body_s.as_bytes());
+                    let known = hist[k]
+                        .iter()
+                        .any(|(n, v)| *n == served_n && *v == body_s.as_bytes());
                     assert!(
                         known,
                         "cycle {cycle}: key {:?} serves unknown value {:?} — corruption",

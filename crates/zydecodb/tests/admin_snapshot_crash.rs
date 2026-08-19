@@ -61,9 +61,13 @@ fn half_written_snapshot_missing_snapmeta_is_unrestorable() {
     // Ordering contract: at the BEFORE_PUBLISH point the MANIFEST copy is
     // already on disk and byte-complete (and fsynced). Only SNAPMETA — the
     // restorability gate — may be missing.
-    let copied = std::fs::read(snap.join("MANIFEST")).expect("MANIFEST must be fully copied pre-publish");
+    let copied =
+        std::fs::read(snap.join("MANIFEST")).expect("MANIFEST must be fully copied pre-publish");
     let source = std::fs::read(dir.path().join("data").join("MANIFEST")).unwrap();
-    assert_eq!(copied, source, "copied MANIFEST must match the source bytes");
+    assert_eq!(
+        copied, source,
+        "copied MANIFEST must match the source bytes"
+    );
 
     let err = admin::restore(&snap, &ship, None, None, &out);
     assert!(err.is_err(), "half-written snapshot must not restore");

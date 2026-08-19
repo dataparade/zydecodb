@@ -659,8 +659,7 @@ impl SstableReader {
         // previous block's tail. Entries below lo are filtered per-entry
         // during iteration, so starting earlier is safe.
         if !lo.is_empty() {
-            start_block =
-                self.earliest_block_for_key(&index, start_block, &lo, false, None)?;
+            start_block = self.earliest_block_for_key(&index, start_block, &lo, false, None)?;
         }
         Ok(SstableRangeIter {
             reader: self,

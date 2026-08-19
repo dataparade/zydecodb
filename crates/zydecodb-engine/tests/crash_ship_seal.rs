@@ -120,7 +120,11 @@ fn double_ship_same_segment_appends_once() {
     shipping::ship_segment(&src, &ship, 7, 42, ShipMode::Copy, Some(hmac)).unwrap();
 
     let entries = shipping::read_shipped_log(&ship).unwrap();
-    assert_eq!(entries.len(), 1, "idempotent ship must not duplicate the log line");
+    assert_eq!(
+        entries.len(),
+        1,
+        "idempotent ship must not duplicate the log line"
+    );
     assert_shipped_log_consistent(&ship, hmac);
 }
 

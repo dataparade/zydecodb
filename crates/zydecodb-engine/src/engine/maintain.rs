@@ -732,7 +732,10 @@ mod tests {
             engine.drain_flush().expect("flush");
         }
         assert_eq!(
-            metrics.live_sstables_by_level.with_label_values(&["0"]).get(),
+            metrics
+                .live_sstables_by_level
+                .with_label_values(&["0"])
+                .get(),
             4,
             "expected four L0 files"
         );
@@ -831,10 +834,14 @@ mod tests {
         // Submit both applies to the apply worker without draining; the
         // flush apply is first in FIFO order.
         for r in engine.flush_scheduler.poll_results() {
-            engine.submit_flush_apply(r.expect("flush result")).expect("flush apply");
+            engine
+                .submit_flush_apply(r.expect("flush result"))
+                .expect("flush apply");
         }
         for r in engine.compaction_scheduler.poll_results() {
-            engine.submit_compaction_apply(r.expect("compaction result")).expect("compaction apply");
+            engine
+                .submit_compaction_apply(r.expect("compaction result"))
+                .expect("compaction apply");
         }
         // Both ready, neither drained: one batched drain publishes
         // [flush, compaction] from a single ready vec.
@@ -842,7 +849,11 @@ mod tests {
             assert!(Instant::now() < deadline, "applies never became ready");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(engine.apply_scheduler.ready_count(), 2, "applies not batched");
+        assert_eq!(
+            engine.apply_scheduler.ready_count(),
+            2,
+            "applies not batched"
+        );
         engine.drain_catalog_apply().expect("batched drain");
 
         engine.drain_compaction().expect("drain");

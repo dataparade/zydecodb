@@ -71,7 +71,7 @@ jobs:
           go-version: "1.23"
       - name: Go codec vs vectors
         working-directory: clients/go
-        run: go test -v ./proto_conformance_test.go ./proto.go ./errors.go
+        run: go test -v -run 'TestRequestVectors|TestResponseVectors|TestCommandAndStatusCodes' .
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -145,7 +145,7 @@ jobs:
           go-version: "1.23"
       - name: Unit tests (no server)
         working-directory: clients/go
-        run: go test -v ./proto_conformance_test.go ./proto.go ./errors.go
+        run: go test -v .
       - name: Start ZydecoDB
         run: |
           mkdir -p /tmp/zdb/data /tmp/zdb/wal

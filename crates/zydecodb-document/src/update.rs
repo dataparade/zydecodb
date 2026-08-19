@@ -783,10 +783,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(".");
         let u = json!({"$set": { path: 1 }});
-        assert!(matches!(
-            UpdateDoc::parse(&u),
-            Err(DocError::BadUpdate(_))
-        ));
+        assert!(matches!(UpdateDoc::parse(&u), Err(DocError::BadUpdate(_))));
 
         // Exactly at the cap still parses.
         let ok_path = (0..MAX_UPDATE_PATH_SEGMENTS)

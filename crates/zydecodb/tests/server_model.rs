@@ -63,10 +63,11 @@ impl Client {
     fn connect(addr: SocketAddr, cert_path: &Path, secret: &str) -> std::io::Result<Self> {
         let tcp = TcpStream::connect(addr)?;
         tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        tcp.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
-        let cert_der = rustls_pemfile::certs(&mut std::io::BufReader::new(
-            std::fs::File::open(cert_path)?,
-        ))
+        tcp.set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let cert_der = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(
+            cert_path,
+        )?))
         .next()
         .unwrap()
         .unwrap();
@@ -126,7 +127,9 @@ impl Client {
             value: value.to_vec(),
         };
         for _ in 0..100 {
-            let st = self.roundtrip(&RequestEnvelope::new(Command::Put, p.encode()))?.0;
+            let st = self
+                .roundtrip(&RequestEnvelope::new(Command::Put, p.encode()))?
+                .0;
             if st != Status::EngineBusy {
                 return Ok(st);
             }
@@ -158,7 +161,9 @@ impl Client {
             key: key.to_vec(),
         };
         for _ in 0..100 {
-            let st = self.roundtrip(&RequestEnvelope::new(Command::Del, p.encode()))?.0;
+            let st = self
+                .roundtrip(&RequestEnvelope::new(Command::Del, p.encode()))?
+                .0;
             if st != Status::EngineBusy {
                 return Ok(st);
             }
@@ -184,7 +189,13 @@ fn free_addr() -> SocketAddr {
     l.local_addr().unwrap()
 }
 
-fn write_config(root: &Path, addr: SocketAddr, keys_file: &Path, cert: &Path, key: &Path) -> PathBuf {
+fn write_config(
+    root: &Path,
+    addr: SocketAddr,
+    keys_file: &Path,
+    cert: &Path,
+    key: &Path,
+) -> PathBuf {
     let cfg_path = root.join("zydecodb.toml");
     let text = format!(
         r#"listen = "{addr}"
@@ -246,7 +257,10 @@ fn wait_ready(root: &Path, addr: SocketAddr, secret: &str, child: &mut Child) ->
         match Client::connect(addr, &cert, secret) {
             Ok(c) => return c,
             Err(_) => {
-                assert!(Instant::now() < deadline, "server never became ready at {addr}");
+                assert!(
+                    Instant::now() < deadline,
+                    "server never became ready at {addr}"
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
@@ -266,7 +280,9 @@ struct Model {
 
 impl Model {
     fn new() -> Self {
-        Model { map: BTreeMap::new() }
+        Model {
+            map: BTreeMap::new(),
+        }
     }
 
     fn confirm_put(&mut self, key: &[u8], val: Vec<u8>) {
@@ -496,13 +512,25 @@ fn server_model_wire_oracle() {
     let mut adv_handles = Vec::new();
     if adversaries_on {
         let (a, b, c) = (adv_stop.clone(), shared_addr.clone(), root.clone());
-        adv_handles.push(std::thread::spawn(move || adversary_garbage(a, b, seed ^ 0xA1)));
+        adv_handles.push(std::thread::spawn(move || {
+            adversary_garbage(a, b, seed ^ 0xA1)
+        }));
         adv_handles.push(std::thread::spawn({
-            let (a, b, r, s) = (adv_stop.clone(), shared_addr.clone(), root.clone(), secret.clone());
+            let (a, b, r, s) = (
+                adv_stop.clone(),
+                shared_addr.clone(),
+                root.clone(),
+                secret.clone(),
+            );
             move || adversary_flooder(a, b, r, s, seed ^ 0xF10D)
         }));
         adv_handles.push(std::thread::spawn({
-            let (a, b, r, s) = (adv_stop.clone(), shared_addr.clone(), root.clone(), secret.clone());
+            let (a, b, r, s) = (
+                adv_stop.clone(),
+                shared_addr.clone(),
+                root.clone(),
+                secret.clone(),
+            );
             move || adversary_postauth_malformed(a, b, r, s, seed ^ 0xBAAD)
         }));
         let _ = c;
@@ -620,7 +648,9 @@ fn server_model_wire_oracle() {
                 }
                 if staging_failed {
                     // Rate-limited mid-staging: abandon cleanly.
-                    let (st, _) = client.simple(Command::Rollback).expect("rollback transport");
+                    let (st, _) = client
+                        .simple(Command::Rollback)
+                        .expect("rollback transport");
                     assert_eq!(st, Status::Ok);
                     continue;
                 }
@@ -633,8 +663,7 @@ fn server_model_wire_oracle() {
                     other => panic!("step {step}: staged get status {other:?}"),
                 };
                 assert_eq!(
-                    served,
-                    probe_v,
+                    served, probe_v,
                     "step {step}: read-your-writes broken inside txn",
                 );
 
@@ -687,7 +716,9 @@ fn server_model_wire_oracle() {
                         }
                     }
                 } else {
-                    let (st, _) = client.simple(Command::Rollback).expect("rollback transport");
+                    let (st, _) = client
+                        .simple(Command::Rollback)
+                        .expect("rollback transport");
                     assert_eq!(st, Status::Ok, "step {step}: rollback rejected");
                     // Staged ops must be invisible now.
                     for (k, _) in &staged {

@@ -142,7 +142,8 @@ fn test_preauth_frame_cap_rejects_oversize_header() {
         found.expect("server never started listening")
     };
     evil.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    evil.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+    evil.set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     // Header-only frame: declares an 8 MiB Put payload, body never follows.
     // Pre-auth the server must reject at the header (64 KiB cap) instead of
@@ -176,7 +177,11 @@ fn test_preauth_frame_cap_rejects_oversize_header() {
     ok.read_exact(&mut header)
         .expect("server must still answer after rejecting the oversized frame");
     let (status, _) = ResponseEnvelope::parse_header(&header).unwrap();
-    assert_eq!(status, Status::Unauthorized, "honest small frame reaches dispatch");
+    assert_eq!(
+        status,
+        Status::Unauthorized,
+        "honest small frame reaches dispatch"
+    );
 
     *shutdown.lock().unwrap() = true;
     handle.join().unwrap();

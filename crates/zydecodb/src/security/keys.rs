@@ -313,7 +313,10 @@ impl KeyStore {
         // then fsync the directory so the rename survives power loss.
         let tmp = self.path.with_file_name(format!(
             "{}.tmp",
-            self.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            self.path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
         ));
         {
             let mut opts = fs::OpenOptions::new();

@@ -303,7 +303,10 @@ impl Server {
             // Seed from on-disk state so byte caps are enforced across
             // restarts instead of silently resetting to zero per process.
             let seeded = engine.tenant_usage_bytes()?;
-            info!(tenants = seeded.len(), "seeded tenant quota usage from keyspace scan");
+            info!(
+                tenants = seeded.len(),
+                "seeded tenant quota usage from keyspace scan"
+            );
             policy.seed_usage(seeded);
             engine = engine.with_write_policy(policy);
         }

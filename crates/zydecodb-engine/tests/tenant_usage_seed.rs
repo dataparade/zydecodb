@@ -29,8 +29,8 @@ fn usage_scan_sums_live_values_per_tenant() {
     e.put(tenant_key(1, b"a"), b"12345".to_vec(), 0).unwrap(); // 5 bytes
     e.put(tenant_key(1, b"b"), b"123".to_vec(), 0).unwrap(); // 3 bytes
     e.put(tenant_key(2, b"a"), b"1234567".to_vec(), 0).unwrap(); // 7 bytes
-    // Legacy un-prefixed single-tenant layout (no 16-byte tenant): skipped,
-    // matching the write-path policy's own tenant extraction.
+                                                                 // Legacy un-prefixed single-tenant layout (no 16-byte tenant): skipped,
+                                                                 // matching the write-path policy's own tenant extraction.
     e.put(vec![KS_USER, b'x'], b"999".to_vec(), 0).unwrap();
     // Overwrite credits the old value; delete frees it.
     e.put(tenant_key(1, b"a"), b"12".to_vec(), 0).unwrap(); // now 2 bytes
@@ -48,7 +48,8 @@ fn usage_scan_reflects_pre_restart_state() {
     let dir = TempDir::new().unwrap();
     {
         let mut e = Engine::open(cfg(&dir)).unwrap();
-        e.put(tenant_key(7, b"a"), b"ten bytes!".to_vec(), 0).unwrap();
+        e.put(tenant_key(7, b"a"), b"ten bytes!".to_vec(), 0)
+            .unwrap();
         e.put(tenant_key(7, b"b"), b"five".to_vec(), 0).unwrap();
         // Dirty shutdown: no Engine::shutdown, so the next open replays the WAL.
         drop(e);
