@@ -241,7 +241,9 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
         run: |
           for t in decode_envelope fuzz_dispatch wal_parser fuzz_filter fuzz_update; do
-            cargo +nightly fuzz run "$t" -- -runs=1000 -max_total_time=60
+            # Workspace release LTO + ASAN/sancov + rust-lld drops __sancov_gen_
+            # symbols (cargo-fuzz#384/#404). Smoke is compile+run, not ASAN.
+            cargo +nightly fuzz run "$t" --sanitizer none -- -runs=1000 -max_total_time=60
           done
   miri:
     runs-on: ubuntu-latest
@@ -249,6 +251,8 @@ jobs:
     env:
       # rust-toolchain.toml pins 1.91; miri is a nightly-only component.
       RUSTUP_TOOLCHAIN: nightly
+      # Engine tests create tempdirs; miri isolation blocks mkdir.
+      MIRIFLAGS: -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
