@@ -138,8 +138,8 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 ## Expectations, gotchas, advice
 
-- **0.11.0** (pre-1.0). Wire `proto_version = 1` opcodes, write flags, and status
-  bytes are treated as **frozen for the upcoming 1.x line** (append-only; see
+- **1.0.0.** Wire `proto_version = 1` opcodes, write flags, and status bytes
+  are **frozen for 1.x** (append-only; see
   [`docs/PROTOCOL.md`](docs/PROTOCOL.md#wire-protocol) and
   [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). Reserved opcodes may gain
   semantics without renumbering. On-disk format changes follow

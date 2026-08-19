@@ -2133,7 +2133,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zydecodb"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "zydecodb-document"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "regex",
@@ -2178,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "zydecodb-engine"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "zydecodb-migrate"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",

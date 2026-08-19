@@ -6,6 +6,22 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-18
+
+First stable 1.0. The compatibility promise is in
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md): wire `proto_version = 1` is
+frozen (additive opcodes and status bytes only); on-disk SSTable/WAL/manifest
+v2 formats, official driver APIs, config keys, CLI flags, and metric names do
+not break without a major version bump. Any 1.x driver works against any 1.x
+server on wire v1.
+
+### Since 1.0.0-rc.1
+
+- Existing sessions are dropped when a key is revoked and the keystore reloads
+  (`SIGHUP` / `Server::reload_keys`).
+- Python `Transaction.put_document` no longer JSON-encodes the body twice.
+- CI on `main` is green (rust, drivers, wire conformance, audit, fuzz-smoke).
+
 ## [1.0.0-rc.1] - 2026-08-07
 
 First release candidate for 1.0. The 1.x compatibility promise is stated in

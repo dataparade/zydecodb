@@ -158,7 +158,7 @@ but runtime compatibility is the wire — not lockstep minors. Full policy:
 
 | Line | Drivers | Wire |
 |------|---------|------|
-| `1.x` (RC: `1.0.0-rc.1`) | Python / npm / Go `1.x*` | `proto_version = 1` |
+| `1.x` | Python / npm / Go `1.x*` | `proto_version = 1` |
 | `0.11.x` | Python / npm / Go `0.11.x*` | `proto_version = 1` |
 | `0.10.x` | Python / npm / Go `0.10.x*` | `proto_version = 1` |
 | `0.9.x` | Python / npm / Go `0.9.x*` | `proto_version = 1` |
@@ -211,14 +211,13 @@ The release workflow then:
 
 ```bash
 # Go — pin the module version (not @latest)
-go get github.com/dataparade/zydecodb/clients/go@v1.0.0-rc.1
-# go get github.com/dataparade/zydecodb/clients/go@v1.0.0  # after stable 1.0
+go get github.com/dataparade/zydecodb/clients/go@v1.0.0
 
-# Python (PEP 440: 1.0.0-rc.1 → 1.0.0rc1)
-pip install zydecodb==1.0.0rc1
+# Python
+pip install zydecodb==1.0.0
 
-# TypeScript (npm dist-tag `beta` for hyphenated pre-releases)
-npm install zydecodb@1.0.0-rc.1
+# TypeScript
+npm install zydecodb@1.0.0
 ```
 
 Unified releases still ship matching `X.Y.Z` tags for convenience. After 1.0,

@@ -9,7 +9,7 @@ Pin an explicit module version (do not use `@latest` — that can resolve to a
 pseudo-version when the nested Go tag is missing):
 
 ```bash
-go get github.com/dataparade/zydecodb/clients/go@v0.11.0
+go get github.com/dataparade/zydecodb/clients/go@v1.0.0
 ```
 
 Requires Go 1.23+. The Go module is tagged as `clients/go/vX.Y.Z` at the same
@@ -21,8 +21,8 @@ commit as the server release `vX.Y.Z`. See
 
 | Server | Go driver tag | Wire |
 |--------|---------------|------|
-| `1.x` (upcoming) | `clients/go/v1.x*` | `proto_version = 1` |
-| `0.11.x` (current) | `clients/go/v0.11.x*` | `proto_version = 1` |
+| `1.x` (current) | `clients/go/v1.x*` | `proto_version = 1` |
+| `0.11.x` | `clients/go/v0.11.x*` | `proto_version = 1` |
 
 After 1.0, any 1.x driver works against any 1.x server on wire v1. Packaging
 stays unified; see [`docs/COMPATIBILITY.md`](../../docs/COMPATIBILITY.md).
