@@ -33,7 +33,7 @@ jobs:
           - name: cold-wide
             soak_env: "HOT_PCT=5"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Soak variant ${{ matrix.name }}
         run: |
