@@ -78,7 +78,7 @@ impl Client {
             .with_no_client_auth();
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(Arc::new(cfg), name)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| std::io::Error::other(e))?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
         // Authenticate.
         let (st, _) = Self::roundtrip_raw(
@@ -440,13 +440,6 @@ fn adversary_postauth_malformed(
             }
         }
         std::thread::sleep(Duration::from_millis(rng.range(0, 5)));
-    }
-}
-
-fn describe(o: &Option<Vec<u8>>) -> String {
-    match o {
-        None => "<absent>".into(),
-        Some(v) => String::from_utf8_lossy(v).into_owned(),
     }
 }
 

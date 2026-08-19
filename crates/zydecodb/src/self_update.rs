@@ -13,7 +13,7 @@ const REPO: &str = "dataparade/zydecodb";
 const DEFAULT_API: &str = "https://api.github.com/repos/dataparade/zydecodb/releases";
 const DEFAULT_DOWNLOAD: &str = "https://github.com/dataparade/zydecodb/releases/download";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
     pub check: bool,
     pub version: Option<String>,
@@ -29,22 +29,6 @@ pub struct UpdateOptions {
     pub install_path: Option<PathBuf>,
     /// Current package version (default: `CARGO_PKG_VERSION`).
     pub current_version: Option<String>,
-}
-
-impl Default for UpdateOptions {
-    fn default() -> Self {
-        Self {
-            check: false,
-            version: None,
-            force: false,
-            yes: false,
-            skip_attestation: false,
-            api_base: None,
-            download_base: None,
-            install_path: None,
-            current_version: None,
-        }
-    }
 }
 
 /// Result of a successful `run` (errors use `Err`).
@@ -76,12 +60,18 @@ pub enum UpdateError {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
-    Http(#[from] ureq::Error),
+    Http(Box<ureq::Error>),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
 
 type Result<T> = std::result::Result<T, UpdateError>;
+
+impl From<ureq::Error> for UpdateError {
+    fn from(e: ureq::Error) -> Self {
+        Self::Http(Box::new(e))
+    }
+}
 
 fn err(msg: impl Into<String>) -> UpdateError {
     UpdateError::Message(msg.into())
@@ -184,7 +174,7 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>> {
 }
 
 fn http_get_string(url: &str) -> Result<String> {
-    Ok(String::from_utf8(http_get_bytes(url)?).map_err(|e| err(e.to_string()))?)
+    String::from_utf8(http_get_bytes(url)?).map_err(|e| err(e.to_string()))
 }
 
 /// Resolve the release tag: explicit `--version`, else `/latest`, else newest.

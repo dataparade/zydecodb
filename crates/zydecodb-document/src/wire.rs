@@ -231,7 +231,7 @@ impl IndexDefPayload {
         let collection = r.lp_string()?;
         let index_name = r.lp_string()?;
         let unique = r.u8()? != 0;
-        let count = r.u32()? as usize;
+        let count = r.u32()?;
         if count > MAX_INDEX_FIELDS {
             return Err(DocError::Protocol(format!(
                 "index field count {count} exceeds max {MAX_INDEX_FIELDS}"
@@ -249,7 +249,7 @@ impl IndexDefPayload {
             0
         };
         let directions =
-            if r.remaining() >= 1 + count && r.buf.get(r.pos).copied() == Some(INDEX_DIR_TAG) {
+            if r.remaining() > count && r.buf.get(r.pos).copied() == Some(INDEX_DIR_TAG) {
                 let _tag = r.u8()?;
                 let mut dirs = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -1008,6 +1008,60 @@ impl DocUpdateIfMatchPayload {
     }
 }
 
+// ---- Transaction control responses ----
+
+/// Begin response: `[tx_id u64 BE][snapshot_seq u64 BE]`.
+pub fn encode_begin_response(tx_id: u64, snapshot_seq: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&tx_id.to_be_bytes());
+    out.extend_from_slice(&snapshot_seq.to_be_bytes());
+    out
+}
+
+pub fn decode_begin_response(p: &[u8]) -> DocResult<(u64, u64)> {
+    if p.len() != 16 {
+        return Err(DocError::Protocol("Begin response must be 16 bytes".into()));
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&p[..8]);
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[8..]);
+    Ok((u64::from_be_bytes(a), u64::from_be_bytes(b)))
+}
+
+/// Commit response: `[seq u64 BE]`.
+pub fn encode_commit_response(seq: u64) -> Vec<u8> {
+    seq.to_be_bytes().to_vec()
+}
+
+pub fn decode_commit_response(p: &[u8]) -> DocResult<u64> {
+    if p.len() != 8 {
+        return Err(DocError::Protocol("Commit response must be 8 bytes".into()));
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(p);
+    Ok(u64::from_be_bytes(a))
+}
+
+/// Stage acknowledgement: `[logical_ops u32 BE][estimated_keys u32 BE]`.
+pub fn encode_stage_ack(logical_ops: u32, estimated_keys: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&logical_ops.to_be_bytes());
+    out.extend_from_slice(&estimated_keys.to_be_bytes());
+    out
+}
+
+pub fn decode_stage_ack(p: &[u8]) -> DocResult<(u32, u32)> {
+    if p.len() != 8 {
+        return Err(DocError::Protocol("stage ack must be 8 bytes".into()));
+    }
+    let mut a = [0u8; 4];
+    a.copy_from_slice(&p[..4]);
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&p[4..]);
+    Ok((u32::from_be_bytes(a), u32::from_be_bytes(b)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1365,58 +1419,4 @@ mod tests {
         let stage = encode_stage_ack(3, 12);
         assert_eq!(decode_stage_ack(&stage).unwrap(), (3, 12));
     }
-}
-
-// ---- Transaction control responses ----
-
-/// Begin response: `[tx_id u64 BE][snapshot_seq u64 BE]`.
-pub fn encode_begin_response(tx_id: u64, snapshot_seq: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&tx_id.to_be_bytes());
-    out.extend_from_slice(&snapshot_seq.to_be_bytes());
-    out
-}
-
-pub fn decode_begin_response(p: &[u8]) -> DocResult<(u64, u64)> {
-    if p.len() != 16 {
-        return Err(DocError::Protocol("Begin response must be 16 bytes".into()));
-    }
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&p[..8]);
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&p[8..]);
-    Ok((u64::from_be_bytes(a), u64::from_be_bytes(b)))
-}
-
-/// Commit response: `[seq u64 BE]`.
-pub fn encode_commit_response(seq: u64) -> Vec<u8> {
-    seq.to_be_bytes().to_vec()
-}
-
-pub fn decode_commit_response(p: &[u8]) -> DocResult<u64> {
-    if p.len() != 8 {
-        return Err(DocError::Protocol("Commit response must be 8 bytes".into()));
-    }
-    let mut a = [0u8; 8];
-    a.copy_from_slice(p);
-    Ok(u64::from_be_bytes(a))
-}
-
-/// Stage acknowledgement: `[logical_ops u32 BE][estimated_keys u32 BE]`.
-pub fn encode_stage_ack(logical_ops: u32, estimated_keys: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8);
-    out.extend_from_slice(&logical_ops.to_be_bytes());
-    out.extend_from_slice(&estimated_keys.to_be_bytes());
-    out
-}
-
-pub fn decode_stage_ack(p: &[u8]) -> DocResult<(u32, u32)> {
-    if p.len() != 8 {
-        return Err(DocError::Protocol("stage ack must be 8 bytes".into()));
-    }
-    let mut a = [0u8; 4];
-    a.copy_from_slice(&p[..4]);
-    let mut b = [0u8; 4];
-    b.copy_from_slice(&p[4..]);
-    Ok((u32::from_be_bytes(a), u32::from_be_bytes(b)))
 }

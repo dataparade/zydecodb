@@ -332,7 +332,7 @@ fn replica_soak_failover_cycles() {
                 let mut picked: Vec<&Vec<u8>> = (0..sample_n)
                     .map(|_| keys[rng.range(0, (keys.len() - 1) as u64) as usize])
                     .collect();
-                picked.extend(keys.iter().rev().take(500).map(|k| *k));
+                picked.extend(keys.iter().rev().take(500).copied());
                 picked.sort();
                 picked.dedup();
                 for k in picked {

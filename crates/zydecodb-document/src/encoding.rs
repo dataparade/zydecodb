@@ -396,7 +396,7 @@ mod tests {
             json!("ab"),
             json!("b"),
         ];
-        values.sort_by(|a, b| enc(a).cmp(&enc(b)));
+        values.sort_by_key(|a| enc(a));
         for w in values.windows(2) {
             if enc(&w[0]) == enc(&w[1]) {
                 assert_eq!(enc_desc(&w[0]), enc_desc(&w[1]));

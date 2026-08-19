@@ -174,10 +174,8 @@ impl<'a> ValueView<'a> {
     pub fn as_f64(&self) -> Option<f64> {
         if self.type_byte() == TYPE_F64 && self.data.len() >= 9 {
             Some(f64::from_le_bytes(self.data[1..9].try_into().unwrap()))
-        } else if let Some(i) = self.as_i64() {
-            Some(i as f64)
         } else {
-            None
+            self.as_i64().map(|i| i as f64)
         }
     }
     pub fn as_str(&self) -> Option<&'a str> {

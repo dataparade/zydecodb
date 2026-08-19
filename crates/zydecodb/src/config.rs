@@ -754,6 +754,11 @@ impl Config {
     }
 }
 
+pub fn is_loopback(addr: &SocketAddr) -> bool {
+    matches!(addr.ip(), IpAddr::V4(v4) if v4.is_loopback())
+        || matches!(addr.ip(), IpAddr::V6(v6) if v6.is_loopback())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,9 +876,4 @@ l0_write_stall_threshold = 8
         fs::set_permissions(&cfg.security.keys_file, fs::Permissions::from_mode(0o600)).unwrap();
         cfg.validate_serve_startup().expect("owner-only keys ok");
     }
-}
-
-pub fn is_loopback(addr: &SocketAddr) -> bool {
-    matches!(addr.ip(), IpAddr::V4(v4) if v4.is_loopback())
-        || matches!(addr.ip(), IpAddr::V6(v6) if v6.is_loopback())
 }

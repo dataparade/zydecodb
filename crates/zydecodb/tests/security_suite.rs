@@ -318,7 +318,7 @@ fn shipping_hmac_roundtrip_rejects_tampering() {
     // Log line carries 4 fields (id, seq, sha256, hmac).
     let log = std::fs::read_to_string(ship.join(shipping::SHIPPED_LOG)).unwrap();
     assert_eq!(
-        log.trim().split_whitespace().count(),
+        log.split_whitespace().count(),
         4,
         "expected HMAC field on shipped.log line: {log}"
     );

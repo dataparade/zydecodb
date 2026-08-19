@@ -157,8 +157,7 @@ fn test_deep_graft_update_rejected_without_crash() {
     // A dotted path is a flat JSON string — serde's parse depth cap does not
     // bound it. 5000 segments would graft 5000 nesting levels in ONE update
     // (and blow the stack on the next read) if the path cap didn't reject it.
-    let path = std::iter::repeat("s")
-        .take(5000)
+    let path = std::iter::repeat_n("s", 5000)
         .enumerate()
         .map(|(i, s)| format!("{s}{i}"))
         .collect::<Vec<_>>()

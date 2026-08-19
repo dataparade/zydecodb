@@ -660,11 +660,9 @@ pub fn execute_find_coll(
             let dk = keys::doc_key(prefix, coll.id, id);
             let mut rows = Vec::new();
             if let Some(stored) = snap.get(&dk)? {
-                if check_filter(&stored, &spec.filter, id) {
-                    if spec.skip == 0 {
-                        if let Some(row) = row_from_stored(id.clone(), &stored, &spec.projection)? {
-                            rows.push(row);
-                        }
+                if check_filter(&stored, &spec.filter, id) && spec.skip == 0 {
+                    if let Some(row) = row_from_stored(id.clone(), &stored, &spec.projection)? {
+                        rows.push(row);
                     }
                 }
             }

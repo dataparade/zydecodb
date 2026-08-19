@@ -52,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
         let catalog = {
             let guard = ctx.engine.read();
             std::sync::Arc::new(std::sync::RwLock::new(
-                zydecodb_document::catalog::Catalog::load(&*guard).unwrap(),
+                zydecodb_document::catalog::Catalog::load(&guard).unwrap(),
             ))
         };
         let commit = zydecodb::commit::CommitCoordinator::new(

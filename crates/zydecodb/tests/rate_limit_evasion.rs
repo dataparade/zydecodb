@@ -72,7 +72,6 @@ fn test_rate_limit_evasion_connection_cycling() {
     let test_duration = Duration::from_secs(1);
 
     for _ in 0..20 {
-        let addr = addr;
         let successful_requests = successful_requests.clone();
 
         threads.push(thread::spawn(move || {

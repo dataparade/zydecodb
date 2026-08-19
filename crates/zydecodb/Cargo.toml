@@ -55,3 +55,6 @@ serde_json = { workspace = true }
 rcgen = "0.13"
 fail = { workspace = true }
 proptest = { workspace = true }
+
+[lints]
+workspace = true

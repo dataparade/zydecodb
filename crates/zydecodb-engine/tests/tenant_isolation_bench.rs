@@ -108,7 +108,7 @@ fn fair_stall_attribution_spares_well_behaved_tenant() {
             memtable_flush_threshold: 8 * 1024,
             l0_write_stall_threshold: Some(2),
             fair: FairConfig::default(),
-            compaction: high_l0_trigger.clone(),
+            compaction: high_l0_trigger,
             ..Default::default()
         })
         .unwrap();

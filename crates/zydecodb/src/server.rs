@@ -853,7 +853,7 @@ fn catch_up_replica(
                 return reopen_replica(engine, catalog, metrics, engine_cfg);
             }
         }
-        let cat = Catalog::load(&*guard).map_err(|e| e.to_string())?;
+        let cat = Catalog::load(&guard).map_err(|e| e.to_string())?;
         drop(guard);
         *catalog.write().unwrap() = cat;
     }

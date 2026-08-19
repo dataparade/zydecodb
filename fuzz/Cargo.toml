@@ -15,6 +15,9 @@ zydecodb = { path = "../crates/zydecodb" }
 zydecodb-engine = { path = "../crates/zydecodb-engine" }
 zydecodb-document = { path = "../crates/zydecodb-document" }
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "decode_envelope"
 path = "fuzz_targets/decode_envelope.rs"

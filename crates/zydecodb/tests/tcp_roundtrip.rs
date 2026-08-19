@@ -2,7 +2,6 @@
 mod common;
 use common::*;
 
-use std::io::Write;
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;

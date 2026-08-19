@@ -33,6 +33,21 @@ fail = "0.5"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 
+[workspace.lints.clippy]
+# Style debt accumulated before `-D warnings` was enforced. Raising argument
+# counts or adding type aliases would churn public store/catalog APIs for no
+# runtime gain. New correctness lints still fail CI.
+too_many_arguments = "allow"
+field_reassign_with_default = "allow"
+type_complexity = "allow"
+len_without_is_empty = "allow"
+wrong_self_convention = "allow"
+result_unit_err = "allow"
+needless_range_loop = "allow"
+match_like_matches_macro = "allow"
+while_let_loop = "allow"
+redundant_closure = "allow"
+
 [profile.release]
 opt-level = 3
 lto = true
