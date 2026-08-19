@@ -106,10 +106,9 @@ class Transaction:
     def put_document(
         self, collection: str, doc_id: str, doc: Any, *, expires_at: int = 0
     ) -> None:
-        body = json.dumps(doc, separators=(",", ":")).encode("utf-8")
         self._request(
             proto.CMD_DOC_PUT,
-            proto.encode_doc_put(collection, doc_id, body, relaxed=False, expires_at=expires_at),
+            proto.encode_doc_put(collection, doc_id, doc, relaxed=False, expires_at=expires_at),
             "DocPut",
         )
 
@@ -122,11 +121,10 @@ class Transaction:
         *,
         expires_at: int = 0,
     ) -> None:
-        body = json.dumps(doc, separators=(",", ":")).encode("utf-8")
         self._request(
             proto.CMD_DOC_PUT_IF_MATCH,
             proto.encode_doc_put_if_match(
-                collection, doc_id, body, relaxed=False, if_match=if_match, expires_at=expires_at
+                collection, doc_id, doc, relaxed=False, if_match=if_match, expires_at=expires_at
             ),
             "DocPutIfMatch",
         )
@@ -153,11 +151,10 @@ class Transaction:
     def update_document_if_match(
         self, collection: str, doc_id: str, update: Any, if_match: int
     ) -> None:
-        body = json.dumps(update, separators=(",", ":")).encode("utf-8")
         self._request(
             proto.CMD_DOC_UPDATE_IF_MATCH,
             proto.encode_doc_update_if_match(
-                collection, doc_id, body, relaxed=False, if_match=if_match
+                collection, doc_id, update, relaxed=False, if_match=if_match
             ),
             "DocUpdateIfMatch",
         )

@@ -1066,17 +1066,8 @@ fn serve_stream<S: Read + Write>(
             }
         }
 
-        if !rate_limiter.allow() {
-            let resp = zydecodb_engine::frame::ResponseEnvelope::error(
-                zydecodb_engine::errors::Status::EngineBusy,
-                "rate limit exceeded",
-            );
-            write_response(stream, &resp)?;
-            stream.flush()?;
-            continue;
-        }
-
-        // Re-validate session against current KeyStore (handles SIGHUP revocations)
+        // Re-validate before rate limiting. A revoked key must get Unauthorized,
+        // not EngineBusy — otherwise a hot connection never sees the reload.
         if session.authenticated {
             let store = security.keys.load();
             if !store.is_session_valid(&session) {
@@ -1091,9 +1082,17 @@ fn serve_stream<S: Read + Write>(
                     stream.flush()?;
                     continue;
                 }
-            } else {
-                // tracing::info!("Session is still valid");
             }
+        }
+
+        if !rate_limiter.allow() {
+            let resp = zydecodb_engine::frame::ResponseEnvelope::error(
+                zydecodb_engine::errors::Status::EngineBusy,
+                "rate limit exceeded",
+            );
+            write_response(stream, &resp)?;
+            stream.flush()?;
+            continue;
         }
 
         // Per-tenant rate ceiling: shared across all of an authenticated tenant's

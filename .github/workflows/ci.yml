@@ -231,9 +231,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Fuzz smoke (1000 runs each)
+        env:
+          # rust-toolchain.toml pins 1.91; cargo-fuzz needs nightly for -Z sanitizer.
+          RUSTUP_TOOLCHAIN: nightly
         run: |
           for t in decode_envelope fuzz_dispatch wal_parser fuzz_filter fuzz_update; do
             cargo fuzz run "$t" -- -runs=1000 -max_total_time=60
