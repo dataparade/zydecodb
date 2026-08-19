@@ -36,7 +36,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = "1"
 argon2 = "0.5"
-rand = "0.8"
+rand = "0.9"
 sha2 = { workspace = true }
 rustls = "0.23"
 rustls-pemfile = "2"
