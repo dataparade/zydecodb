@@ -31,7 +31,7 @@ proptest = "1"
 tempfile = "3"
 fail = "0.5"
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 
 [workspace.lints.clippy]
 # Style debt accumulated before `-D warnings` was enforced. Raising argument
