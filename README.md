@@ -1,13 +1,36 @@
-# ZydecoDB
+<div align="center">
 
-Source-available database written in Rust (BSL 1.1). Runs as a standalone server — use any language that speaks TCP.
+<img src="docs/assets/logo_black.jpeg" alt="ZydecoDB" width="520">
+
+**Document store on an LSM engine**
+
+[![CI](https://github.com/dataparade/zydecodb/actions/workflows/ci.yml/badge.svg)](https://github.com/dataparade/zydecodb/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-BSL_1.1-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org/)
+[![PyPI](https://img.shields.io/pypi/v/zydecodb)](https://pypi.org/project/zydecodb/)
+[![npm](https://img.shields.io/npm/v/zydecodb)](https://www.npmjs.com/package/zydecodb)
+
+</div>
+
+**ZydecoDB** is a source-available database written in **Rust**. It runs as a standalone server — any language that speaks TCP can talk to it.
 
 Two layers, one engine:
 
 - **Document store** — collections of JSON documents with a filter/query layer: `$`-operators, sort/projection/pagination, partial updates (`$set`/`$inc`/`$unset`/`$push`/`$setOnInsert`), `count`/`distinct`, and secondary indexes the server keeps in sync automatically. Any field is queryable, indexed or not.
 - **Key-value core** — the LSM storage engine underneath: ordered keys, atomic multi-key batches, snapshots, and WAL crash recovery.
 
-**License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07)
+**License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07). Self-hosting is free. You may not offer ZydecoDB as a competing hosted/managed service.
+
+<div align="center">
+
+[Quick start](#quick-start) •
+[Drivers](#more-docs) •
+[Operator guide](docs/GUIDE.md) •
+[Protocol](docs/PROTOCOL.md) •
+[Examples](examples/README.md) •
+[Compatibility](docs/COMPATIBILITY.md)
+
+</div>
 
 ## Quick start
 
