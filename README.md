@@ -20,7 +20,9 @@ Two layers, one engine:
 - **Document store** — collections of JSON documents with a filter/query layer: `$`-operators, sort/projection/pagination, partial updates (`$set`/`$inc`/`$unset`/`$push`/`$setOnInsert`), `count`/`distinct`, and secondary indexes the server keeps in sync automatically. Any field is queryable, indexed or not.
 - **Key-value core** — the LSM storage engine underneath: ordered keys, atomic multi-key batches, snapshots, and WAL crash recovery.
 
-**License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07). Self-hosting is free. For a managed instance, use **[ZydecoDB Cloud](https://zydecodb.com)**.
+ZydecoDB is also available as a fully managed **[ZydecoDB Cloud](https://zydecodb.com)** including a free tier.
+
+**License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07)
 
 <div align="center">
 
