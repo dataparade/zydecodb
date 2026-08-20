@@ -9,6 +9,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org/)
 [![PyPI](https://img.shields.io/pypi/v/zydecodb)](https://pypi.org/project/zydecodb/)
 [![npm](https://img.shields.io/npm/v/zydecodb)](https://www.npmjs.com/package/zydecodb)
+[![Cloud](https://img.shields.io/badge/ZydecoDB-Cloud-1d4ed8)](https://zydecodb.com)
 
 </div>
 
@@ -19,7 +20,7 @@ Two layers, one engine:
 - **Document store** — collections of JSON documents with a filter/query layer: `$`-operators, sort/projection/pagination, partial updates (`$set`/`$inc`/`$unset`/`$push`/`$setOnInsert`), `count`/`distinct`, and secondary indexes the server keeps in sync automatically. Any field is queryable, indexed or not.
 - **Key-value core** — the LSM storage engine underneath: ordered keys, atomic multi-key batches, snapshots, and WAL crash recovery.
 
-**License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07). Self-hosting is free. You may not offer ZydecoDB as a competing hosted/managed service.
+**License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07). Self-hosting is free. For a managed instance, use **[ZydecoDB Cloud](https://zydecodb.com)**.
 
 <div align="center">
 
@@ -28,7 +29,8 @@ Two layers, one engine:
 [Operator guide](docs/GUIDE.md) •
 [Protocol](docs/PROTOCOL.md) •
 [Examples](examples/README.md) •
-[Compatibility](docs/COMPATIBILITY.md)
+[Compatibility](docs/COMPATIBILITY.md) •
+[Cloud](https://zydecodb.com)
 
 </div>
 
