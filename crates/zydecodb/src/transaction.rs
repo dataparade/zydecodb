@@ -753,9 +753,9 @@ fn commit_transaction(
     tx: &TransactionState,
 ) -> DocResult<u64> {
     let (result, slowdown) = {
-        let cat = catalog.read().unwrap();
+        let mut cat = catalog.write().unwrap();
         let mut guard = engine.write();
-        let r = commit_under_lock(&mut guard, &cat, tx);
+        let r = commit_under_lock(&mut guard, &mut cat, tx);
         let s = guard.take_write_slowdown();
         (r, s)
     };
@@ -765,7 +765,7 @@ fn commit_transaction(
 
 fn commit_under_lock(
     engine: &mut Engine,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     tx: &TransactionState,
 ) -> DocResult<u64> {
     // 1. Validate document revisions against current committed state.
@@ -806,6 +806,8 @@ fn commit_under_lock(
 
     // 4. Build physical batch ops.
     let mut key_map: BTreeMap<Vec<u8>, BatchOp> = BTreeMap::new();
+    // Counter deltas per collection id, committed in the same batch as the ops.
+    let mut deltas: BTreeMap<u32, i64> = BTreeMap::new();
 
     for (dk, staged) in &tx.documents {
         match &staged.state {
@@ -816,7 +818,7 @@ fn commit_under_lock(
                     // Was absent and still deleted → nothing to write.
                     continue;
                 }
-                let ops = store::delete_ops(
+                let w = store::delete_ops(
                     engine,
                     catalog,
                     &tx.tenant_prefix,
@@ -824,7 +826,10 @@ fn commit_under_lock(
                     &dk.doc_id,
                     None,
                 )?;
-                for op in ops {
+                if !w.ops.is_empty() {
+                    *deltas.entry(w.collection_id).or_insert(0) += w.doc_delta;
+                }
+                for op in w.ops {
                     insert_op(&mut key_map, op)?;
                 }
             }
@@ -846,7 +851,7 @@ fn commit_under_lock(
                     &dk.collection,
                     &dk.doc_id,
                 )?;
-                let ops = store::upsert_ops_without_unique(
+                let w = store::upsert_ops_without_unique(
                     engine,
                     catalog,
                     &tx.tenant_prefix,
@@ -857,7 +862,8 @@ fn commit_under_lock(
                     *expires_at,
                     old_doc.as_ref(),
                 )?;
-                for op in ops {
+                *deltas.entry(w.collection_id).or_insert(0) += w.doc_delta;
+                for op in w.ops {
                     insert_op(&mut key_map, op)?;
                 }
             }
@@ -880,11 +886,13 @@ fn commit_under_lock(
         // Empty commit: still succeeds with current seq (no WAL write).
         return Ok(engine.snapshot_owned().seq_upper());
     }
-    if key_map.len() > MAX_BATCH_KEYS {
+    // One slot is reserved for the catalog counter blob.
+    if key_map.len() + 1 > MAX_BATCH_KEYS {
         return Err(DocError::BatchTooLarge(key_map.len()));
     }
     let ops: Vec<BatchOp> = key_map.into_values().collect();
-    Ok(engine.write_batch(ops)?)
+    let deltas: Vec<(u32, i64)> = deltas.into_iter().collect();
+    store::commit_with_deltas(engine, catalog, ops, &deltas)
 }
 
 fn insert_op(map: &mut BTreeMap<Vec<u8>, BatchOp>, op: BatchOp) -> DocResult<()> {

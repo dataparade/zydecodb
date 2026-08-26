@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 use zydecodb_engine::SnapshotHandle;
 
-pub const MAX_PIPELINE_STAGES: usize = 2;
+pub const MAX_PIPELINE_STAGES: usize = 3;
 pub const MAX_ACCUMULATORS: usize = 16;
 pub const MAX_PIPELINE_BYTES: usize = 64 * 1024;
 
@@ -24,6 +24,8 @@ pub const DEFAULT_MAX_SCAN_DOCS: usize = 100_000;
 pub const DEFAULT_MAX_GROUPS: usize = 10_000;
 pub const DEFAULT_MAX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_MAX_MATCHES_PER_OUTER: usize = 1_000;
+pub const DEFAULT_MAX_HASH_BYTES: usize = 16 * 1024 * 1024;
 
 /// Per-request resource bounds for aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +39,10 @@ pub struct AggregationLimits {
     /// Wire-layer result limit. The core reports `result_bytes` but deliberately
     /// leaves enforcement to the eventual response encoder.
     pub max_result_bytes: usize,
+    /// Maximum inner documents attached to one outer document by `$lookup`.
+    pub max_matches_per_outer: usize,
+    /// Maximum estimated bytes retained by a hash-join build (inner side).
+    pub max_hash_bytes: usize,
 }
 
 impl Default for AggregationLimits {
@@ -46,15 +52,23 @@ impl Default for AggregationLimits {
             max_groups: DEFAULT_MAX_GROUPS,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
+            max_matches_per_outer: DEFAULT_MAX_MATCHES_PER_OUTER,
+            max_hash_bytes: DEFAULT_MAX_HASH_BYTES,
         }
     }
 }
 
 /// Parsed, validated aggregation pipeline.
+///
+/// Legal shapes (see `docs/DESIGN-joins.md`):
+/// `[$group]`, `[$match, $group]`, `[$lookup]`, `[$lookup, $group]`,
+/// `[$match, $lookup]`, `[$match, $lookup, $group]`. `$lookup` appears at
+/// most once and never after `$group`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregationPipeline {
     pub filter: Filter,
-    pub group: GroupSpec,
+    pub lookup: Option<LookupSpec>,
+    pub group: Option<GroupSpec>,
 }
 
 impl AggregationPipeline {
@@ -62,6 +76,16 @@ impl AggregationPipeline {
     pub fn parse(bytes: &[u8]) -> DocResult<Self> {
         parse_pipeline(bytes)
     }
+}
+
+/// A parsed `$lookup` stage: equality left-outer join against one collection
+/// under the same tenant prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupSpec {
+    pub from: String,
+    pub local_field: String,
+    pub foreign_field: String,
+    pub as_field: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,7 +153,9 @@ fn parse_field_reference(value: &Value, context: &str) -> DocResult<String> {
     Ok(path.to_string())
 }
 
-/// Parse exactly `[{$group: ...}]` or `[{$match: ...}, {$group: ...}]`.
+/// Parse the strict pipeline grammar: optional `$match`, optional `$lookup`,
+/// optional `$group` — at least one stage, `$lookup` at most once and never
+/// after `$group`, and a `$lookup`-free pipeline must end in `$group`.
 pub fn parse_pipeline(bytes: &[u8]) -> DocResult<AggregationPipeline> {
     if bytes.len() > MAX_PIPELINE_BYTES {
         return Err(bad_aggregation(format!(
@@ -142,22 +168,112 @@ pub fn parse_pipeline(bytes: &[u8]) -> DocResult<AggregationPipeline> {
         .as_array()
         .ok_or_else(|| bad_aggregation("pipeline must be a JSON array"))?;
     if stages.is_empty() || stages.len() > MAX_PIPELINE_STAGES {
+        return Err(bad_aggregation(format!(
+            "pipeline must have 1..={MAX_PIPELINE_STAGES} stages"
+        )));
+    }
+
+    let mut filter = Filter::MatchAll;
+    let mut lookup: Option<LookupSpec> = None;
+    let mut group: Option<GroupSpec> = None;
+    for (i, stage) in stages.iter().enumerate() {
+        let operator = stage_operator(stage)?;
+        match operator {
+            "$match" => {
+                if i != 0 {
+                    return Err(bad_aggregation("$match must be the first stage"));
+                }
+                filter = Filter::parse(one_stage(stage, "$match")?)?;
+            }
+            "$lookup" => {
+                if lookup.is_some() {
+                    return Err(bad_aggregation("$lookup may appear at most once"));
+                }
+                if group.is_some() {
+                    return Err(bad_aggregation("$lookup must not follow $group"));
+                }
+                lookup = Some(parse_lookup(one_stage(stage, "$lookup")?)?);
+            }
+            "$group" => {
+                if group.is_some() {
+                    return Err(bad_aggregation("$group may appear at most once"));
+                }
+                if i + 1 != stages.len() {
+                    return Err(bad_aggregation("$group must be the last stage"));
+                }
+                group = Some(parse_group(one_stage(stage, "$group")?)?);
+            }
+            other => {
+                return Err(bad_aggregation(format!("unsupported stage '{other}'")));
+            }
+        }
+    }
+    if lookup.is_none() && group.is_none() {
         return Err(bad_aggregation(
             "pipeline must contain one $group, optionally preceded by one $match",
         ));
     }
+    Ok(AggregationPipeline {
+        filter,
+        lookup,
+        group,
+    })
+}
 
-    let (filter, group_stage) = match stages.as_slice() {
-        [group] => (Filter::MatchAll, group),
-        [match_stage, group] => {
-            let match_value = one_stage(match_stage, "$match")?;
-            (Filter::parse(match_value)?, group)
+/// The single operator key of a stage object.
+fn stage_operator(stage: &Value) -> DocResult<&str> {
+    let object = stage
+        .as_object()
+        .ok_or_else(|| bad_aggregation("each stage must be an object"))?;
+    if object.len() != 1 {
+        return Err(bad_aggregation(
+            "each stage must contain exactly one operator",
+        ));
+    }
+    Ok(object.keys().next().unwrap())
+}
+
+/// Parse a `$lookup` body: exactly `from`, `localField`, `foreignField`,
+/// `as` — all required, no extras.
+fn parse_lookup(value: &Value) -> DocResult<LookupSpec> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| bad_aggregation("$lookup must be an object"))?;
+    for key in object.keys() {
+        if !matches!(key.as_str(), "from" | "localField" | "foreignField" | "as") {
+            return Err(bad_aggregation(format!("$lookup: unknown key '{key}'")));
         }
-        _ => unreachable!("stage count validated above"),
+    }
+    let required = |name: &str| -> DocResult<&str> {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad_aggregation(format!("$lookup requires a string '{name}'")))
     };
-    let group_value = one_stage(group_stage, "$group")?;
-    let group = parse_group(group_value)?;
-    Ok(AggregationPipeline { filter, group })
+    let from = required("from")?;
+    if from.is_empty() {
+        return Err(bad_aggregation("$lookup 'from' must be non-empty"));
+    }
+    let local_field = required("localField")?;
+    let foreign_field = required("foreignField")?;
+    let as_field = required("as")?;
+    for (name, path) in [
+        ("localField", local_field),
+        ("foreignField", foreign_field),
+        ("as", as_field),
+    ] {
+        if !valid_path(path) {
+            return Err(bad_aggregation(format!(
+                "$lookup '{name}' must be a valid dotted path"
+            )));
+        }
+    }
+    Ok(LookupSpec {
+        from: from.to_string(),
+        local_field: local_field.to_string(),
+        foreign_field: foreign_field.to_string(),
+        as_field: as_field.to_string(),
+    })
 }
 
 fn one_stage<'a>(stage: &'a Value, expected: &str) -> DocResult<&'a Value> {
@@ -428,6 +544,83 @@ fn with_stored_view<T>(
     f(ValueView::new(&zdoc))
 }
 
+/// Bounded group-state accumulator for a `$group` stage.
+struct GroupEngine<'a> {
+    spec: &'a GroupSpec,
+    limits: AggregationLimits,
+    groups: BTreeMap<Vec<u8>, GroupState>,
+    memory_bytes: usize,
+}
+
+impl<'a> GroupEngine<'a> {
+    fn new(spec: &'a GroupSpec, limits: AggregationLimits) -> Self {
+        Self {
+            spec,
+            limits,
+            groups: BTreeMap::new(),
+            memory_bytes: 0,
+        }
+    }
+
+    fn add(&mut self, root: ValueView<'_>) -> DocResult<()> {
+        let (encoded_key, id) = group_key(root, &self.spec.id)?;
+        if !self.groups.contains_key(&encoded_key) {
+            if self.groups.len() >= self.limits.max_groups {
+                return Err(bad_aggregation(format!(
+                    "group count exceeds {}",
+                    self.limits.max_groups
+                )));
+            }
+            let added = estimated_group_bytes(&encoded_key, &id, self.spec.accumulators.len())?;
+            let next_memory = self
+                .memory_bytes
+                .checked_add(added)
+                .ok_or_else(|| bad_aggregation("memory accounting overflow"))?;
+            if next_memory > self.limits.max_memory_bytes {
+                return Err(bad_aggregation(format!(
+                    "group state exceeds {} bytes",
+                    self.limits.max_memory_bytes
+                )));
+            }
+            self.memory_bytes = next_memory;
+            self.groups.insert(
+                encoded_key.clone(),
+                GroupState {
+                    id,
+                    accumulators: self
+                        .spec
+                        .accumulators
+                        .iter()
+                        .map(AccumulatorState::new)
+                        .collect(),
+                },
+            );
+        }
+
+        let state = self
+            .groups
+            .get_mut(&encoded_key)
+            .ok_or_else(|| DocError::Corrupt("aggregation group disappeared".into()))?;
+        for (accumulator, spec) in state.accumulators.iter_mut().zip(&self.spec.accumulators) {
+            accumulator.update(spec, root)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> DocResult<(Vec<Value>, usize)> {
+        let mut rows = Vec::with_capacity(self.groups.len());
+        for (_, group) in self.groups {
+            let mut row = Map::new();
+            row.insert("_id".into(), group.id);
+            for (state, spec) in group.accumulators.into_iter().zip(&self.spec.accumulators) {
+                row.insert(spec.output_field.clone(), state.into_value()?);
+            }
+            rows.push(Value::Object(row));
+        }
+        Ok((rows, self.memory_bytes))
+    }
+}
+
 /// Execute a parsed pipeline against a pinned snapshot.
 pub fn execute_aggregation(
     snap: &SnapshotHandle,
@@ -437,92 +630,98 @@ pub fn execute_aggregation(
     pipeline: &AggregationPipeline,
     limits: AggregationLimits,
 ) -> DocResult<AggregationResult> {
-    let mut groups: BTreeMap<Vec<u8>, GroupState> = BTreeMap::new();
-    let mut memory_bytes = 0usize;
+    let outer = catalog
+        .collection(prefix, collection)
+        .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
+    let inner = match &pipeline.lookup {
+        Some(spec) => Some(
+            catalog
+                .collection(prefix, &spec.from)
+                .ok_or_else(|| DocError::CollectionNotFound(spec.from.clone()))?,
+        ),
+        None => None,
+    };
+    execute_aggregation_coll(snap, prefix, outer, inner, pipeline, limits)
+}
 
-    let stats = query::visit_planned_matches_bounded(
-        snap,
-        catalog,
-        prefix,
-        collection,
-        &pipeline.filter,
-        limits.max_scan_docs,
-        |_doc_id, stored| {
-            with_stored_view(stored, |root| {
-                let (encoded_key, id) = group_key(root, &pipeline.group.id)?;
-                if !groups.contains_key(&encoded_key) {
-                    if groups.len() >= limits.max_groups {
-                        return Err(bad_aggregation(format!(
-                            "group count exceeds {}",
-                            limits.max_groups
-                        )));
+/// Execute a parsed pipeline against caller-resolved collection metadata, so
+/// the dispatch layer can release the catalog lock before the scan.
+///
+/// Both sides of a `$lookup` read under the SAME pinned snapshot — the
+/// single-snapshot consistency claim application-tier joins cannot make.
+pub fn execute_aggregation_coll(
+    snap: &SnapshotHandle,
+    prefix: &[u8],
+    outer: &crate::catalog::CollectionMeta,
+    inner: Option<&crate::catalog::CollectionMeta>,
+    pipeline: &AggregationPipeline,
+    limits: AggregationLimits,
+) -> DocResult<AggregationResult> {
+    let (rows, scanned_docs, matched_docs, memory_bytes) = match &pipeline.lookup {
+        Some(spec) => {
+            let inner = inner.ok_or_else(|| DocError::CollectionNotFound(spec.from.clone()))?;
+            let join = crate::join::execute_lookup(
+                snap,
+                prefix,
+                outer,
+                inner,
+                &pipeline.filter,
+                spec,
+                limits,
+            )?;
+            match &pipeline.group {
+                Some(spec) => {
+                    let mut engine = GroupEngine::new(spec, limits);
+                    for doc in join.docs {
+                        let zdoc = ZDocBuilder::from_value(&doc);
+                        engine.add(ValueView::new(&zdoc))?;
                     }
-                    let added = estimated_group_bytes(
-                        &encoded_key,
-                        &id,
-                        pipeline.group.accumulators.len(),
-                    )?;
-                    let next_memory = memory_bytes
-                        .checked_add(added)
-                        .ok_or_else(|| bad_aggregation("memory accounting overflow"))?;
-                    if next_memory > limits.max_memory_bytes {
-                        return Err(bad_aggregation(format!(
-                            "group state exceeds {} bytes",
-                            limits.max_memory_bytes
-                        )));
-                    }
-                    memory_bytes = next_memory;
-                    groups.insert(
-                        encoded_key.clone(),
-                        GroupState {
-                            id,
-                            accumulators: pipeline
-                                .group
-                                .accumulators
-                                .iter()
-                                .map(AccumulatorState::new)
-                                .collect(),
-                        },
-                    );
+                    let (rows, memory_bytes) = engine.finish()?;
+                    (
+                        rows,
+                        join.stats.candidates,
+                        join.stats.matches,
+                        memory_bytes,
+                    )
                 }
-
-                let state = groups
-                    .get_mut(&encoded_key)
-                    .ok_or_else(|| DocError::Corrupt("aggregation group disappeared".into()))?;
-                for (accumulator, spec) in state
-                    .accumulators
-                    .iter_mut()
-                    .zip(&pipeline.group.accumulators)
-                {
-                    accumulator.update(spec, root)?;
-                }
-                Ok(())
-            })?;
-            Ok(true)
-        },
-    )?;
-
-    let mut rows = Vec::with_capacity(groups.len());
-    for (_, group) in groups {
-        let mut row = Map::new();
-        row.insert("_id".into(), group.id);
-        for (state, spec) in group
-            .accumulators
-            .into_iter()
-            .zip(&pipeline.group.accumulators)
-        {
-            row.insert(spec.output_field.clone(), state.into_value()?);
+                None => (
+                    join.docs,
+                    join.stats.candidates,
+                    join.stats.matches,
+                    join.memory_bytes,
+                ),
+            }
         }
-        rows.push(Value::Object(row));
-    }
+        None => {
+            let spec = pipeline
+                .group
+                .as_ref()
+                .ok_or_else(|| bad_aggregation("pipeline requires a $group stage"))?;
+            let mut engine = GroupEngine::new(spec, limits);
+            let stats = query::visit_planned_matches_bounded_coll(
+                snap,
+                prefix,
+                outer,
+                &pipeline.filter,
+                limits.max_scan_docs,
+                |_doc_id, stored| {
+                    with_stored_view(stored, |root| engine.add(root))?;
+                    Ok(true)
+                },
+            )?;
+            let (rows, memory_bytes) = engine.finish()?;
+            (rows, stats.candidates, stats.matches, memory_bytes)
+        }
+    };
+
     let result_bytes = serde_json::to_vec(&rows)
         .map_err(|e| DocError::Corrupt(format!("aggregation result serialization failed: {e}")))?
         .len();
 
     Ok(AggregationResult {
         rows,
-        scanned_docs: stats.candidates,
-        matched_docs: stats.matches,
+        scanned_docs,
+        matched_docs,
         memory_bytes,
         result_bytes,
     })
@@ -548,8 +747,10 @@ mod tests {
             }}
         ]))
         .unwrap();
-        assert_eq!(pipeline.group.id, GroupId::Field("team.name".into()));
-        assert_eq!(pipeline.group.accumulators.len(), 2);
+        let group = pipeline.group.as_ref().unwrap();
+        assert_eq!(group.id, GroupId::Field("team.name".into()));
+        assert_eq!(group.accumulators.len(), 2);
+        assert!(pipeline.lookup.is_none());
 
         assert!(parse(
             json!([{"$match": {}}, {"$group": {"_id": null}}, {"$group": {"_id": null}}])
@@ -558,6 +759,110 @@ mod tests {
         assert!(parse(json!([{"$group": {"_id": null}}, {"$match": {}}])).is_err());
         assert!(parse(json!([{"$match": {}}])).is_err());
         assert!(parse(json!([{"$sort": {}}, {"$group": {"_id": null}}])).is_err());
+    }
+
+    #[test]
+    fn parses_all_six_legal_lookup_orders() {
+        let lookup = json!({"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits"
+        }});
+        let group = json!({"$group": {"_id": null, "n": {"$count": {}}}});
+        let match_stage = json!({"$match": {"active": true}});
+
+        // [$group], [$match, $group] still parse with no lookup.
+        assert!(parse(json!([group.clone()])).unwrap().lookup.is_none());
+        assert!(parse(json!([match_stage.clone(), group.clone()]))
+            .unwrap()
+            .lookup
+            .is_none());
+
+        // [$lookup]
+        let p = parse(json!([lookup.clone()])).unwrap();
+        let spec = p.lookup.as_ref().unwrap();
+        assert_eq!(spec.from, "orders");
+        assert_eq!(spec.local_field, "_id");
+        assert_eq!(spec.foreign_field, "user_id");
+        assert_eq!(spec.as_field, "hits");
+        assert!(p.group.is_none());
+
+        // [$lookup, $group]
+        let p = parse(json!([lookup.clone(), group.clone()])).unwrap();
+        assert!(p.lookup.is_some() && p.group.is_some());
+        // [$match, $lookup]
+        let p = parse(json!([match_stage.clone(), lookup.clone()])).unwrap();
+        assert!(p.lookup.is_some() && p.group.is_none());
+        // [$match, $lookup, $group]
+        let p = parse(json!([match_stage.clone(), lookup.clone(), group.clone()])).unwrap();
+        assert!(p.lookup.is_some() && p.group.is_some());
+    }
+
+    #[test]
+    fn rejects_illegal_lookup_pipelines() {
+        let lookup = json!({"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits"
+        }});
+        let group = json!({"$group": {"_id": null}});
+        let match_stage = json!({"$match": {}});
+
+        // $lookup after $group
+        assert!(parse(json!([group.clone(), lookup.clone()])).is_err());
+        // second $lookup
+        assert!(parse(json!([lookup.clone(), lookup.clone()])).is_err());
+        // $match after $lookup
+        assert!(parse(json!([lookup.clone(), match_stage.clone()])).is_err());
+        // four stages
+        assert!(parse(json!([
+            match_stage.clone(),
+            lookup.clone(),
+            group.clone(),
+            group.clone()
+        ]))
+        .is_err());
+        // bare $match
+        assert!(parse(json!([match_stage.clone()])).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_lookup_stages() {
+        let good = json!({"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits"
+        }});
+        assert!(parse(json!([good])).is_ok());
+
+        // unknown key
+        assert!(parse(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+            "pipeline": []
+        }}]))
+        .is_err());
+        // missing required fields
+        for missing in ["from", "localField", "foreignField", "as"] {
+            let mut body = serde_json::Map::new();
+            body.insert("from".into(), json!("orders"));
+            body.insert("localField".into(), json!("_id"));
+            body.insert("foreignField".into(), json!("user_id"));
+            body.insert("as".into(), json!("hits"));
+            body.remove(missing);
+            assert!(
+                parse(json!([{"$lookup": body}])).is_err(),
+                "missing {missing}"
+            );
+        }
+        // bad paths
+        assert!(parse(json!([{"$lookup": {
+            "from": "orders", "localField": "a..b", "foreignField": "user_id", "as": "hits"
+        }}]))
+        .is_err());
+        assert!(parse(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "$x", "as": "hits"
+        }}]))
+        .is_err());
+        assert!(parse(json!([{"$lookup": {
+            "from": "", "localField": "_id", "foreignField": "user_id", "as": "hits"
+        }}]))
+        .is_err());
+        // multi-operator stage object
+        assert!(parse(json!([{"$lookup": {}, "$match": {}}])).is_err());
     }
 
     #[test]

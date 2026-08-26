@@ -50,7 +50,7 @@ fn seed() -> (TempDir, Engine, Catalog) {
             let zdoc = ZDocBuilder::from_value(&document);
             store::upsert(
                 &mut engine,
-                &catalog,
+                &mut catalog,
                 PREFIX,
                 "sales",
                 index.to_string().as_bytes(),
@@ -62,7 +62,7 @@ fn seed() -> (TempDir, Engine, Catalog) {
             let json = serde_json::to_vec(&document).unwrap();
             store::upsert(
                 &mut engine,
-                &catalog,
+                &mut catalog,
                 PREFIX,
                 "sales",
                 index.to_string().as_bytes(),
@@ -77,7 +77,7 @@ fn seed() -> (TempDir, Engine, Catalog) {
 
 #[test]
 fn streams_grouped_sum_and_count_in_scalar_order() {
-    let (_dir, engine, catalog) = seed();
+    let (_dir, engine, mut catalog) = seed();
     let pipeline = pipeline(json!([
         {"$match": {"active": true, "include": true}},
         {"$group": {
@@ -88,7 +88,7 @@ fn streams_grouped_sum_and_count_in_scalar_order() {
     ]));
     let result = execute_aggregation(
         &engine.snapshot_owned(),
-        &catalog,
+        &mut catalog,
         PREFIX,
         "sales",
         &pipeline,
@@ -114,7 +114,7 @@ fn streams_grouped_sum_and_count_in_scalar_order() {
 
 #[test]
 fn scan_limit_counts_index_candidates_before_residual_filtering() {
-    let (_dir, engine, catalog) = seed();
+    let (_dir, engine, mut catalog) = seed();
     let pipeline = pipeline(json!([
         {"$match": {"active": true, "include": false}},
         {"$group": {"_id": null, "count": {"$count": {}}}}
@@ -125,7 +125,7 @@ fn scan_limit_counts_index_candidates_before_residual_filtering() {
     };
     let error = execute_aggregation(
         &engine.snapshot_owned(),
-        &catalog,
+        &mut catalog,
         PREFIX,
         "sales",
         &pipeline,
@@ -150,7 +150,7 @@ fn rejects_non_scalar_group_keys_and_numeric_overflow() {
         let zdoc = ZDocBuilder::from_value(&document);
         store::upsert(
             &mut engine,
-            &catalog,
+            &mut catalog,
             PREFIX,
             "values",
             id.as_bytes(),
@@ -166,7 +166,7 @@ fn rejects_non_scalar_group_keys_and_numeric_overflow() {
     ]));
     assert!(execute_aggregation(
         &engine.snapshot_owned(),
-        &catalog,
+        &mut catalog,
         PREFIX,
         "values",
         &object_key,
@@ -182,7 +182,7 @@ fn rejects_non_scalar_group_keys_and_numeric_overflow() {
     ]));
     assert!(execute_aggregation(
         &engine.snapshot_owned(),
-        &catalog,
+        &mut catalog,
         PREFIX,
         "values",
         &overflow,
@@ -195,14 +195,14 @@ fn rejects_non_scalar_group_keys_and_numeric_overflow() {
 
 #[test]
 fn enforces_group_and_memory_limits() {
-    let (_dir, engine, catalog) = seed();
+    let (_dir, engine, mut catalog) = seed();
     let pipeline = pipeline(json!([
         {"$group": {"_id": "$team", "count": {"$count": {}}}}
     ]));
 
     let group_error = execute_aggregation(
         &engine.snapshot_owned(),
-        &catalog,
+        &mut catalog,
         PREFIX,
         "sales",
         &pipeline,
@@ -216,7 +216,7 @@ fn enforces_group_and_memory_limits() {
 
     let memory_error = execute_aggregation(
         &engine.snapshot_owned(),
-        &catalog,
+        &mut catalog,
         PREFIX,
         "sales",
         &pipeline,
@@ -233,13 +233,13 @@ fn enforces_group_and_memory_limits() {
 
 #[test]
 fn enforces_result_byte_limit_on_encode_path() {
-    let (_dir, engine, catalog) = seed();
+    let (_dir, engine, mut catalog) = seed();
     let pipeline = pipeline(json!([
         {"$group": {"_id": "$team", "count": {"$count": {}}}}
     ]));
     let result = execute_aggregation(
         &engine.snapshot_owned(),
-        &catalog,
+        &mut catalog,
         PREFIX,
         "sales",
         &pipeline,

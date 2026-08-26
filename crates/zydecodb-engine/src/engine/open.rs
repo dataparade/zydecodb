@@ -223,6 +223,7 @@ impl Engine {
             active_wal: None,
             active_wal_size: 0,
             in_flight_wal_bytes: 0,
+            flush_in_flight: false,
             sealed_segment_max_seq,
             wal_sync: crate::wal_sync::WalSync::new(max_seq_seen),
             group_commit: true,

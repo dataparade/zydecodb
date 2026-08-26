@@ -102,6 +102,8 @@ enabled = false
 # max_scan_docs = 100000
 # max_groups = 10000
 # max_memory_bytes = 16777216   # 16 MiB
+# max_matches_per_outer = 1000
+# max_hash_bytes = 16777216     # 16 MiB
 # max_result_bytes = 4194304    # 4 MiB
 
 # Collection change streams (`Watch = 0x2C`). Disabled by default.

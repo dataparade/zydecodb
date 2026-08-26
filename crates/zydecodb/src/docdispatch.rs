@@ -10,7 +10,9 @@ use crate::commit::CommitCoordinator;
 use crate::security::keys::KeyRole;
 use crate::security::{SecurityRuntime, SessionState};
 use crate::shared::{SharedCatalog, SharedEngine};
-use zydecodb_document::aggregation::{execute_aggregation, AggregationLimits, AggregationPipeline};
+use zydecodb_document::aggregation::{
+    execute_aggregation_coll, AggregationLimits, AggregationPipeline,
+};
 use zydecodb_document::catalog::Catalog;
 use zydecodb_document::error::{DocError, DocResult};
 use zydecodb_document::filter::Filter;
@@ -50,12 +52,14 @@ fn apply_pending_slowdown(slowdown: std::time::Duration) {
 fn with_catalog_engine_write<R>(
     engine: &SharedEngine,
     catalog: &SharedCatalog,
-    f: impl FnOnce(&Catalog, &mut Engine) -> R,
+    f: impl FnOnce(&mut Catalog, &mut Engine) -> R,
 ) -> R {
     let (r, slowdown) = {
-        let cat = catalog.read().unwrap();
+        // Write lock: mutating paths update catalog counters in the same
+        // engine critical section as the data write.
+        let mut cat = catalog.write().unwrap();
         let mut guard = engine.write();
-        let r = f(&cat, &mut guard);
+        let r = f(&mut cat, &mut guard);
         let s = guard.take_write_slowdown();
         (r, s)
     };
@@ -731,8 +735,30 @@ fn aggregate_cmd(
         let guard = engine.read();
         guard.snapshot_owned()
     };
-    let cat = catalog.read().unwrap();
-    let result = execute_aggregation(&snap, &cat, prefix, &p.collection, &pipeline, limits)?;
+    // Clone the small CollectionMetas under the catalog read lock so a long
+    // aggregation/join scan does not block DDL for its entire duration.
+    let (outer, inner) = {
+        let cat = catalog.read().unwrap();
+        let outer = cat.collection(prefix, &p.collection).cloned();
+        let inner = pipeline
+            .lookup
+            .as_ref()
+            .map(|spec| cat.collection(prefix, &spec.from).cloned());
+        (outer, inner)
+    };
+    let Some(outer) = outer else {
+        return Err(DocError::CollectionNotFound(p.collection));
+    };
+    let inner = match inner {
+        Some(Some(c)) => Some(c),
+        Some(None) => {
+            let spec = pipeline.lookup.as_ref().unwrap();
+            return Err(DocError::CollectionNotFound(spec.from.clone()));
+        }
+        None => None,
+    };
+    let result =
+        execute_aggregation_coll(&snap, prefix, &outer, inner.as_ref(), &pipeline, limits)?;
     let body = wire::encode_aggregate_response(&result.rows, limits.max_result_bytes)?;
     Ok(ResponseEnvelope::ok(body))
 }
@@ -825,13 +851,13 @@ mod tests {
         // Seed documents directly through the store (buffered WAL append; no
         // commit wait needed — the data is visible from the memtable at once).
         {
-            let cat = catalog.read().unwrap();
+            let mut cat = catalog.write().unwrap();
             let mut e = engine.write();
             for id in seed_ids {
                 let body = format!("{{\"_id\":\"{id}\",\"n\":1}}");
                 store::upsert(
                     &mut e,
-                    &cat,
+                    &mut cat,
                     &prefix,
                     "c",
                     id.as_bytes(),

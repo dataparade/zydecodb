@@ -6,6 +6,37 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-26
+
+Bounded `$lookup` on the existing `Aggregate` opcode. Not Mongo aggregation
+compatibility — equality left-outer, one stage, two physical operators, hard
+caps. See [`docs/DESIGN-joins.md`](docs/DESIGN-joins.md) and
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md#aggregation).
+
+### Server
+
+- `$lookup` as an aggregation stage (`from` / `localField` / `foreignField` /
+  `as`). Legal pipelines: `[$group]`, `[$match, $group]`, `[$lookup]`,
+  `[$lookup, $group]`, `[$match, $lookup]`, `[$match, $lookup, $group]`.
+- Physical operators: indexed nested-loop when the inner `foreignField` is
+  `_id` or a leading-field index; bounded hash join when there is no index
+  and `inner.doc_count <= max_scan_docs`. Otherwise a named error — never a
+  per-outer collection scan.
+- Crash-atomic catalog `doc_count` / `entry_count` (catalog blob in the same
+  WAL record as the data). Durable TTL sweep keeps counters exact.
+- New `[aggregation]` knobs: `max_matches_per_outer` (default 1000),
+  `max_hash_bytes` (default 16 MiB). `MAX_PIPELINE_STAGES` is 3.
+- Flush visibility: an in-flight memtable flush no longer drops that
+  memtable from the live read set before its SSTable is published
+  (`flush_in_flight`).
+
+### Compatibility
+
+- Wire `Aggregate = 0x2B` is unchanged. Older 1.x drivers already send
+  pipeline bytes; `$lookup` is a server-side stage. 1.0 servers reject
+  `$lookup` pipelines as before.
+- `$unwind`, multi-`$lookup`, and `pipeline:` / `let:` remain unsupported.
+
 ## [1.0.0] - 2026-08-18
 
 First stable 1.0. The compatibility promise is in

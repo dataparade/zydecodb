@@ -61,6 +61,8 @@ impl SecurityRuntime {
                 max_groups: config.aggregation.max_groups,
                 max_memory_bytes: config.aggregation.max_memory_bytes,
                 max_result_bytes: config.aggregation.max_result_bytes,
+                max_matches_per_outer: config.aggregation.max_matches_per_outer,
+                max_hash_bytes: config.aggregation.max_hash_bytes,
             },
             change_streams: config.change_streams.clone(),
             watch_registry: Arc::new(WatchRegistry::default()),

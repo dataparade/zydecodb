@@ -17,6 +17,7 @@
 
 use crate::catalog::CollectionMeta;
 use crate::encoding;
+use crate::error::{DocError, DocResult};
 use crate::filter::{Atom, Filter};
 use crate::keys;
 use serde_json::Value;
@@ -132,6 +133,70 @@ pub fn plan(filter: &Filter, prefix: &[u8], coll: &CollectionMeta) -> AccessPath
     }
 }
 
+/// Value-independent: does `field` have a usable equality-probe index?
+///
+/// True for the virtual `_id` index, or any index whose **leading** field is
+/// `field` (a compound index on `[field, …]` counts; one on `[other, field]`
+/// does not). Used by `$lookup` strategy selection before any outer document
+/// is examined.
+pub fn has_equality_index(coll: &CollectionMeta, field: &str) -> bool {
+    field == ID_FIELD || equality_index(coll, field).is_some()
+}
+
+fn equality_index<'a>(
+    coll: &'a CollectionMeta,
+    field: &str,
+) -> Option<&'a crate::catalog::IndexMeta> {
+    coll.indexes
+        .iter()
+        .find(|i| i.fields.first().map(String::as_str) == Some(field))
+}
+
+/// Bind an equality probe `field == value` to an [`AccessPath`].
+///
+/// Unlike [`plan`], this NEVER falls back to a collection scan: without a
+/// usable index the join would degenerate into a full-scan-per-outer-
+/// document. Callers that want a hash join instead must consult
+/// [`has_equality_index`] first and not call this. `value` must be scalar;
+/// callers handle missing/non-scalar local values before probing (left-outer
+/// empty array).
+pub fn plan_equality(
+    prefix: &[u8],
+    coll: &CollectionMeta,
+    field: &str,
+    value: &Value,
+) -> DocResult<AccessPath> {
+    if field == ID_FIELD {
+        if let Value::String(s) = value {
+            return Ok(AccessPath::ById(s.as_bytes().to_vec()));
+        }
+        return Err(DocError::BadFilter(
+            "lookup: '_id' join value must be a string".into(),
+        ));
+    }
+    if !is_scalar(value) {
+        return Err(DocError::BadFilter(
+            "lookup: join value must be scalar".into(),
+        ));
+    }
+    let Some(idx) = equality_index(coll, field) else {
+        return Err(DocError::BadFilter(format!(
+            "lookup: no index on '{field}' for collection '{}'; create an index with '{field}' as the leading field",
+            coll.name
+        )));
+    };
+    let mut constraints: HashMap<String, Constraint> = HashMap::new();
+    constraints.insert(
+        field.to_string(),
+        Constraint {
+            eq: Some(value.clone()),
+            lo: None,
+            hi: None,
+        },
+    );
+    Ok(build_index_scan(prefix, coll.id, idx, 1, &constraints))
+}
+
 fn build_index_scan(
     prefix: &[u8],
     collection_id: u32,
@@ -213,6 +278,7 @@ mod tests {
             prefix: b"\x01".to_vec(),
             name: "users".into(),
             indexes,
+            doc_count: 0,
         }
     }
 
@@ -224,6 +290,7 @@ mod tests {
             directions: vec![true; fields.len()],
             unique: false,
             expire_after_seconds: None,
+            entry_count: 0,
         }
     }
 
@@ -302,5 +369,20 @@ mod tests {
             plan_for(json!({"$or": [{"age": 1}, {"age": 2}]}), &coll),
             AccessPath::CollectionScan
         );
+    }
+
+    #[test]
+    fn equality_index_resolution_is_value_independent() {
+        let empty = coll_with(vec![]);
+        assert!(has_equality_index(&empty, ID_FIELD));
+        assert!(!has_equality_index(&empty, "age"));
+
+        let leading = coll_with(vec![idx(0, "by_age", &["age"])]);
+        assert!(has_equality_index(&leading, "age"));
+        assert!(!has_equality_index(&leading, "name"));
+
+        let compound = coll_with(vec![idx(0, "by_city_age", &["city", "age"])]);
+        assert!(has_equality_index(&compound, "city"));
+        assert!(!has_equality_index(&compound, "age"));
     }
 }

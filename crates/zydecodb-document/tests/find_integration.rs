@@ -53,7 +53,7 @@ fn seed(indexed: bool) -> (TempDir, Engine, Catalog) {
     ];
     for (id, doc) in docs {
         let body = serde_json::to_vec(&doc).unwrap();
-        store::upsert(&mut e, &cat, PREFIX, "people", id, &body, false).unwrap();
+        store::upsert(&mut e, &mut cat, PREFIX, "people", id, &body, false).unwrap();
     }
     (dir, e, cat)
 }
@@ -86,32 +86,32 @@ fn run(e: &Engine, cat: &Catalog, s: &FindSpec) -> query::QueryPage {
 
 #[test]
 fn find_unindexed_field_uses_collection_scan() {
-    let (_d, e, cat) = seed(false);
+    let (_d, e, mut cat) = seed(false);
     let mut s = spec(json!({"city": "NOLA"}));
     s.sort = vec![("age".into(), true)];
-    let page = run(&e, &cat, &s);
+    let page = run(&e, &mut cat, &s);
     assert_eq!(names(&page), vec!["Bo", "Cy"]);
 }
 
 #[test]
 fn find_indexed_range_returns_sorted() {
-    let (_d, e, cat) = seed(true);
+    let (_d, e, mut cat) = seed(true);
     let mut s = spec(json!({"age": {"$gte": 30}}));
     s.sort = vec![("age".into(), true)];
-    let page = run(&e, &cat, &s);
+    let page = run(&e, &mut cat, &s);
     assert_eq!(names(&page), vec!["Ada", "Di", "Cy"]);
 }
 
 #[test]
 fn find_by_id_fast_path() {
-    let (_d, e, cat) = seed(true);
-    let page = run(&e, &cat, &spec(json!({"_id": "c"})));
+    let (_d, e, mut cat) = seed(true);
+    let page = run(&e, &mut cat, &spec(json!({"_id": "c"})));
     assert_eq!(names(&page), vec!["Cy"]);
 }
 
 #[test]
 fn sort_skip_limit_projection() {
-    let (_d, e, cat) = seed(false);
+    let (_d, e, mut cat) = seed(false);
     let s = FindSpec {
         filter: Filter::MatchAll,
         sort: vec![("age".into(), false)], // descending
@@ -120,7 +120,7 @@ fn sort_skip_limit_projection() {
         limit: 2,
         cursor: None,
     };
-    let page = run(&e, &cat, &s);
+    let page = run(&e, &mut cat, &s);
     // ages desc: Cy(40), Di(35), Ada(30), Bo(25); skip 1, take 2 -> Di, Ada
     assert_eq!(names(&page), vec!["Di", "Ada"]);
     // Projection kept only name (+ _id, absent from body here).
@@ -131,7 +131,7 @@ fn sort_skip_limit_projection() {
 
 #[test]
 fn pagination_key_mode_over_index() {
-    let (_d, e, cat) = seed(true);
+    let (_d, e, mut cat) = seed(true);
     // No sort + index path => KEY cursor mode.
     let mut all = Vec::new();
     let mut cursor = None;
@@ -144,7 +144,7 @@ fn pagination_key_mode_over_index() {
             limit: 2,
             cursor: cursor.clone(),
         };
-        let page = run(&e, &cat, &s);
+        let page = run(&e, &mut cat, &s);
         all.extend(names(&page));
         match page.next_cursor {
             Some(c) => cursor = Some(c),
@@ -157,7 +157,7 @@ fn pagination_key_mode_over_index() {
 
 #[test]
 fn pagination_offset_mode_with_sort() {
-    let (_d, e, cat) = seed(false);
+    let (_d, e, mut cat) = seed(false);
     let mut all = Vec::new();
     let mut cursor = None;
     loop {
@@ -169,7 +169,7 @@ fn pagination_offset_mode_with_sort() {
             limit: 1,
             cursor: cursor.clone(),
         };
-        let page = run(&e, &cat, &s);
+        let page = run(&e, &mut cat, &s);
         all.extend(names(&page));
         match page.next_cursor {
             Some(c) => cursor = Some(c),
@@ -191,7 +191,7 @@ fn run_rr(e: &Engine, cat: &Catalog, s: &FindSpec) -> query::QueryPage {
 
 #[test]
 fn pagination_is_repeatable_read_across_inserts() {
-    let (_d, mut e, cat) = seed(true);
+    let (_d, mut e, mut cat) = seed(true);
     let page_spec = |cursor: Option<Vec<u8>>| FindSpec {
         filter: Filter::parse(&json!({"age": {"$gte": 0}})).unwrap(),
         sort: vec![],
@@ -202,7 +202,7 @@ fn pagination_is_repeatable_read_across_inserts() {
     };
 
     // Page 1 (key-cursor mode over the by_age index): Bo(25), Ada(30).
-    let page1 = run_rr(&e, &cat, &page_spec(None));
+    let page1 = run_rr(&e, &mut cat, &page_spec(None));
     assert_eq!(names(&page1), vec!["Bo", "Ada"]);
     let cursor = page1.next_cursor.clone().expect("more pages remain");
 
@@ -213,14 +213,14 @@ fn pagination_is_repeatable_read_across_inserts() {
         (b"f".as_slice(), json!({"name": "Fi", "age": 33})),
     ] {
         let body = serde_json::to_vec(&doc).unwrap();
-        store::upsert(&mut e, &cat, PREFIX, "people", id, &body, false).unwrap();
+        store::upsert(&mut e, &mut cat, PREFIX, "people", id, &body, false).unwrap();
     }
 
     // Drain remaining pages from the pinned snapshot.
     let mut all = names(&page1);
     let mut cursor = Some(cursor);
     while let Some(c) = cursor.take() {
-        let page = run_rr(&e, &cat, &page_spec(Some(c)));
+        let page = run_rr(&e, &mut cat, &page_spec(Some(c)));
         all.extend(names(&page));
         cursor = page.next_cursor;
     }
@@ -231,13 +231,13 @@ fn pagination_is_repeatable_read_across_inserts() {
 
 #[test]
 fn update_one_moves_index_entry() {
-    let (_d, mut e, cat) = seed(true);
+    let (_d, mut e, mut cat) = seed(true);
     let upd = UpdateDoc::parse(&json!({"$inc": {"age": 5}})).unwrap();
     let id = {
         let snap = e.snapshot_owned();
         query::find_first_id(
             &snap,
-            &cat,
+            &mut cat,
             PREFIX,
             "people",
             &Filter::parse(&json!({"name":"Bo"})).unwrap(),
@@ -245,34 +245,34 @@ fn update_one_moves_index_entry() {
         .unwrap()
         .unwrap()
     };
-    assert!(update::apply_to_id(&mut e, &cat, PREFIX, "people", &id, &upd).unwrap());
+    assert!(update::apply_to_id(&mut e, &mut cat, PREFIX, "people", &id, &upd).unwrap());
 
     // Bo was 25, now 30; querying age 30 by index returns both Ada and Bo.
     let mut s = spec(json!({"age": 30}));
     s.sort = vec![("name".into(), true)];
-    let page = run(&e, &cat, &s);
+    let page = run(&e, &mut cat, &s);
     assert_eq!(names(&page), vec!["Ada", "Bo"]);
 }
 
 #[test]
 fn update_many_and_count_and_distinct() {
-    let (_d, mut e, cat) = seed(true);
+    let (_d, mut e, mut cat) = seed(true);
     let filter = Filter::parse(&json!({"city": "NOLA"})).unwrap();
     let upd = UpdateDoc::parse(&json!({"$set": {"city": "New Orleans"}})).unwrap();
 
     let ids = {
         let snap = e.snapshot_owned();
-        query::find_ids(&snap, &cat, PREFIX, "people", &filter, 1000).unwrap()
+        query::find_ids(&snap, &mut cat, PREFIX, "people", &filter, 1000).unwrap()
     };
     assert_eq!(ids.len(), 2);
     for id in &ids {
-        update::apply_to_id(&mut e, &cat, PREFIX, "people", id, &upd).unwrap();
+        update::apply_to_id(&mut e, &mut cat, PREFIX, "people", id, &upd).unwrap();
     }
 
     let snap = e.snapshot_owned();
     let n = query::count(
         &snap,
-        &cat,
+        &mut cat,
         PREFIX,
         "people",
         &Filter::parse(&json!({"city":"New Orleans"})).unwrap(),
@@ -281,7 +281,7 @@ fn update_many_and_count_and_distinct() {
     assert_eq!(n, 2);
 
     let mut cities =
-        query::distinct(&snap, &cat, PREFIX, "people", "city", &Filter::MatchAll).unwrap();
+        query::distinct(&snap, &mut cat, PREFIX, "people", "city", &Filter::MatchAll).unwrap();
     cities.sort_by_key(|v| v.as_str().unwrap().to_string());
     let cities: Vec<String> = cities
         .iter()
@@ -292,17 +292,17 @@ fn update_many_and_count_and_distinct() {
 
 #[test]
 fn delete_many_removes_matches() {
-    let (_d, mut e, cat) = seed(true);
+    let (_d, mut e, mut cat) = seed(true);
     let filter = Filter::parse(&json!({"age": {"$lt": 35}})).unwrap();
     let ids = {
         let snap = e.snapshot_owned();
-        query::find_ids(&snap, &cat, PREFIX, "people", &filter, 1000).unwrap()
+        query::find_ids(&snap, &mut cat, PREFIX, "people", &filter, 1000).unwrap()
     };
     for id in &ids {
-        store::delete(&mut e, &cat, PREFIX, "people", id).unwrap();
+        store::delete(&mut e, &mut cat, PREFIX, "people", id).unwrap();
     }
     let snap = e.snapshot_owned();
-    let remaining = query::count(&snap, &cat, PREFIX, "people", &Filter::MatchAll).unwrap();
+    let remaining = query::count(&snap, &mut cat, PREFIX, "people", &Filter::MatchAll).unwrap();
     assert_eq!(remaining, 2); // Cy(40), Di(35)
 }
 
@@ -330,7 +330,7 @@ fn owner_sort_desc_streams_from_asc_index_via_reverse_scan() {
         (b"d", "u2", 9),
     ] {
         let body = serde_json::to_vec(&json!({"ownerId": owner, "updatedAt": ts})).unwrap();
-        store::upsert(&mut e, &cat, PREFIX, "events", id, &body, false).unwrap();
+        store::upsert(&mut e, &mut cat, PREFIX, "events", id, &body, false).unwrap();
     }
 
     let s = FindSpec {
@@ -342,8 +342,15 @@ fn owner_sort_desc_streams_from_asc_index_via_reverse_scan() {
         cursor: None,
     };
     let snap = e.snapshot_owned();
-    let page =
-        query::execute_find(&snap, &cat, PREFIX, "events", &s, query::MAX_SORT_BUFFER).unwrap();
+    let page = query::execute_find(
+        &snap,
+        &mut cat,
+        PREFIX,
+        "events",
+        &s,
+        query::MAX_SORT_BUFFER,
+    )
+    .unwrap();
     let ids: Vec<_> = page.rows.iter().map(|r| r.doc_id.clone()).collect();
     assert_eq!(ids, vec![b"b".to_vec(), b"c".to_vec(), b"a".to_vec()]);
     // Key-mode: no offset cursor (empty sort buffer path).
@@ -370,7 +377,7 @@ fn mixed_direction_index_streams_forward() {
 
     for (id, owner, ts) in [(b"a", "u1", 1), (b"b", "u1", 3), (b"c", "u1", 2)] {
         let body = serde_json::to_vec(&json!({"ownerId": owner, "updatedAt": ts})).unwrap();
-        store::upsert(&mut e, &cat, PREFIX, "events", id, &body, false).unwrap();
+        store::upsert(&mut e, &mut cat, PREFIX, "events", id, &body, false).unwrap();
     }
 
     let s = FindSpec {
@@ -382,8 +389,15 @@ fn mixed_direction_index_streams_forward() {
         cursor: None,
     };
     let snap = e.snapshot_owned();
-    let page1 =
-        query::execute_find(&snap, &cat, PREFIX, "events", &s, query::MAX_SORT_BUFFER).unwrap();
+    let page1 = query::execute_find(
+        &snap,
+        &mut cat,
+        PREFIX,
+        "events",
+        &s,
+        query::MAX_SORT_BUFFER,
+    )
+    .unwrap();
     assert_eq!(
         page1
             .rows
@@ -397,8 +411,15 @@ fn mixed_direction_index_streams_forward() {
         cursor: Some(cursor),
         ..s
     };
-    let page2 =
-        query::execute_find(&snap, &cat, PREFIX, "events", &s2, query::MAX_SORT_BUFFER).unwrap();
+    let page2 = query::execute_find(
+        &snap,
+        &mut cat,
+        PREFIX,
+        "events",
+        &s2,
+        query::MAX_SORT_BUFFER,
+    )
+    .unwrap();
     assert_eq!(
         page2
             .rows

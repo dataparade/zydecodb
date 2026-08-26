@@ -77,6 +77,9 @@ tls.key
 !/scripts/crash-soak.sh
 !/scripts/ref-workloads.sh
 !/scripts/bench-regression.sh
+!/scripts/bench-join.sh
+!/scripts/bench-join-mongo.sh
+!/scripts/bench-join-mongo.py
 !/scripts/bisect-amp.sh
 !/scripts/model-repro.sh
 !/scripts/model-nightly.sh

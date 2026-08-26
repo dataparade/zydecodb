@@ -35,6 +35,10 @@ pub struct IndexMeta {
     /// `field_unix_millis + expire_after_seconds * 1000`. At most one per collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expire_after_seconds: Option<u64>,
+    /// Exact count of live index entries. Maintained in the same engine-lock
+    /// critical section as document writes; `0` in old catalog blobs.
+    #[serde(default)]
+    pub entry_count: u64,
 }
 
 impl IndexMeta {
@@ -59,6 +63,10 @@ pub struct CollectionMeta {
     pub prefix: Vec<u8>,
     pub name: String,
     pub indexes: Vec<IndexMeta>,
+    /// Exact count of live documents. Maintained in the same engine-lock
+    /// critical section as document writes; `0` in old catalog blobs.
+    #[serde(default)]
+    pub doc_count: u64,
 }
 
 impl CollectionMeta {
@@ -116,6 +124,54 @@ impl Catalog {
             .find(|c| c.prefix == prefix && c.name == name)
     }
 
+    /// All collections (used by the TTL sweep to classify expired keys).
+    pub fn collections(&self) -> &[CollectionMeta] {
+        &self.collections
+    }
+
+    /// Apply a document-count delta to a collection. Every index's
+    /// `entry_count` moves by the same delta: each document contributes
+    /// exactly one entry per index. Saturates at zero rather than wrapping —
+    /// exactness is enforced by the drift tests, not by panicking in prod.
+    pub fn add_doc_count(&mut self, collection_id: u32, delta: i64) {
+        if let Some(c) = self.collections.iter_mut().find(|c| c.id == collection_id) {
+            c.doc_count = c.doc_count.saturating_add_signed(delta);
+            for idx in &mut c.indexes {
+                idx.entry_count = idx.entry_count.saturating_add_signed(delta);
+            }
+        }
+    }
+
+    /// Apply a document-count delta WITHOUT touching index entry counts.
+    /// Used by the TTL sweep, where a doc key and its index keys are
+    /// tombstoned together and counted independently.
+    pub fn add_doc_count_only(&mut self, collection_id: u32, delta: i64) {
+        if let Some(c) = self.collections.iter_mut().find(|c| c.id == collection_id) {
+            c.doc_count = c.doc_count.saturating_add_signed(delta);
+        }
+    }
+
+    /// Apply an entry-count delta to one index (ids are globally unique).
+    /// Used by the TTL sweep, which tombstones index keys directly.
+    pub fn add_index_entry_count(&mut self, index_id: u32, delta: i64) {
+        for c in &mut self.collections {
+            if let Some(idx) = c.indexes.iter_mut().find(|i| i.id == index_id) {
+                idx.entry_count = idx.entry_count.saturating_add_signed(delta);
+                return;
+            }
+        }
+    }
+
+    /// Set an index's entry count outright (backfill).
+    pub fn set_index_entry_count(&mut self, index_id: u32, count: u64) {
+        for c in &mut self.collections {
+            if let Some(idx) = c.indexes.iter_mut().find(|i| i.id == index_id) {
+                idx.entry_count = count;
+                return;
+            }
+        }
+    }
+
     /// Create the collection if it does not exist, returning its id.
     pub fn ensure_collection(&mut self, prefix: &[u8], name: &str) -> u32 {
         if let Some(c) = self.collection(prefix, name) {
@@ -128,6 +184,7 @@ impl Catalog {
             prefix: prefix.to_vec(),
             name: name.to_string(),
             indexes: Vec::new(),
+            doc_count: 0,
         });
         id
     }
@@ -197,6 +254,7 @@ impl Catalog {
             directions,
             unique,
             expire_after_seconds,
+            entry_count: 0,
         };
         let c = self
             .collections

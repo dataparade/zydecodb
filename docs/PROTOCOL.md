@@ -225,7 +225,7 @@ indexer.
 | `0x28` | `FindRev` | Implemented (find page rows include opaque revision) |
 | `0x29` | `DocPutIfMatch` | Implemented (conditional replace; stale/missing → `Conflict`) |
 | `0x2A` | `DocUpdateIfMatch` | Implemented (conditional by-id update; stale/missing → `Conflict`) |
-| `0x2B` | `Aggregate` | Implemented (optional `$match` + one `$group`; see [Aggregation](#aggregation)) |
+| `0x2B` | `Aggregate` | Implemented (optional `$match`, optional `$lookup`, optional `$group`; see [Aggregation](#aggregation)) |
 | `0x2C` | `Watch` | Implemented (primary-only collection change stream; see [Change streams](#change-streams)) |
 | `0x30` | `IndexDef` | Implemented (index create + backfill; optional TTL / direction trailers) |
 | `0x31` | `SchemaDef` | Reserved (parseable; responds `ProtocolError` until schemas) |
@@ -418,7 +418,7 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 
 ## Not yet
 
-- Full Mongo aggregation compatibility (`$lookup`, joins, `$unwind`, expressions, multi-stage pipelines beyond `$match`→`$group` — see [Aggregation](#aggregation) for the supported subset)
+- Full Mongo aggregation compatibility (`$unwind`, expressions, `pipeline:`/`let:` `$lookup`, multi-`$lookup` — see [Aggregation](#aggregation) for the supported subset)
 - Projection pushdown / covered queries (the body is always fetched)
 - Other upsert edge-case Mongo parity beyond `$setOnInsert`
 - Mongo `arrayFilters`, bare `$` / `$[]` / `$[<id>]`, multi-match positional
@@ -446,21 +446,37 @@ There is a slight CPU cost during initial ingestion to compile incoming JSON to 
 5. [`crates/zydecodb-document/src/catalog.rs`](../crates/zydecodb-document/src/catalog.rs) — collection/index metadata
 6. [`crates/zydecodb-document/src/store.rs`](../crates/zydecodb-document/src/store.rs) — body + index write batch
 7. [`crates/zydecodb-document/src/planner.rs`](../crates/zydecodb-document/src/planner.rs) / [`query.rs`](../crates/zydecodb-document/src/query.rs) — plan + execution
-8. [`crates/zydecodb/src/docdispatch.rs`](../crates/zydecodb/src/docdispatch.rs) — opcode routing
-9. [`crates/zydecodb/src/server.rs`](../crates/zydecodb/src/server.rs) — `EngineHandle` + thread-per-connection
+8. [`crates/zydecodb-document/src/join.rs`](../crates/zydecodb-document/src/join.rs) — `$lookup` (INLJ / bounded hash)
+9. [`crates/zydecodb/src/docdispatch.rs`](../crates/zydecodb/src/docdispatch.rs) — opcode routing
+10. [`crates/zydecodb/src/server.rs`](../crates/zydecodb/src/server.rs) — `EngineHandle` + thread-per-connection
 
 **Tests:** `crates/zydecodb/tests/document_e2e.rs`, `crates/zydecodb-engine/tests/range_scan.rs`.
 
 ## Aggregation
 
-ZydecoDB supports a **bounded**, **deterministic** aggregation opcode (`Aggregate = 0x2B`) for simple rollups. This is not MongoDB aggregation compatibility.
+ZydecoDB supports a **bounded**, **deterministic** aggregation opcode (`Aggregate = 0x2B`) for rollups and a single equality `$lookup`. This is not MongoDB aggregation compatibility. Design: [`DESIGN-joins.md`](DESIGN-joins.md).
 
 ### Supported pipeline
 
-Exactly:
+Legal shapes:
 
-1. Optional first stage: `$match` (same filter language as `Find`)
-2. Required final stage: `$group`
+- `[$group]`
+- `[$match, $group]`
+- `[$lookup]`
+- `[$lookup, $group]`
+- `[$match, $lookup]`
+- `[$match, $lookup, $group]`
+
+`$lookup` appears at most once and never after `$group`. Bare `[$lookup]` (and `[$lookup, $group]`) is a collection scan of the outer side, bounded by `max_scan_docs`.
+
+`$lookup` rules (equality left-outer, same tenant prefix, one snapshot):
+
+- Required keys only: `from`, `localField`, `foreignField`, `as`
+- Missing or non-scalar `localField` → empty `as` array
+- Strategy, chosen once before the outer scan:
+  - usable inner index (`_id` or leading-field) → indexed nested-loop
+  - no index and `inner.doc_count <= max_scan_docs` → bounded hash join
+  - otherwise → named error (index to create, or inner too large). Never a per-outer collection scan.
 
 `$group` rules:
 
@@ -468,10 +484,11 @@ Exactly:
 - Accumulator fields may only be:
   - `{"$sum":"$path"}` — missing/non-numeric inputs contribute `0`
   - `{"$count":{}}` — counts every document that reaches `$group`
+- After `$lookup`, `$group` sees join-output documents (outer plus the `as` array)
 
 Hard parser ceilings (not configurable):
 
-- At most two stages
+- At most three stages
 - At most 16 accumulators
 - Pipeline JSON ≤ 64 KiB
 
@@ -487,9 +504,11 @@ Hard parser ceilings (not configurable):
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `max_scan_docs` | `100000` | Candidates inspected (counted before residual filter) |
+| `max_scan_docs` | `100000` | Candidates inspected (counted before residual filter); also the hash-join inner-size gate |
 | `max_groups` | `10000` | Distinct group keys |
-| `max_memory_bytes` | `16MiB` | Group key + accumulator state |
+| `max_memory_bytes` | `16MiB` | Group / join-output retained state |
+| `max_matches_per_outer` | `1000` | Inner documents attached to one outer document |
+| `max_hash_bytes` | `16MiB` | Hash-join build; hard reject, no spill |
 | `max_result_bytes` | `4MiB` | Encoded response size (enforced while encoding) |
 
 Aggregation is an authenticated **read**. It is unavailable inside bounded transactions. Tenant prefix and collection-prefix ACL apply like other document reads.
@@ -498,10 +517,10 @@ Aggregation is an authenticated **read**. It is unavailable inside bounded trans
 
 The following remain unsupported and are rejected by the parser:
 
-- `$lookup`, joins, `$unwind`
+- `$unwind`, multi-`$lookup`, `pipeline:` / `let:` form
 - Expression languages, window functions, `$facet`
-- Multi-stage pipelines beyond `$match` → `$group`
-- Spilling to disk / unbounded group maps
+- Pipelines outside the six legal shapes above
+- Spilling to disk / unbounded group or hash maps
 
 ### Client APIs
 

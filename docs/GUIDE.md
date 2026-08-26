@@ -1176,9 +1176,11 @@ fails if engine microbench `p99_us` or `rss_bytes` exceeds baseline by more than
 | `rate_limit_rps` | **1000** | Per connection; Docker example uses 200 |
 | `auth_burst_limit` | **10** | Failed `SessionInit` per IP per minute |
 | `max_sort_buffer` | **10000** | Docs buffered per sort / multi-write select |
-| `[aggregation] max_scan_docs` | **100000** | |
+| `[aggregation] max_scan_docs` | **100000** | Outer scan; hash-join inner-size gate |
 | `[aggregation] max_groups` | **10000** | |
-| `[aggregation] max_memory_bytes` | **16 MiB** | |
+| `[aggregation] max_memory_bytes` | **16 MiB** | Group / join-output state |
+| `[aggregation] max_matches_per_outer` | **1000** | Inner docs per outer `$lookup` |
+| `[aggregation] max_hash_bytes` | **16 MiB** | Hash-join build; no spill |
 | `[aggregation] max_result_bytes` | **4 MiB** | |
 | `[change_streams] max_subscriptions` | **128** | Process-wide; feature off until `enabled = true` |
 | `[change_streams] max_subscriptions_per_tenant` | **8** | |

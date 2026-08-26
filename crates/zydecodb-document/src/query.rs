@@ -784,7 +784,7 @@ fn offset_mode_page(
 
 /// Counts observed while streaming a planned query.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct MatchVisitStats {
+pub struct MatchVisitStats {
     /// Candidate documents considered before residual filter evaluation.
     pub candidates: usize,
     /// Documents that passed the complete residual filter.
@@ -897,23 +897,24 @@ fn plan_scan(
 }
 
 /// Stream matches for a planner-selected access path with a hard bound on
-/// candidates examined before residual filtering.
-pub(crate) fn visit_planned_matches_bounded<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
+/// candidates examined before residual filtering, against caller-resolved
+/// collection metadata so callers can release the catalog lock first.
+pub(crate) fn visit_planned_matches_bounded_coll<F: FnMut(Vec<u8>, &[u8]) -> DocResult<bool>>(
     snap: &SnapshotHandle,
-    catalog: &Catalog,
     prefix: &[u8],
-    collection: &str,
+    coll: &crate::catalog::CollectionMeta,
     filter: &Filter,
     max_candidates: usize,
     f: F,
 ) -> DocResult<MatchVisitStats> {
-    let (path, doc_prefix, prefix_len) = plan_scan(catalog, prefix, collection, filter)?;
+    let path = planner::plan(filter, prefix, coll);
+    let doc_prefix = keys::doc_prefix(prefix, coll.id);
     for_each_match_bounded(
         snap,
         filter,
         &path,
         &doc_prefix,
-        prefix_len,
+        prefix.len(),
         max_candidates,
         f,
     )

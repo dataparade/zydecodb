@@ -156,13 +156,35 @@ impl Engine {
     /// assigned sequence number (await durability via [`sync_wal`] under group
     /// commit; when group commit is disabled the WAL is fsynced on return).
     pub fn write_batch(&mut self, ops: Vec<BatchOp>) -> EngineResult<u64> {
-        if ops.is_empty() {
+        self.write_batch_inner(ops, Vec::new())
+    }
+
+    /// Like [`write_batch`], but atomically includes system-keyspace puts
+    /// (e.g. an embedder's metadata blob) in the SAME self-framed WAL record,
+    /// so user ops and system metadata commit or vanish together on a torn
+    /// crash. System puts skip the write policy and fair-admit accounting
+    /// (they are engine-side bookkeeping, like [`Engine::sys_put`]) and carry
+    /// no expiry. `ops` may be empty when `sys_puts` is not.
+    pub fn write_batch_with_sys(
+        &mut self,
+        ops: Vec<BatchOp>,
+        sys_puts: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> EngineResult<u64> {
+        self.write_batch_inner(ops, sys_puts)
+    }
+
+    fn write_batch_inner(
+        &mut self,
+        ops: Vec<BatchOp>,
+        sys_puts: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> EngineResult<u64> {
+        if ops.is_empty() && sys_puts.is_empty() {
             return Err(EngineError::InvalidKey("empty batch".into()));
         }
-        if ops.len() > keys::MAX_BATCH_KEYS {
+        if ops.len() + sys_puts.len() > keys::MAX_BATCH_KEYS {
             return Err(EngineError::InvalidKey(format!(
                 "batch size {} exceeds MAX_BATCH_KEYS {}",
-                ops.len(),
+                ops.len() + sys_puts.len(),
                 keys::MAX_BATCH_KEYS
             )));
         }
@@ -172,7 +194,7 @@ impl Engine {
         // shared batch seq, making newest-wins ambiguous.)
         {
             let mut seen: std::collections::HashSet<&[u8]> =
-                std::collections::HashSet::with_capacity(ops.len());
+                std::collections::HashSet::with_capacity(ops.len() + sys_puts.len());
             for op in &ops {
                 keys::validate_user_key(op.key())?;
                 if let BatchOp::Put { value, .. } = op {
@@ -182,8 +204,15 @@ impl Engine {
                     return Err(EngineError::InvalidKey("duplicate key in batch".into()));
                 }
             }
+            for (key, value) in &sys_puts {
+                keys::validate_system_key(key)?;
+                keys::validate_value(value)?;
+                if !seen.insert(key) {
+                    return Err(EngineError::InvalidKey("duplicate key in batch".into()));
+                }
+            }
         }
-        self.check_backpressure_for_key(ops[0].key())?;
+        self.check_backpressure_for_key(ops.first().map(|o| o.key()).unwrap_or(&[]))?;
 
         // Policy gate: consult the policy for every op BEFORE any mutation. Any
         // rejection aborts the whole batch with nothing persisted. Existing
@@ -216,7 +245,7 @@ impl Engine {
 
         // Build one self-framed batch WAL record (one CRC = atomic on a torn
         // crash) and append it on the group-commit path.
-        let wal_ops: Vec<wal::WalOp> = ops
+        let mut wal_ops: Vec<wal::WalOp> = ops
             .iter()
             .map(|op| match op {
                 BatchOp::Put {
@@ -237,6 +266,12 @@ impl Engine {
                 },
             })
             .collect();
+        wal_ops.extend(sys_puts.iter().map(|(key, value)| wal::WalOp {
+            command: wal::WAL_PUT,
+            expires_at: 0,
+            key: key.clone(),
+            value: value.clone(),
+        }));
         let rec_bytes = wal::WalBatch { seq, ops: wal_ops }.encode();
         self.append_bytes_buffered(&rec_bytes, seq)?;
         if !self.group_commit {
@@ -279,6 +314,11 @@ impl Engine {
                 rc.invalidate(&key_for_hooks);
             }
             policy.post_write(self, &key_for_hooks, value_len, existing, is_delete);
+        }
+        // System puts join the same batch seq but bypass policy/fair accounting.
+        for (key, value) in sys_puts {
+            let ik = InternalKey::new(key, seq, EntryKind::Value);
+            self.active_mut().insert(ik, Entry::value(value, None));
         }
         crate::engine_fail_point!(crate::failpoints::ENGINE_AFTER_MEMTABLE_INSERT);
 
@@ -465,7 +505,9 @@ impl Engine {
     }
 
     pub(crate) fn try_submit_flush(&mut self) -> bool {
-        if self.flush_scheduler.is_worker_busy() {
+        // One flush in flight at a time: the submitted memtable remains in
+        // the read set until its SSTable apply lands (see flush_in_flight).
+        if self.flush_in_flight || self.flush_scheduler.is_worker_busy() {
             return false;
         }
         let Some(mt) = self.immutable.front() else {
@@ -498,8 +540,9 @@ impl Engine {
             priority_tenant,
         );
         if submitted {
-            self.immutable.pop_front();
-            self.refresh_topology_gauges();
+            // Do NOT pop the immutable here: it leaves the read set only when
+            // the flush apply publishes the SSTable (publish_catalog_apply).
+            self.flush_in_flight = true;
         }
         submitted
     }

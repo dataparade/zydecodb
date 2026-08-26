@@ -475,6 +475,62 @@ fn aggregate_over_wire() {
 }
 
 #[test]
+fn lookup_join_over_wire() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    define_index(&mut s, "orders", "by_user", &["user_id"]);
+    doc_put(&mut s, "users", b"u1", r#"{"name":"alice"}"#);
+    doc_put(&mut s, "users", b"u2", r#"{"name":"bob"}"#);
+    doc_put(&mut s, "orders", b"o1", r#"{"user_id":"u1","total":10}"#);
+    doc_put(&mut s, "orders", b"o2", r#"{"user_id":"u1","total":20}"#);
+
+    // $lookup alone: joined documents with the `as` array spliced in.
+    let rows = aggregate(
+        &mut s,
+        "users",
+        r#"[{"$lookup":{"from":"orders","localField":"_id","foreignField":"user_id","as":"orders"}}]"#,
+    );
+    assert_eq!(rows.len(), 2);
+    let u1 = rows
+        .iter()
+        .find(|r| r["_id"] == serde_json::json!("u1"))
+        .unwrap();
+    assert_eq!(u1["orders"].as_array().unwrap().len(), 2);
+    let u2 = rows
+        .iter()
+        .find(|r| r["_id"] == serde_json::json!("u2"))
+        .unwrap();
+    assert_eq!(u2["orders"], serde_json::json!([]));
+
+    // $lookup -> $group.
+    let rows = aggregate(
+        &mut s,
+        "users",
+        r#"[{"$lookup":{"from":"orders","localField":"_id","foreignField":"user_id","as":"orders"}},{"$group":{"_id":null,"n":{"$count":{}}}}]"#,
+    );
+    assert_eq!(rows, vec![serde_json::json!({"_id": null, "n": 2})]);
+
+    // No inner index: hash join, not a silent per-outer scan.
+    doc_put(&mut s, "logs", b"l1", r#"{"user_id":"u1"}"#);
+    let rows = aggregate(
+        &mut s,
+        "users",
+        r#"[{"$lookup":{"from":"logs","localField":"_id","foreignField":"user_id","as":"hits"}}]"#,
+    );
+    assert_eq!(rows.len(), 2);
+    let u1 = rows
+        .iter()
+        .find(|r| r["_id"] == serde_json::json!("u1"))
+        .unwrap();
+    assert_eq!(u1["hits"].as_array().unwrap().len(), 1);
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
 fn filter_type_array_regex_over_wire() {
     let (addr, shutdown, handle) = spawn_ephemeral_server();
     let mut s = connect(addr);

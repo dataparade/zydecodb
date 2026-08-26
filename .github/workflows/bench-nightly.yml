@@ -22,10 +22,25 @@ jobs:
           OPS: "50000"
           OUT: ${{ runner.temp }}/bench-regression.json
         run: ./scripts/bench-regression.sh
+      - name: Run bench-join (COMPARE vs baseline)
+        env:
+          COMPARE: "1"
+          THRESHOLD_PCT: "20"
+          FACT_DOCS: "100000"
+          DIM_DOCS: "1000"
+          OUT: ${{ runner.temp }}/bench-join.json
+        run: ./scripts/bench-join.sh
       - name: Upload bench trend artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bench-regression-${{ github.run_id }}
           path: ${{ runner.temp }}/bench-regression.json
+          if-no-files-found: ignore
+      - name: Upload bench-join trend artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-join-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench-join.json
           if-no-files-found: ignore

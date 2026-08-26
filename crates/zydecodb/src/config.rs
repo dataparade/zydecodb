@@ -126,6 +126,10 @@ pub struct AggregationConfig {
     pub max_memory_bytes: usize,
     #[serde(default = "default_agg_max_result_bytes")]
     pub max_result_bytes: usize,
+    #[serde(default = "default_agg_max_matches_per_outer")]
+    pub max_matches_per_outer: usize,
+    #[serde(default = "default_agg_max_hash_bytes")]
+    pub max_hash_bytes: usize,
 }
 
 impl Default for AggregationConfig {
@@ -135,6 +139,8 @@ impl Default for AggregationConfig {
             max_groups: default_agg_max_groups(),
             max_memory_bytes: default_agg_max_memory_bytes(),
             max_result_bytes: default_agg_max_result_bytes(),
+            max_matches_per_outer: default_agg_max_matches_per_outer(),
+            max_hash_bytes: default_agg_max_hash_bytes(),
         }
     }
 }
@@ -150,6 +156,12 @@ fn default_agg_max_memory_bytes() -> usize {
 }
 fn default_agg_max_result_bytes() -> usize {
     4 * 1024 * 1024
+}
+fn default_agg_max_matches_per_outer() -> usize {
+    1_000
+}
+fn default_agg_max_hash_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 /// TOML surface for [`FairConfig`]. Durations are milliseconds.

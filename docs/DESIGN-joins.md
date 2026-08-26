@@ -1,19 +1,10 @@
 # Design: `$lookup` joins (1.1)
 
-Protocol commitment for Theme 2 joins. Research: `website/joins.md`. Engineering
-order: `1.1-Roadmap.md` Theme 2. This document is the contract Steps 1–4 build
-against. **No code ships from this file.**
-
-[`COMPATIBILITY.md`](COMPATIBILITY.md) line 128 ("No `$lookup`, joins, or
-`$unwind`") and the [`PROTOCOL.md`](PROTOCOL.md#aggregation) supported-pipeline
-section stay as they are until the feature ships. Do not flip them at design
-time.
-
 ## 1. Pipeline grammar
 
-Today [`aggregation.rs`](../crates/zydecodb-document/src/aggregation.rs) accepts
-exactly `[{$group}]` or `[{$match}, {$group}]` (`MAX_PIPELINE_STAGES = 2`).
-Those remain legal. `$lookup` is one additional aggregation stage.
+[`aggregation.rs`](../crates/zydecodb-document/src/aggregation.rs) accepts the
+`$group` / `$match`→`$group` shapes and one additional `$lookup` stage
+(`MAX_PIPELINE_STAGES = 3`).
 
 Legal pipelines after the change:
 
@@ -59,9 +50,8 @@ Rules:
 
 ## 3. Failure posture
 
-**No usable index on the inner `foreignField` → explicit error naming the
-index to create. Never a silent full-scan-per-document fallback.** That
-O(n×m) footgun is MongoDB's mistake and we will not ship it.
+**Never a silent full-scan-per-document fallback.** That O(n×m) footgun is
+MongoDB's mistake and we will not ship it.
 
 A usable inner index is:
 
@@ -71,10 +61,16 @@ A usable inner index is:
   of length 1). A compound index on `[foreignField, …]` counts; one on
   `[other, foreignField]` does not.
 
-Until the Step 4 hash-join operator ships, that error is unconditional. Hash
-join, when added, is a single bounded inner scan plus an in-memory map — not a
-per-outer collection scan — and may proceed without an index only when the
-inner side fits `max_memory_bytes`. It is not a silent fallback.
+Strategy is chosen once, before the outer scan:
+
+- usable index → indexed nested-loop (INLJ)
+- no index and `inner.doc_count <= max_scan_docs` → bounded hash join (one
+  inner scan plus an in-memory map, capped by `max_hash_bytes`)
+- otherwise → named error naming the index to create and the inner size that
+  disqualified the hash path
+
+Hash join is not a silent fallback. It is a single bounded inner scan, not a
+per-outer collection scan.
 
 ## 4. Bounds
 
@@ -83,7 +79,8 @@ no spill, no silent truncation.
 
 | Bound | Default | Meaning |
 | --- | --- | --- |
-| `max_scan_docs` | `100_000` | Outer candidates examined (reuses `DEFAULT_MAX_SCAN_DOCS`) |
-| `max_matches_per_outer` | `1_000` | Inner documents attached to one outer document (new) |
-| `max_memory_bytes` | `16 MiB` | Retained join state (reuses `DEFAULT_MAX_MEMORY_BYTES`) |
-| `max_result_bytes` | `4 MiB` | Encoded response size (reuses `DEFAULT_MAX_RESULT_BYTES`) |
+| `max_scan_docs` | `100_000` | Outer candidates examined; also the hash-join inner-size gate |
+| `max_matches_per_outer` | `1_000` | Inner documents attached to one outer document |
+| `max_memory_bytes` | `16 MiB` | Retained join-output state |
+| `max_hash_bytes` | `16 MiB` | Hash-join build (inner-side map); hard reject, no spill |
+| `max_result_bytes` | `4 MiB` | Encoded response size |

@@ -189,10 +189,11 @@ impl Engine {
         Ok(existed)
     }
 
-    /// Lazy-expiry sweep over the active memtable: insert non-durable tombstones
-    /// for expired entries. Does **not** append WAL — SST reclaim is compaction's
-    /// job; this is memtable hygiene only (lost on crash; lazy read still hides).
-    pub fn sweep_expired(&mut self) -> EngineResult<usize> {
+    /// Read-only view of the sweepable set: deduplicated user keys whose latest
+    /// active-memtable version is an expired value. Callers that need the sweep
+    /// to be durable (or atomic with their own metadata) collect these keys and
+    /// commit tombstones themselves via [`Engine::write_batch`].
+    pub fn collect_expired(&self) -> Vec<Vec<u8>> {
         let now = Self::now_ms();
         let mut expired_keys: Vec<Vec<u8>> = Vec::new();
         for (ik, entry) in self.active.iter() {
@@ -203,17 +204,26 @@ impl Engine {
         // Deduplicate (a key may appear with multiple seqs).
         expired_keys.sort();
         expired_keys.dedup();
-        let mut count = 0usize;
-        for key in expired_keys {
-            // Only tombstone if the latest version is still an expired value.
-            if let Some((_, entry)) = self.active.get_latest(&key) {
-                if entry.is_expired(now) && !entry.is_tombstone() {
-                    let seq = self.seq.next();
-                    let ik = InternalKey::new(key.clone(), seq, EntryKind::Tombstone);
-                    self.active_mut().insert(ik, Entry::tombstone());
-                    count += 1;
-                }
+        expired_keys.retain(|key| {
+            // Only report keys whose latest version is still an expired value.
+            match self.active.get_latest(key) {
+                Some((_, entry)) => entry.is_expired(now) && !entry.is_tombstone(),
+                None => false,
             }
+        });
+        expired_keys
+    }
+
+    /// Lazy-expiry sweep over the active memtable: insert non-durable tombstones
+    /// for expired entries. Does **not** append WAL — SST reclaim is compaction's
+    /// job; this is memtable hygiene only (lost on crash; lazy read still hides).
+    pub fn sweep_expired(&mut self) -> EngineResult<usize> {
+        let expired_keys = self.collect_expired();
+        let count = expired_keys.len();
+        for key in expired_keys {
+            let seq = self.seq.next();
+            let ik = InternalKey::new(key, seq, EntryKind::Tombstone);
+            self.active_mut().insert(ik, Entry::tombstone());
         }
         if count > 0 {
             if let Some(m) = &self.metrics {

@@ -124,6 +124,10 @@ impl Engine {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "background flush failed");
+                    // The memtable was never flushed and is still at the front
+                    // of the immutable queue; clear the in-flight flag so it
+                    // is resubmitted on the next attempt.
+                    self.flush_in_flight = false;
                     self.flush_scheduler.note_worker_failed(e);
                 }
             }
@@ -441,6 +445,11 @@ impl Engine {
         self.dir_fsync_pending = true;
 
         if let Some(max_seq) = apply.flush_max_seq {
+            // The flush's memtable was kept in the read set while in flight;
+            // now that the SSTable is published, retire it atomically with
+            // the publish so no snapshot ever sees a gap.
+            self.immutable.pop_front();
+            self.flush_in_flight = false;
             if let Some(m) = &self.metrics {
                 m.sstable_flushes_total.inc();
                 m.last_durable_seq.set(max_seq as i64);

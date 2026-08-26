@@ -1,0 +1,41 @@
+[
+  {
+    "backfill_ms": 0,
+    "dim_docs": 1000,
+    "docs_sec": 224215.2466367713,
+    "elapsed_ms": 446,
+    "fact_docs": 100000,
+    "load_ms": 596,
+    "probe_p50_us": 0,
+    "probe_p99_us": 0,
+    "rss_bytes": 490835968,
+    "runs": 3,
+    "scenario": "hash"
+  },
+  {
+    "backfill_ms": 64,
+    "dim_docs": 1000,
+    "docs_sec": 233644.85981308413,
+    "elapsed_ms": 428,
+    "fact_docs": 100000,
+    "load_ms": 596,
+    "probe_p50_us": 0,
+    "probe_p99_us": 0,
+    "rss_bytes": 491622400,
+    "runs": 3,
+    "scenario": "_id-probe"
+  },
+  {
+    "backfill_ms": 64,
+    "dim_docs": 1000,
+    "docs_sec": 161030.5958132045,
+    "elapsed_ms": 621,
+    "fact_docs": 100000,
+    "load_ms": 596,
+    "probe_p50_us": 1,
+    "probe_p99_us": 2,
+    "rss_bytes": 496496640,
+    "runs": 3,
+    "scenario": "k-probe"
+  }
+]

@@ -41,7 +41,7 @@ fn upsert_get_and_index_orders_by_field() {
 
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -51,7 +51,7 @@ fn upsert_get_and_index_orders_by_field() {
     .unwrap();
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u2",
@@ -61,12 +61,13 @@ fn upsert_get_and_index_orders_by_field() {
     .unwrap();
 
     let snap = e.snapshot_owned();
-    assert_eq!(body_name(&snap, &cat, b"u1"), "alice");
+    assert_eq!(body_name(&snap, &mut cat, b"u1"), "alice");
 
     // Ascending by age: u2 (25) before u1 (30).
-    let spec =
-        query::build_index_scan_spec(&cat, PREFIX, "users", "by_age", None, None, None, 10, true)
-            .unwrap();
+    let spec = query::build_index_scan_spec(
+        &mut cat, PREFIX, "users", "by_age", None, None, None, 10, true,
+    )
+    .unwrap();
     let page = query::execute_index_scan(&snap, &spec).unwrap();
     assert_eq!(doc_ids(&page), vec![b"u2".to_vec(), b"u1".to_vec()]);
     assert!(page.next_cursor.is_none());
@@ -85,17 +86,27 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
 
     let ids: Vec<Vec<u8>> = (0..5u8).map(|i| vec![b'u', b'0' + i]).collect();
     for id in &ids {
-        store::upsert(&mut e, &cat, PREFIX, "users", id, br#"{"age":30}"#, false).unwrap();
+        store::upsert(
+            &mut e,
+            &mut cat,
+            PREFIX,
+            "users",
+            id,
+            br#"{"age":30}"#,
+            false,
+        )
+        .unwrap();
     }
 
     // Atomic bulk update: every matching doc moves to the new age bucket.
     let upd = UpdateDoc::parse_bytes(br#"{"$set":{"age":31}}"#).unwrap();
-    let modified = update::apply_to_ids(&mut e, &cat, PREFIX, "users", &ids, &upd, None).unwrap();
+    let modified =
+        update::apply_to_ids(&mut e, &mut cat, PREFIX, "users", &ids, &upd, None).unwrap();
     assert_eq!(modified, 5);
 
     let snap = e.snapshot_owned();
     let spec = query::build_index_scan_spec(
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         "by_age",
@@ -113,12 +124,13 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
     drop(snap);
 
     // Atomic bulk delete: bodies and index entries all gone.
-    let deleted = store::delete_ids(&mut e, &cat, PREFIX, "users", &ids, None).unwrap();
+    let deleted = store::delete_ids(&mut e, &mut cat, PREFIX, "users", &ids, None).unwrap();
     assert_eq!(deleted, 5);
     let snap = e.snapshot_owned();
-    let spec =
-        query::build_index_scan_spec(&cat, PREFIX, "users", "by_age", None, None, None, 100, true)
-            .unwrap();
+    let spec = query::build_index_scan_spec(
+        &mut cat, PREFIX, "users", "by_age", None, None, None, 100, true,
+    )
+    .unwrap();
     assert!(query::execute_index_scan(&snap, &spec)
         .unwrap()
         .rows
@@ -145,7 +157,7 @@ fn filtered_write_recheck_skips_stale_candidates() {
 
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -157,23 +169,23 @@ fn filtered_write_recheck_skips_stale_candidates() {
     // Phase 1 (as docdispatch does it): select candidates matching count == 4.
     let filter = Filter::parse_bytes(br#"{"count":4}"#).unwrap();
     let snap = e.snapshot_owned();
-    let ids = query::find_ids(&snap, &cat, PREFIX, "users", &filter, 100).unwrap();
+    let ids = query::find_ids(&snap, &mut cat, PREFIX, "users", &filter, 100).unwrap();
     assert_eq!(ids.len(), 1);
     drop(snap);
 
     // A concurrent writer bumps the count BEFORE our write runs.
     let bump = UpdateDoc::parse_bytes(br#"{"$inc":{"count":1}}"#).unwrap();
-    assert!(update::apply_to_id(&mut e, &cat, PREFIX, "users", b"u1", &bump).unwrap());
+    assert!(update::apply_to_id(&mut e, &mut cat, PREFIX, "users", b"u1", &bump).unwrap());
 
     // Phase 2 with the stale candidate list: the re-check must skip it.
     let inc = UpdateDoc::parse_bytes(br#"{"$inc":{"count":1}}"#).unwrap();
     let modified =
-        update::apply_to_ids(&mut e, &cat, PREFIX, "users", &ids, &inc, Some(&filter)).unwrap();
+        update::apply_to_ids(&mut e, &mut cat, PREFIX, "users", &ids, &inc, Some(&filter)).unwrap();
     assert_eq!(modified, 0, "stale candidate must not be updated");
 
     // The document kept the concurrent writer's value (5), not 6.
     let snap = e.snapshot_owned();
-    let body = query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
+    let body = query::get_by_id(&snap, &mut cat, PREFIX, "users", b"u1")
         .unwrap()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -181,18 +193,27 @@ fn filtered_write_recheck_skips_stale_candidates() {
     drop(snap);
 
     // Same contract for filtered deletes: stale candidates survive.
-    let deleted = store::delete_ids(&mut e, &cat, PREFIX, "users", &ids, Some(&filter)).unwrap();
+    let deleted =
+        store::delete_ids(&mut e, &mut cat, PREFIX, "users", &ids, Some(&filter)).unwrap();
     assert_eq!(deleted, 0, "stale candidate must not be deleted");
     let snap = e.snapshot_owned();
-    assert!(query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
+    assert!(query::get_by_id(&snap, &mut cat, PREFIX, "users", b"u1")
         .unwrap()
         .is_some());
 
     // And with a still-matching filter, the write proceeds normally.
     drop(snap);
     let filter5 = Filter::parse_bytes(br#"{"count":5}"#).unwrap();
-    let modified =
-        update::apply_to_ids(&mut e, &cat, PREFIX, "users", &ids, &inc, Some(&filter5)).unwrap();
+    let modified = update::apply_to_ids(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "users",
+        &ids,
+        &inc,
+        Some(&filter5),
+    )
+    .unwrap();
     assert_eq!(modified, 1);
 }
 
@@ -219,7 +240,7 @@ fn filtered_positional_set_maintains_indexes() {
 
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "orders",
         b"o1",
@@ -230,12 +251,12 @@ fn filtered_positional_set_maintains_indexes() {
 
     let upd = UpdateDoc::parse_bytes(br#"{"$set":{"items.$[skuId=B].qty":9,"status":"packed"}}"#)
         .unwrap();
-    assert!(update::apply_to_id(&mut e, &cat, PREFIX, "orders", b"o1", &upd).unwrap());
+    assert!(update::apply_to_id(&mut e, &mut cat, PREFIX, "orders", b"o1", &upd).unwrap());
 
     let snap = e.snapshot_owned();
     let page = query::execute_find(
         &snap,
-        &cat,
+        &mut cat,
         PREFIX,
         "orders",
         &FindSpec {
@@ -258,7 +279,7 @@ fn filtered_positional_set_maintains_indexes() {
     // Old status index entry is gone.
     let old = query::execute_find(
         &snap,
-        &cat,
+        &mut cat,
         PREFIX,
         "orders",
         &FindSpec {
@@ -284,36 +305,53 @@ fn if_match_succeeds_when_revision_current() {
     let mut cat = Catalog::default();
     cat.ensure_collection(PREFIX, "users");
     cat.persist(&mut e).unwrap();
-    let seq = store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"n":1}"#, false).unwrap();
+    let seq = store::upsert(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "users",
+        b"u1",
+        br#"{"n":1}"#,
+        false,
+    )
+    .unwrap();
     assert!(seq > 0);
-    let rev = store::doc_revision(&e, &cat, PREFIX, "users", b"u1")
+    let rev = store::doc_revision(&e, &mut cat, PREFIX, "users", b"u1")
         .unwrap()
         .unwrap();
     assert_eq!(rev, seq);
 
-    store::check_if_match(&e, &cat, PREFIX, "users", b"u1", rev).unwrap();
-    let new_seq =
-        store::upsert(&mut e, &cat, PREFIX, "users", b"u1", br#"{"n":2}"#, false).unwrap();
+    store::check_if_match(&e, &mut cat, PREFIX, "users", b"u1", rev).unwrap();
+    let new_seq = store::upsert(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "users",
+        b"u1",
+        br#"{"n":2}"#,
+        false,
+    )
+    .unwrap();
     assert!(new_seq > rev);
 
     assert!(matches!(
-        store::check_if_match(&e, &cat, PREFIX, "users", b"u1", rev),
+        store::check_if_match(&e, &mut cat, PREFIX, "users", b"u1", rev),
         Err(zydecodb_document::error::DocError::StaleRevision)
     ));
 
     let upd = UpdateDoc::parse_bytes(br#"{"$inc":{"n":1}}"#).unwrap();
-    let cur = store::doc_revision(&e, &cat, PREFIX, "users", b"u1")
+    let cur = store::doc_revision(&e, &mut cat, PREFIX, "users", b"u1")
         .unwrap()
         .unwrap();
     let after =
-        update::apply_to_id_if_match(&mut e, &cat, PREFIX, "users", b"u1", &upd, cur).unwrap();
+        update::apply_to_id_if_match(&mut e, &mut cat, PREFIX, "users", b"u1", &upd, cur).unwrap();
     assert!(after > cur);
     assert!(matches!(
-        update::apply_to_id_if_match(&mut e, &cat, PREFIX, "users", b"u1", &upd, cur),
+        update::apply_to_id_if_match(&mut e, &mut cat, PREFIX, "users", b"u1", &upd, cur),
         Err(zydecodb_document::error::DocError::StaleRevision)
     ));
     assert!(matches!(
-        store::check_if_match(&e, &cat, PREFIX, "users", b"missing", 1),
+        store::check_if_match(&e, &mut cat, PREFIX, "users", b"missing", 1),
         Err(zydecodb_document::error::DocError::StaleRevision)
     ));
 }
@@ -336,7 +374,7 @@ fn unique_index_rejects_duplicate_value() {
 
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -348,7 +386,7 @@ fn unique_index_rejects_duplicate_value() {
     // A different document with the same unique value is rejected.
     let err = store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u2",
@@ -361,7 +399,7 @@ fn unique_index_rejects_duplicate_value() {
     // Re-upserting the SAME document with its value is allowed (idempotent).
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -373,7 +411,7 @@ fn unique_index_rejects_duplicate_value() {
     // A distinct value for a new document is allowed.
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u2",
@@ -385,7 +423,7 @@ fn unique_index_rejects_duplicate_value() {
     // Updating u1 to collide with u2's value is rejected.
     let err = store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -407,7 +445,7 @@ fn updating_indexed_field_moves_the_entry() {
 
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -417,7 +455,7 @@ fn updating_indexed_field_moves_the_entry() {
     .unwrap();
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -429,7 +467,7 @@ fn updating_indexed_field_moves_the_entry() {
     let snap = e.snapshot_owned();
     // Old bucket [30,31) is empty; new bucket [40,41) has u1.
     let old = query::build_index_scan_spec(
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         "by_age",
@@ -446,7 +484,7 @@ fn updating_indexed_field_moves_the_entry() {
         .is_empty());
 
     let new = query::build_index_scan_spec(
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         "by_age",
@@ -474,7 +512,7 @@ fn delete_removes_doc_and_index_entries() {
 
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -482,16 +520,17 @@ fn delete_removes_doc_and_index_entries() {
         false,
     )
     .unwrap();
-    assert!(store::delete(&mut e, &cat, PREFIX, "users", b"u1").unwrap());
-    assert!(!store::delete(&mut e, &cat, PREFIX, "users", b"u1").unwrap());
+    assert!(store::delete(&mut e, &mut cat, PREFIX, "users", b"u1").unwrap());
+    assert!(!store::delete(&mut e, &mut cat, PREFIX, "users", b"u1").unwrap());
 
     let snap = e.snapshot_owned();
-    assert!(query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
+    assert!(query::get_by_id(&snap, &mut cat, PREFIX, "users", b"u1")
         .unwrap()
         .is_none());
-    let spec =
-        query::build_index_scan_spec(&cat, PREFIX, "users", "by_age", None, None, None, 10, false)
-            .unwrap();
+    let spec = query::build_index_scan_spec(
+        &mut cat, PREFIX, "users", "by_age", None, None, None, 10, false,
+    )
+    .unwrap();
     assert!(query::execute_index_scan(&snap, &spec)
         .unwrap()
         .rows
@@ -511,7 +550,7 @@ fn pagination_walks_all_rows_in_order() {
         let body = format!(r#"{{"age":{age}}}"#);
         store::upsert(
             &mut e,
-            &cat,
+            &mut cat,
             PREFIX,
             "users",
             id.as_bytes(),
@@ -527,7 +566,7 @@ fn pagination_walks_all_rows_in_order() {
     loop {
         let snap = e.snapshot_owned();
         let spec = query::build_index_scan_spec(
-            &cat,
+            &mut cat,
             PREFIX,
             "users",
             "by_age",
@@ -568,7 +607,7 @@ fn define_index_backfills_existing_documents() {
 
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -578,7 +617,7 @@ fn define_index_backfills_existing_documents() {
     .unwrap();
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u2",
@@ -601,9 +640,10 @@ fn define_index_backfills_existing_documents() {
     .unwrap();
 
     let snap = e.snapshot_owned();
-    let spec =
-        query::build_index_scan_spec(&cat, PREFIX, "users", "by_age", None, None, None, 10, false)
-            .unwrap();
+    let spec = query::build_index_scan_spec(
+        &mut cat, PREFIX, "users", "by_age", None, None, None, 10, false,
+    )
+    .unwrap();
     assert_eq!(
         doc_ids(&query::execute_index_scan(&snap, &spec).unwrap()),
         vec![b"u2".to_vec(), b"u1".to_vec()]
@@ -631,7 +671,7 @@ fn orphan_index_keys_without_catalog_entry_are_invisible() {
     cat.persist(&mut e).unwrap();
     store::upsert(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "users",
         b"u1",
@@ -681,11 +721,11 @@ fn oversized_document_batch_is_rejected() {
     }
     cat.persist(&mut e).unwrap();
 
-    let err = store::upsert(&mut e, &cat, PREFIX, "users", b"u1", b"{}", false).unwrap_err();
+    let err = store::upsert(&mut e, &mut cat, PREFIX, "users", b"u1", b"{}", false).unwrap_err();
     assert!(matches!(err, DocError::BatchTooLarge(_)));
     // Nothing persisted.
     let snap = e.snapshot_owned();
-    assert!(query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
+    assert!(query::get_by_id(&snap, &mut cat, PREFIX, "users", b"u1")
         .unwrap()
         .is_none());
 }
@@ -725,7 +765,7 @@ fn expires_at_change_rewrites_index_keys_for_compaction_reclaim() {
     let far = 4_000_000_000_000u64; // far future millis
     store::upsert_with_expiry(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "sess",
         b"s1",
@@ -739,7 +779,7 @@ fn expires_at_change_rewrites_index_keys_for_compaction_reclaim() {
     // Same indexed fields, shorter expiry — intersection index keys must be rewritten.
     store::upsert_with_expiry(
         &mut e,
-        &cat,
+        &mut cat,
         PREFIX,
         "sess",
         b"s1",
@@ -752,12 +792,12 @@ fn expires_at_change_rewrites_index_keys_for_compaction_reclaim() {
     e.drain_compaction().unwrap();
 
     let snap = e.snapshot_owned();
-    assert!(query::get_by_id(&snap, &cat, PREFIX, "sess", b"s1")
+    assert!(query::get_by_id(&snap, &mut cat, PREFIX, "sess", b"s1")
         .unwrap()
         .is_none());
     let page = query::execute_find(
         &snap,
-        &cat,
+        &mut cat,
         PREFIX,
         "sess",
         &FindSpec {

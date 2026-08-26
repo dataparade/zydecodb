@@ -585,9 +585,11 @@ impl Server {
 
         // Lazy TTL sweep: expire engine-level `expires_at` entries on a cadence
         // so document TTL (and raw-KV TTL) become unreachable without waiting
-        // for a natural read.
+        // for a natural read. The sweep is durable and counter-exact: tombstones
+        // and catalog counter deltas commit in the same atomic batches.
         let sweep_thread = {
             let engine = Arc::clone(&engine);
+            let catalog = Arc::clone(&catalog);
             let shutdown = Arc::clone(&self.shutdown);
             let wake = Arc::clone(&self.wake);
             let interval = Duration::from_secs(30);
@@ -597,8 +599,11 @@ impl Server {
                     if wait_or_shutdown(&shutdown, &wake, interval) {
                         break;
                     }
+                    // Lock order matches the write path: catalog, then engine.
+                    let mut cat = catalog.write().unwrap();
                     if let Ok(mut e) = engine.try_write() {
-                        match e.sweep_expired() {
+                        match zydecodb_document::store::sweep_expired_with_counts(&mut e, &mut cat)
+                        {
                             Ok(n) if n > 0 => info!(expired = n, "TTL sweep removed entries"),
                             Ok(_) => {}
                             Err(err) => warn!(error = %err, "TTL sweep failed"),

@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod encoding;
 pub mod error;
 pub mod filter;
+pub mod join;
 pub mod keys;
 pub mod planner;
 pub mod query;

@@ -153,7 +153,7 @@ impl Engine {
     /// or below `seq_upper`. Tombstones suppress; expired entries suppress.
     pub fn snapshot_get(&self, seq_upper: u64, key: &[u8]) -> EngineResult<Option<Vec<u8>>> {
         Ok(self
-            .snapshot_get_inner(seq_upper, key, true)?
+            .snapshot_get_inner(seq_upper, key, true, false)?
             .map(|(v, _)| v))
     }
 
@@ -164,7 +164,19 @@ impl Engine {
         seq_upper: u64,
         key: &[u8],
     ) -> EngineResult<Option<(Vec<u8>, u64)>> {
-        self.snapshot_get_inner(seq_upper, key, false)
+        self.snapshot_get_inner(seq_upper, key, false, false)
+    }
+
+    /// GET the newest version of `key` when it is a live (non-tombstone)
+    /// value, IGNORING expiry. Tombstones still suppress. The document layer
+    /// uses this to keep cardinality counters consistent across lazy TTL
+    /// expiry: an expired-but-unswept document still occupies its counter
+    /// slot until the sweep tombstones it, so a re-upsert over it is a
+    /// replace (delta 0), not an insert.
+    pub fn get_including_expired(&self, key: &[u8]) -> EngineResult<Option<Vec<u8>>> {
+        Ok(self
+            .snapshot_get_inner(u64::MAX, key, false, true)?
+            .map(|(v, _)| v))
     }
 
     fn snapshot_get_inner(
@@ -172,16 +184,17 @@ impl Engine {
         seq_upper: u64,
         key: &[u8],
         use_result_cache: bool,
+        include_expired: bool,
     ) -> EngineResult<Option<(Vec<u8>, u64)>> {
         keys::validate_user_key(key).or_else(|_| keys::validate_system_key(key))?;
         let now = Self::now_ms();
 
         if let Some((ik, entry)) = self.first_visible_in_memtable(&self.active, key, seq_upper) {
-            return Ok(self.resolve_with_seq(&ik, &entry, now));
+            return Ok(self.resolve_entry(&ik, &entry, now, include_expired));
         }
         for mt in self.immutable.iter().rev() {
             if let Some((ik, entry)) = self.first_visible_in_memtable(mt, key, seq_upper) {
-                return Ok(self.resolve_with_seq(&ik, &entry, now));
+                return Ok(self.resolve_entry(&ik, &entry, now, include_expired));
             }
         }
         if use_result_cache && seq_upper == u64::MAX {
@@ -226,7 +239,7 @@ impl Engine {
                         m.sstable_get_duration_seconds
                             .observe(start.elapsed().as_secs_f64());
                     }
-                    let resolved = self.resolve_with_seq(&ik, &entry, now);
+                    let resolved = self.resolve_entry(&ik, &entry, now, include_expired);
                     if let (Some(rc), Some((v, _))) = (&self.result_cache, &resolved) {
                         if seq_upper == u64::MAX {
                             rc.insert(key.to_vec(), v.clone());
@@ -371,14 +384,15 @@ impl Engine {
         out
     }
 
-    /// Resolve an entry to `(value, seq)`, or None for tombstone/expired.
-    pub(crate) fn resolve_with_seq(
+    /// Resolve an entry, optionally treating expired values as still live.
+    pub(crate) fn resolve_entry(
         &self,
         ik: &InternalKey,
         entry: &Entry,
         now: u64,
+        include_expired: bool,
     ) -> Option<(Vec<u8>, u64)> {
-        if entry.is_tombstone() || entry.is_expired(now) {
+        if entry.is_tombstone() || (!include_expired && entry.is_expired(now)) {
             return None;
         }
         entry.value.clone().map(|v| (v, ik.seq))

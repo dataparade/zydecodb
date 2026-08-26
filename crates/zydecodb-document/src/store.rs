@@ -16,6 +16,16 @@ use zydecodb_engine::keys::MAX_BATCH_KEYS;
 pub const VK_RAW: u8 = 0x00;
 pub const VK_ZDOC: u8 = 0x01;
 
+/// Ops for one document write plus the catalog counter delta it implies.
+/// `doc_delta` is +1 for an insert, 0 for a replace, -1 for a delete; every
+/// index entry count moves by the same delta (one entry per doc per index).
+#[derive(Debug)]
+pub struct WriteOps {
+    pub ops: Vec<BatchOp>,
+    pub collection_id: u32,
+    pub doc_delta: i64,
+}
+
 /// Build the set of index keys this document occupies across all of the
 /// collection's indexes.
 fn index_keys_for(
@@ -194,7 +204,7 @@ pub fn upsert_ops(
     payload: &[u8],
     is_zdoc: bool,
     expires_at: u64,
-) -> DocResult<Vec<BatchOp>> {
+) -> DocResult<WriteOps> {
     upsert_ops_with_old(
         engine, catalog, prefix, collection, doc_id, payload, is_zdoc, expires_at, None,
     )
@@ -211,7 +221,7 @@ pub fn upsert_ops_with_old(
     is_zdoc: bool,
     expires_at: u64,
     old_doc: Option<&Value>,
-) -> DocResult<Vec<BatchOp>> {
+) -> DocResult<WriteOps> {
     upsert_ops_with_old_inner(
         engine, catalog, prefix, collection, doc_id, payload, is_zdoc, expires_at, old_doc, true,
     )
@@ -231,7 +241,7 @@ pub fn upsert_ops_without_unique(
     is_zdoc: bool,
     expires_at: u64,
     old_doc: Option<&Value>,
-) -> DocResult<Vec<BatchOp>> {
+) -> DocResult<WriteOps> {
     upsert_ops_with_old_inner(
         engine, catalog, prefix, collection, doc_id, payload, is_zdoc, expires_at, old_doc, false,
     )
@@ -250,7 +260,7 @@ fn upsert_ops_with_old_inner(
     expires_at: u64,
     old_doc: Option<&Value>,
     check_unique: bool,
-) -> DocResult<Vec<BatchOp>> {
+) -> DocResult<WriteOps> {
     let coll = catalog
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
@@ -259,7 +269,7 @@ fn upsert_ops_with_old_inner(
 
     // ZDoc path: index/TTL/unique use ValueView path extraction — never build a
     // full serde_json tree for the new body under the engine lock.
-    let (expires_at, old_keys, new_keys) = if is_zdoc {
+    let (expires_at, old_keys, new_keys, existed) = if is_zdoc {
         let view = crate::binary::ValueView::new(payload);
         if check_unique {
             enforce_unique_view(engine, coll, prefix, doc_id, &view)?;
@@ -269,17 +279,20 @@ fn upsert_ops_with_old_inner(
         } else {
             expires_at
         };
-        let old_keys: BTreeSet<Vec<u8>> = if let Some(old) = old_doc {
-            index_keys_for(coll, prefix, doc_id, old)
-                .into_iter()
-                .collect()
+        let (old_keys, existed) = if let Some(old) = old_doc {
+            (
+                index_keys_for(coll, prefix, doc_id, old)
+                    .into_iter()
+                    .collect::<BTreeSet<Vec<u8>>>(),
+                true,
+            )
         } else {
             old_index_keys(engine, coll, prefix, doc_id, &doc_key)?
         };
         let new_keys: BTreeSet<Vec<u8>> = index_keys_for_view(coll, prefix, doc_id, &view)
             .into_iter()
             .collect();
-        (expires_at, old_keys, new_keys)
+        (expires_at, old_keys, new_keys, existed)
     } else {
         let new_doc: Value =
             serde_json::from_slice(payload).map_err(|e| DocError::InvalidJson(e.to_string()))?;
@@ -291,17 +304,20 @@ fn upsert_ops_with_old_inner(
         } else {
             expires_at
         };
-        let old_keys: BTreeSet<Vec<u8>> = if let Some(old) = old_doc {
-            index_keys_for(coll, prefix, doc_id, old)
-                .into_iter()
-                .collect()
+        let (old_keys, existed) = if let Some(old) = old_doc {
+            (
+                index_keys_for(coll, prefix, doc_id, old)
+                    .into_iter()
+                    .collect::<BTreeSet<Vec<u8>>>(),
+                true,
+            )
         } else {
             old_index_keys(engine, coll, prefix, doc_id, &doc_key)?
         };
         let new_keys: BTreeSet<Vec<u8>> = index_keys_for(coll, prefix, doc_id, &new_doc)
             .into_iter()
             .collect();
-        (expires_at, old_keys, new_keys)
+        (expires_at, old_keys, new_keys, existed)
     };
 
     let mut ops: Vec<BatchOp> = Vec::with_capacity(1 + old_keys.len() + new_keys.len());
@@ -329,26 +345,38 @@ fn upsert_ops_with_old_inner(
         });
     }
 
-    if ops.len() > MAX_BATCH_KEYS {
+    // One batch slot is reserved for the catalog blob (counter updates commit
+    // in the same WAL record as the document write).
+    if ops.len() + 1 > MAX_BATCH_KEYS {
         return Err(DocError::BatchTooLarge(ops.len()));
     }
-    Ok(ops)
+    Ok(WriteOps {
+        ops,
+        collection_id: coll.id,
+        doc_delta: if existed { 0 } else { 1 },
+    })
 }
 
-/// Prior index footprint for `doc_id`. ZDoc bodies use view extraction (no
-/// full-tree materialization); JSON bodies decode as usual.
+/// Prior index footprint for `doc_id`, plus whether the document existed at
+/// all. ZDoc bodies use view extraction (no full-tree materialization); JSON
+/// bodies decode as usual.
+///
+/// Existence is checked with [`Engine::get_including_expired`]: an
+/// expired-but-unswept document still occupies a counter slot (the sweep
+/// decrements when it tombstones), so re-upserting over it is a replace,
+/// not an insert.
 fn old_index_keys(
     engine: &mut Engine,
     coll: &CollectionMeta,
     prefix: &[u8],
     doc_id: &[u8],
     doc_key: &[u8],
-) -> DocResult<BTreeSet<Vec<u8>>> {
-    Ok(match engine.get(doc_key)? {
+) -> DocResult<(BTreeSet<Vec<u8>>, bool)> {
+    Ok(match engine.get_including_expired(doc_key)? {
         Some(stored) if !stored.is_empty() => {
             let old_kind = stored[0];
             let old_payload = &stored[1..];
-            if old_kind == VK_ZDOC {
+            let keys = if old_kind == VK_ZDOC {
                 let view = crate::binary::ValueView::new(old_payload);
                 index_keys_for_view(coll, prefix, doc_id, &view)
                     .into_iter()
@@ -360,16 +388,17 @@ fn old_index_keys(
                         .collect(),
                     Err(_) => BTreeSet::new(),
                 }
-            }
+            };
+            (keys, true)
         }
-        _ => BTreeSet::new(),
+        _ => (BTreeSet::new(), false),
     })
 }
 
 /// Insert or replace a document (no TTL). See [`upsert_with_expiry`].
 pub fn upsert(
     engine: &mut Engine,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
@@ -385,7 +414,7 @@ pub fn upsert(
 /// millis; `0` = never). Diffs index entries against the prior version.
 pub fn upsert_with_expiry(
     engine: &mut Engine,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
@@ -393,10 +422,10 @@ pub fn upsert_with_expiry(
     is_zdoc: bool,
     expires_at: u64,
 ) -> DocResult<u64> {
-    let ops = upsert_ops(
+    let w = upsert_ops(
         engine, catalog, prefix, collection, doc_id, payload, is_zdoc, expires_at,
     )?;
-    Ok(engine.write_batch(ops)?)
+    commit_batches(engine, catalog, vec![w])
 }
 
 /// Build (but do not write) the batch that deletes `doc_id` and all of its index
@@ -410,18 +439,25 @@ pub fn delete_ops(
     collection: &str,
     doc_id: &[u8],
     filter: Option<&crate::filter::Filter>,
-) -> DocResult<Vec<BatchOp>> {
+) -> DocResult<WriteOps> {
     let coll = catalog
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
     let doc_key = keys::doc_key(prefix, coll.id, doc_id);
+    let empty = || WriteOps {
+        ops: Vec::new(),
+        collection_id: coll.id,
+        doc_delta: 0,
+    };
     let stored = match engine.get(&doc_key)? {
         Some(v) => v,
-        None => return Ok(Vec::new()),
+        // Absent — or expired-but-unswept, in which case the sweep owns the
+        // counter decrement.
+        None => return Ok(empty()),
     };
     if let Some(f) = filter {
         if !crate::query::check_filter(&stored, f, doc_id) {
-            return Ok(Vec::new());
+            return Ok(empty());
         }
     }
 
@@ -437,26 +473,30 @@ pub fn delete_ops(
             ops.push(BatchOp::Del { key: k });
         }
     }
-    if ops.len() > MAX_BATCH_KEYS {
+    if ops.len() + 1 > MAX_BATCH_KEYS {
         return Err(DocError::BatchTooLarge(ops.len()));
     }
-    Ok(ops)
+    Ok(WriteOps {
+        ops,
+        collection_id: coll.id,
+        doc_delta: -1,
+    })
 }
 
 /// Delete a document and all of its index entries atomically. Returns whether
 /// the document existed.
 pub fn delete(
     engine: &mut Engine,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
 ) -> DocResult<bool> {
-    let ops = delete_ops(engine, catalog, prefix, collection, doc_id, None)?;
-    if ops.is_empty() {
+    let w = delete_ops(engine, catalog, prefix, collection, doc_id, None)?;
+    if w.ops.is_empty() {
         return Ok(false);
     }
-    engine.write_batch(ops)?;
+    commit_batches(engine, catalog, vec![w])?;
     Ok(true)
 }
 
@@ -470,57 +510,101 @@ pub fn delete(
 /// snapshot selection are skipped and not counted).
 pub fn delete_ids(
     engine: &mut Engine,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     prefix: &[u8],
     collection: &str,
     ids: &[Vec<u8>],
     filter: Option<&crate::filter::Filter>,
 ) -> DocResult<u64> {
-    let mut per_doc: Vec<Vec<BatchOp>> = Vec::with_capacity(ids.len());
+    let mut per_doc: Vec<WriteOps> = Vec::with_capacity(ids.len());
     let mut deleted: u64 = 0;
     for id in ids {
-        let ops = delete_ops(engine, catalog, prefix, collection, id, filter)?;
-        if !ops.is_empty() {
+        let w = delete_ops(engine, catalog, prefix, collection, id, filter)?;
+        if !w.ops.is_empty() {
             deleted += 1;
-            per_doc.push(ops);
+            per_doc.push(w);
         }
     }
-    commit_batches(engine, per_doc)?;
+    commit_batches(engine, catalog, per_doc)?;
     Ok(deleted)
 }
 
-/// Submit pre-built per-document op groups: one atomic `write_batch` when the
-/// total fits, otherwise one batch per group. Deletes can never violate a
-/// unique constraint, and combined keys never collide (distinct doc ids), so the
-/// merged batch is always safe.
-pub(crate) fn commit_batches(engine: &mut Engine, per_doc: Vec<Vec<BatchOp>>) -> DocResult<()> {
-    let total: usize = per_doc.iter().map(|o| o.len()).sum();
+/// Commit one batch atomically with the catalog counter blob: the updated
+/// catalog is a system put inside the SAME self-framed WAL record as the
+/// document ops, so a torn crash replays both or neither. The in-memory
+/// catalog is replaced only after the commit succeeds.
+fn write_counted_chunk(
+    engine: &mut Engine,
+    catalog: &mut Catalog,
+    working: &mut Catalog,
+    ops: Vec<BatchOp>,
+) -> DocResult<u64> {
+    let bytes = serde_json::to_vec(working).map_err(|e| DocError::Corrupt(e.to_string()))?;
+    let seq = engine
+        .write_batch_with_sys(ops, vec![(crate::catalog::CATALOG_SYS_KEY.to_vec(), bytes)])?;
+    *catalog = working.clone();
+    Ok(seq)
+}
+
+/// Single-batch commit with counter deltas spanning multiple collections
+/// (bounded transactions). The whole set must fit in one batch (one slot is
+/// reserved for the catalog blob). Returns the committed seq.
+pub fn commit_with_deltas(
+    engine: &mut Engine,
+    catalog: &mut Catalog,
+    ops: Vec<BatchOp>,
+    deltas: &[(u32, i64)],
+) -> DocResult<u64> {
+    if ops.is_empty() {
+        return Ok(0);
+    }
+    if ops.len() + 1 > MAX_BATCH_KEYS {
+        return Err(DocError::BatchTooLarge(ops.len()));
+    }
+    let mut working = catalog.clone();
+    for (coll_id, delta) in deltas {
+        working.add_doc_count(*coll_id, *delta);
+    }
+    write_counted_chunk(engine, catalog, &mut working, ops)
+}
+
+/// Submit pre-built per-document writes: one atomic batch when the total fits,
+/// otherwise chunked. Each chunk carries the catalog blob reflecting every
+/// delta up through that chunk, so a crash between chunks leaves counters
+/// matching exactly the committed chunks. Returns the last committed seq (0
+/// when there was nothing to write).
+pub(crate) fn commit_batches(
+    engine: &mut Engine,
+    catalog: &mut Catalog,
+    per_doc: Vec<WriteOps>,
+) -> DocResult<u64> {
+    let total: usize = per_doc.iter().map(|w| w.ops.len()).sum();
     if total == 0 {
-        return Ok(());
+        return Ok(0);
     }
 
-    let mut all = Vec::with_capacity(std::cmp::min(total, MAX_BATCH_KEYS));
-    for mut ops in per_doc {
-        // If adding this doc's ops would exceed the chunk limit, flush what we have
-        if all.len() + ops.len() > MAX_BATCH_KEYS && !all.is_empty() {
-            engine.write_batch(std::mem::take(&mut all))?;
-        }
-
-        // A single doc's ops should never exceed MAX_BATCH_KEYS in practice (unless
-        // there are hundreds of indexes), but if it somehow does, we write it alone
-        // and it'll get caught by the engine's internal check if it's strictly > MAX_BATCH_KEYS.
-        if ops.len() > MAX_BATCH_KEYS {
-            engine.write_batch(ops)?;
+    let mut working = catalog.clone();
+    // One slot per batch is reserved for the catalog system put.
+    let chunk_limit = MAX_BATCH_KEYS - 1;
+    let mut all: Vec<BatchOp> = Vec::with_capacity(std::cmp::min(total, chunk_limit));
+    let mut last_seq = 0u64;
+    for mut w in per_doc {
+        if w.ops.is_empty() {
             continue;
         }
-
-        all.append(&mut ops);
+        // If adding this doc's ops would exceed the chunk limit, flush what we have
+        if all.len() + w.ops.len() > chunk_limit && !all.is_empty() {
+            last_seq =
+                write_counted_chunk(engine, catalog, &mut working, std::mem::take(&mut all))?;
+        }
+        working.add_doc_count(w.collection_id, w.doc_delta);
+        all.append(&mut w.ops);
     }
 
     if !all.is_empty() {
-        engine.write_batch(all)?;
+        last_seq = write_counted_chunk(engine, catalog, &mut working, all)?;
     }
-    Ok(())
+    Ok(last_seq)
 }
 
 /// Encoded unique-index field values claimed by `doc` (one entry per unique index).
@@ -659,7 +743,8 @@ pub fn define_index_directed(
         .expect("collection ensured by add_index")
         .id;
 
-    backfill_index(engine, prefix, collection_id, &meta)?;
+    let entries = backfill_index(engine, prefix, collection_id, &meta)?;
+    working.set_index_entry_count(meta.id, entries);
     working.persist(engine)?;
     *catalog = working;
     Ok(())
@@ -710,13 +795,14 @@ pub fn derive_ttl_expires_at_view(
 }
 
 /// Scan every existing document in a collection and write the new index's
-/// entries in chunks that respect `MAX_BATCH_KEYS`.
+/// entries in chunks that respect `MAX_BATCH_KEYS`. Returns the number of
+/// entries written (the index's initial `entry_count`).
 fn backfill_index(
     engine: &mut Engine,
     prefix: &[u8],
     collection_id: u32,
     idx: &IndexMeta,
-) -> DocResult<()> {
+) -> DocResult<u64> {
     let dprefix = keys::doc_prefix(prefix, collection_id);
     let dhi = keys::prefix_upper_bound(&dprefix);
     let prefix_len = prefix.len();
@@ -726,6 +812,7 @@ fn backfill_index(
     // snapshot's fixed seq ceiling means our own writes are never re-scanned.
     let snap = engine.snapshot_owned();
     let mut pending: Vec<BatchOp> = Vec::new();
+    let mut entries: u64 = 0;
     let mut rows = snap.scan(dprefix.clone(), dhi)?;
     for item in rows.by_ref() {
         let (doc_key, stored) = item?;
@@ -758,6 +845,7 @@ fn backfill_index(
             value: doc_id.clone(),
             expires_at,
         });
+        entries += 1;
         // When creating a TTL index, stamp body expiry so existing docs become
         // invisible under lazy expiry without waiting for a later rewrite.
         if idx.expire_after_seconds.is_some() && expires_at != 0 {
@@ -777,5 +865,94 @@ fn backfill_index(
     if !pending.is_empty() {
         engine.write_batch(pending)?;
     }
-    Ok(())
+    Ok(entries)
+}
+
+/// Durable TTL sweep with counter maintenance. Tombstones every expired
+/// memtable entry AND applies the matching catalog counter deltas in the same
+/// atomic batches, so a crash replays tombstones and counts together (the
+/// engine's own `sweep_expired` is non-durable memtable hygiene and must not
+/// be used on the document path — a replayed expired value would be swept and
+/// counted twice).
+///
+/// Counter semantics: a document occupies its `doc_count` slot from upsert
+/// until delete or sweep. Documents that expire after leaving the active
+/// memtable (flushed, then dropped by compaction) are not observed by the
+/// sweep, so counts can overstate live TTL'd documents — the conservative,
+/// planner-safe direction. Raw-KV keys are tombstoned without any counter
+/// change.
+pub fn sweep_expired_with_counts(engine: &mut Engine, catalog: &mut Catalog) -> DocResult<usize> {
+    let expired = engine.collect_expired();
+    if expired.is_empty() {
+        return Ok(0);
+    }
+
+    // Classify each expired key against the catalog's known collection
+    // prefixes (snapshotted up front so the catalog can be mutated below).
+    // Doc keys decrement doc_count; index keys decrement their index's
+    // entry_count (they share the body's expiry and are swept alongside it).
+    // Raw-KV keys are tombstoned with no counter change.
+    let prefix_table: Vec<(Vec<u8>, u32)> = catalog
+        .collections()
+        .iter()
+        .map(|c| (c.prefix.clone(), c.id))
+        .collect();
+    let classify = |key: &[u8]| -> SweepDelta {
+        for (prefix, coll_id) in &prefix_table {
+            let plen = prefix.len();
+            if !key.starts_with(prefix) || key.len() < plen + 5 {
+                continue;
+            }
+            let key_coll = u32::from_be_bytes(key[plen + 1..plen + 5].try_into().unwrap());
+            if key_coll != *coll_id {
+                continue;
+            }
+            if key[plen] == keys::REC_DOC {
+                return SweepDelta::Doc(*coll_id);
+            }
+            if key[plen] == keys::REC_INDEX && key.len() >= plen + 9 {
+                let index_id = u32::from_be_bytes(key[plen + 5..plen + 9].try_into().unwrap());
+                return SweepDelta::Index(index_id);
+            }
+        }
+        SweepDelta::Raw
+    };
+
+    let total = expired.len();
+    let chunk_limit = MAX_BATCH_KEYS - 1;
+    let mut working = catalog.clone();
+    let mut chunk: Vec<BatchOp> = Vec::with_capacity(chunk_limit.min(total));
+    let mut chunk_deltas: Vec<SweepDelta> = Vec::with_capacity(chunk_limit.min(total));
+    for key in expired {
+        chunk_deltas.push(classify(&key));
+        chunk.push(BatchOp::Del { key });
+        if chunk.len() >= chunk_limit {
+            apply_sweep_deltas(&mut working, &mut chunk_deltas);
+            write_counted_chunk(engine, catalog, &mut working, std::mem::take(&mut chunk))?;
+        }
+    }
+    if !chunk.is_empty() {
+        apply_sweep_deltas(&mut working, &mut chunk_deltas);
+        write_counted_chunk(engine, catalog, &mut working, chunk)?;
+    }
+    Ok(total)
+}
+
+/// Counter delta for one swept key.
+enum SweepDelta {
+    Doc(u32),
+    Index(u32),
+    Raw,
+}
+
+fn apply_sweep_deltas(working: &mut Catalog, deltas: &mut Vec<SweepDelta>) {
+    for d in deltas.drain(..) {
+        match d {
+            // Doc keys move doc_count only; their index keys are swept (and
+            // counted) alongside as separate `Index` deltas.
+            SweepDelta::Doc(coll_id) => working.add_doc_count_only(coll_id, -1),
+            SweepDelta::Index(index_id) => working.add_index_entry_count(index_id, -1),
+            SweepDelta::Raw => {}
+        }
+    }
 }

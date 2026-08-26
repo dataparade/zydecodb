@@ -125,7 +125,8 @@ major.
   model
 - No general MVCC; transactions remain bounded per-connection staging
   (≤1024 keys)
-- No `$lookup`, joins, or `$unwind`
+- No `$unwind`, multi-`$lookup`, or Mongo aggregation compatibility
+  beyond the bounded `$lookup` in [`PROTOCOL.md`](PROTOCOL.md#aggregation)
 - No MongoDB compatibility
 - Single-writer primary
 
@@ -211,13 +212,13 @@ The release workflow then:
 
 ```bash
 # Go — pin the module version (not @latest)
-go get github.com/dataparade/zydecodb/clients/go@v1.0.0
+go get github.com/dataparade/zydecodb/clients/go@v1.1.0
 
 # Python
-pip install zydecodb==1.0.0
+pip install zydecodb==1.1.0
 
 # TypeScript
-npm install zydecodb@1.0.0
+npm install zydecodb@1.1.0
 ```
 
 Unified releases still ship matching `X.Y.Z` tags for convenience. After 1.0,

@@ -542,7 +542,7 @@ fn updated_body(
 /// atomic index-maintaining [`store::upsert`]. Returns whether the doc existed.
 pub fn apply_to_id(
     engine: &mut Engine,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
@@ -550,7 +550,7 @@ pub fn apply_to_id(
 ) -> DocResult<bool> {
     match updated_body(engine, catalog, prefix, collection, doc_id, update, None)? {
         Some((bytes, old)) => {
-            let ops = store::upsert_ops_with_old(
+            let w = store::upsert_ops_with_old(
                 engine,
                 catalog,
                 prefix,
@@ -561,7 +561,7 @@ pub fn apply_to_id(
                 0,
                 Some(&old),
             )?;
-            engine.write_batch(ops)?;
+            store::commit_batches(engine, catalog, vec![w])?;
             Ok(true)
         }
         None => Ok(false),
@@ -573,7 +573,7 @@ pub fn apply_to_id(
 /// revisions return [`DocError::StaleRevision`].
 pub fn apply_to_id_if_match(
     engine: &mut Engine,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     prefix: &[u8],
     collection: &str,
     doc_id: &[u8],
@@ -583,7 +583,7 @@ pub fn apply_to_id_if_match(
     store::check_if_match(engine, catalog, prefix, collection, doc_id, if_match)?;
     match updated_body(engine, catalog, prefix, collection, doc_id, update, None)? {
         Some((bytes, old)) => {
-            let ops = store::upsert_ops_with_old(
+            let w = store::upsert_ops_with_old(
                 engine,
                 catalog,
                 prefix,
@@ -594,7 +594,7 @@ pub fn apply_to_id_if_match(
                 0,
                 Some(&old),
             )?;
-            Ok(engine.write_batch(ops)?)
+            store::commit_batches(engine, catalog, vec![w])
         }
         None => Err(DocError::StaleRevision),
     }
@@ -612,7 +612,7 @@ pub fn apply_to_id_if_match(
 /// per-document compare-and-swap.
 pub fn apply_to_ids(
     engine: &mut Engine,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     prefix: &[u8],
     collection: &str,
     ids: &[Vec<u8>],
@@ -629,13 +629,13 @@ pub fn apply_to_ids(
     // everything and rely on the engine's write_batch uniqueness check, but
     // if that fails, we would ideally fall back to sequential. Since we are
     // optimizing the happy path, we'll try the batch first.
-    let mut per_doc: Vec<Vec<zydecodb_engine::engine::BatchOp>> = Vec::with_capacity(ids.len());
+    let mut per_doc: Vec<store::WriteOps> = Vec::with_capacity(ids.len());
     let mut modified: u64 = 0;
     for id in ids {
         if let Some((bytes, old)) =
             updated_body(engine, catalog, prefix, collection, id, update, filter)?
         {
-            let ops = store::upsert_ops_with_old(
+            let w = store::upsert_ops_with_old(
                 engine,
                 catalog,
                 prefix,
@@ -647,10 +647,10 @@ pub fn apply_to_ids(
                 Some(&old),
             )?;
             modified += 1;
-            per_doc.push(ops);
+            per_doc.push(w);
         }
     }
-    store::commit_batches(engine, per_doc)?;
+    store::commit_batches(engine, catalog, per_doc)?;
     Ok(modified)
 }
 

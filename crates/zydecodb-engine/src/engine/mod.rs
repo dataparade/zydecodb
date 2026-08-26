@@ -168,6 +168,11 @@ pub struct Engine {
     active_wal: Option<Arc<File>>,
     active_wal_size: usize,
     in_flight_wal_bytes: usize,
+    /// The front immutable memtable has been submitted to the flush worker but
+    /// its SSTable is not yet applied. The memtable stays in the read set
+    /// until the apply lands — popping it at submit time would make its data
+    /// invisible to new snapshots for the entire flush window.
+    flush_in_flight: bool,
     /// Cached max `seq` of each *sealed* (not active) WAL segment on disk.
     /// Populated when a segment is sealed (the seq is known at seal time —
     /// it's `last_buffered_seq`), and reconstructed on `Engine::open` for

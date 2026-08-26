@@ -9,7 +9,7 @@ Pin an explicit module version (do not use `@latest` — that can resolve to a
 pseudo-version when the nested Go tag is missing):
 
 ```bash
-go get github.com/dataparade/zydecodb/clients/go@v1.0.0
+go get github.com/dataparade/zydecodb/clients/go@v1.1.0
 ```
 
 Requires Go 1.23+. The Go module is tagged as `clients/go/vX.Y.Z` at the same
