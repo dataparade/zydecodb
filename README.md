@@ -6,14 +6,14 @@
 
 [![CI](https://github.com/dataparade/zydecodb/actions/workflows/ci.yml/badge.svg)](https://github.com/dataparade/zydecodb/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-BSL_1.1-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.91-orange)](https://www.rust-lang.org/)
 [![PyPI](https://img.shields.io/pypi/v/zydecodb)](https://pypi.org/project/zydecodb/)
 [![npm](https://img.shields.io/npm/v/zydecodb)](https://www.npmjs.com/package/zydecodb)
 [![Cloud](https://img.shields.io/badge/ZydecoDB-Cloud-1d4ed8)](https://zydecodb.com)
 
 </div>
 
-**ZydecoDB** is a source-available database written in **Rust**. It runs as a standalone server — any language that speaks TCP can talk to it.
+**ZydecoDB** is a source-available database written in **Rust**. It runs as a standalone server speaking a length-prefixed binary protocol over TCP (see `zydecodb-engine::frame` and [`docs/PROTOCOL.md`](docs/PROTOCOL.md#wire-protocol)). Official drivers are the supported client path.
 
 Two layers, one engine:
 
@@ -22,7 +22,7 @@ Two layers, one engine:
 
 ZydecoDB is also available as a fully managed **[ZydecoDB Cloud](https://zydecodb.com)** including a free tier.
 
-**License:** [BSL 1.1](LICENSE) (converts to Apache 2.0 on 2029-06-07)
+**License:** [BSL 1.1](LICENSE) — self-hosting (including production) is allowed; you may not offer ZydecoDB to third parties as a hosted or managed service. Converts to Apache 2.0 on 2029-06-07.
 
 <div align="center">
 
@@ -46,7 +46,7 @@ curl -sSL https://zydeco.dev/install.sh | sh
 # zydecodb update
 
 # 2. Start the server — no config needed for local use
-zydecodb serve          # listens on 127.0.0.1:9470, data in ~/.zydecodb
+zydecodb serve          # 127.0.0.1:9470; state under ~/.zydecodb/ (data in ~/.zydecodb/data)
 ```
 
 Then grab a driver and make your first write (Python shown; also on [npm](clients/typescript) and [Go](clients/go)):
@@ -111,7 +111,7 @@ Details: [`docs/GUIDE.md`](docs/GUIDE.md#security).
 
 ```bash
 # Create API keys first (auth is required in the Docker config)
-./target/release/zydecodb admin keys create \
+zydecodb admin keys create \
   --id docker --role admin --keys-file config/keys.toml
 
 docker compose up -d --build
@@ -123,13 +123,17 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 **Document store**
 - JSON document collections with auto-generated time-ordered `_id`
-- Filters: `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists`, implicit-AND, `$and/$or/$not`, dotted paths
+- Filters: `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$type`, `$all/$elemMatch`, gated `$regex` (max pattern length, `i` only), implicit-AND, `$and/$or/$not`, dotted paths
 - `find` with sort, projection, skip/limit, and cursor pagination; `find_one`, `count_documents`, `distinct`
 - Partial updates (`$set/$inc/$unset/$push/$setOnInsert`), filter upsert, `update_one/many`, `delete_one/many`
 - A query planner that uses an index (or `_id` lookup) when one fits and falls back to a collection scan otherwise — so any field is queryable
 - Secondary indexes maintained automatically and atomically on every write; synchronous backfill when added to an existing collection
 - **Unique indexes** enforced server-side (`create_index(..., unique=True)` → `Conflict` on duplicates)
 - **Repeatable-read pagination** — a cursor pins its snapshot, so later pages never shift under concurrent writes
+- Bounded `$match` → `$group` aggregation — [`docs/PROTOCOL.md`](docs/PROTOCOL.md#aggregation)
+- Primary-only change streams (`watch`) — [`docs/PROTOCOL.md`](docs/PROTOCOL.md#change-streams)
+- TTL: field-based indexes (`expireAfterSeconds`) and per-document `expires_at`; compaction drops expired SST values
+- Bounded per-connection transactions (by-ID + KV, ≤1024 keys)
 - Official drivers for Python ([`clients/python`](clients/python)), Go ([`clients/go`](clients/go)), and TypeScript/Node ([`clients/typescript`](clients/typescript)) — connection pooling, retries, and a typed error taxonomy, all verified byte-for-byte against shared [conformance vectors](clients/conformance)
 
 **Key-value core**
@@ -142,7 +146,7 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 **Operations**
 - API-key auth, tenant isolation, TLS, rate limits, audit logging
 - Durability you choose: `sync` (fsync-on-commit, default) or `periodic` (bounded-loss, higher throughput), plus a per-write `relaxed` flag
-- Prometheus `/metrics` plus `/healthz`/`/readyz` HTTP endpoints; optional per-tenant request counters
+- Prometheus `/metrics` plus `/healthz`/`/readyz` when `[metrics] listen` is set (zero-config `serve` does not bind them; dev/Docker use `127.0.0.1:9471`); optional per-tenant request counters
 - Exclusive `data_dir` lock (no accidental double-open) and graceful `SIGTERM`/`SIGINT` shutdown that writes a clean-shutdown marker
 - Read replicas via WAL shipping with assisted failover: a liveness heartbeat, a `replica status` health probe, and `replica promote` with a cooperative epoch fence — [`docs/GUIDE.md`](docs/GUIDE.md#replication-and-failover)
 - Base snapshots and point-in-time restore (`admin snapshot` / `admin restore --to-seq|--to-time`) — [`docs/GUIDE.md`](docs/GUIDE.md#wal-shipping-and-restore)
@@ -157,11 +161,11 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
 
 **Multi-tenant sharing model (read this):** tenants get **namespace isolation** (key prefix, ACLs, byte/RPS quotas, drop-tenant). Write/catalog mutations still serialize on the engine write lock; block cache, fair-share accounting, and WAL fsync are separate domains. δ-fair memtable/cache/stall isolation is **off by default** for local/single-tenant; pods hosts should start from [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) (`[fair] enabled = true`) and follow the one-page runbook [`docs/GUIDE.md`](docs/GUIDE.md#multi-tenant-pods). Until fair is on and soak-proven, do not assume one tenant’s write storm cannot affect another’s latency. See [`docs/GUIDE.md`](docs/GUIDE.md#multi-tenant-sharing-model).
 
-## 1.1 scope
+## 1.1
 
-**Today:** single-node document + KV database, binary protocol, API-key auth (optional on localhost). Filters, sort, projection, pagination, partial updates, `count`/`distinct`, bounded aggregation (`$match` / `$lookup` / `$group`), optional primary-only change streams, and automatic index maintenance; three official drivers (Python, Go, TypeScript). Queries are correct on any field (collection scan) and fast when an index fits. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md#aggregation) and [`docs/PROTOCOL.md`](docs/PROTOCOL.md#change-streams).
+**1.1** is a single-writer document + KV database: binary protocol, official Python / Go / TypeScript drivers, API-key auth (optional on localhost), filters, indexes, bounded `$match` / `$lookup` / `$group` aggregation, primary-only change streams, TTL, and assisted replica promote. Wire `proto_version = 1` is frozen for 1.x. Any 1.x official driver works against any 1.x server. See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
-**Not yet:** Mongo-compatible aggregation (`$unwind`/expressions/multi-`$lookup`), general MVCC/multi-document transactional queries (bounded by-ID+KV transactions ship), and *autonomous* failover (promotion is assisted — an orchestrator decides death and does hard fencing; the database automates draining, the epoch fence, and the role switch). δ-fair multi-tenant isolation clears the simulated pods soak ship bar (steady victim put p99 δ ≤ 50 ms with `[fair]` on) and the FairDB-style ramp-up reclaim gate (≤ 350 ms) but stays **off by default** — enable via [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml) and prove on your hardware via `scripts/tenant-isolation-soak.sh` (`MODE=rampup` for reclaim). See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the gap list and roadmap. Field-based TTL indexes (`expireAfterSeconds` on a unix-millis number field) and per-document DocPut `expires_at` are supported in the server and official drivers. TTL compaction reclamation ships for SST expiry drops.
+**1.x does not include** Mongo compatibility (`$unwind`, multi-`$lookup`, general aggregation), Raft / consensus, autonomous failover, or general MVCC. Transactions stay bounded per-connection staging. Fair multi-tenant isolation is off by default — enable `[fair]` from [`config/zydecodb.pods.example.toml`](config/zydecodb.pods.example.toml). Gap list: [`docs/PROTOCOL.md`](docs/PROTOCOL.md#not-yet).
 
 ## Expectations, gotchas, advice
 
@@ -171,10 +175,9 @@ Compose publishes `:9470` only. Metrics stay on loopback inside the container. S
   [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). Reserved opcodes may gain
   semantics without renumbering. On-disk format changes follow
   [`docs/GUIDE.md`](docs/GUIDE.md#upgrading).
-- **BSL license.** Self-hosting (including in production) is free; you may not offer ZydecoDB to third parties as a competing hosted/managed service. Converts to Apache 2.0 on the change date — see [LICENSE](LICENSE).
+- **BSL license.** Self-hosting (including in production) is allowed; you may not offer ZydecoDB to third parties as a hosted or managed service. Converts to Apache 2.0 on the change date — see [LICENSE](LICENSE). Fully managed: [ZydecoDB Cloud](https://zydecodb.com).
 - **Security:** run behind your API on localhost or a private network. See [`docs/GUIDE.md`](docs/GUIDE.md#security). Do not expose `:9470` to the internet without auth.
 - **Keys on the wire** are opaque bytes; the server stores them under the user keyspace (`KS_USER` prefix).
-- **Heavy sustained writes** can leave extra small on-disk files. Cosmetic — no data loss.
 
 ## Embedding
 
