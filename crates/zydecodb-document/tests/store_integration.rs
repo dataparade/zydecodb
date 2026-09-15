@@ -61,13 +61,12 @@ fn upsert_get_and_index_orders_by_field() {
     .unwrap();
 
     let snap = e.snapshot_owned();
-    assert_eq!(body_name(&snap, &mut cat, b"u1"), "alice");
+    assert_eq!(body_name(&snap, &cat, b"u1"), "alice");
 
     // Ascending by age: u2 (25) before u1 (30).
-    let spec = query::build_index_scan_spec(
-        &mut cat, PREFIX, "users", "by_age", None, None, None, 10, true,
-    )
-    .unwrap();
+    let spec =
+        query::build_index_scan_spec(&cat, PREFIX, "users", "by_age", None, None, None, 10, true)
+            .unwrap();
     let page = query::execute_index_scan(&snap, &spec).unwrap();
     assert_eq!(doc_ids(&page), vec![b"u2".to_vec(), b"u1".to_vec()]);
     assert!(page.next_cursor.is_none());
@@ -106,7 +105,7 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
 
     let snap = e.snapshot_owned();
     let spec = query::build_index_scan_spec(
-        &mut cat,
+        &cat,
         PREFIX,
         "users",
         "by_age",
@@ -127,10 +126,9 @@ fn bulk_delete_and_update_apply_to_all_candidates() {
     let deleted = store::delete_ids(&mut e, &mut cat, PREFIX, "users", &ids, None).unwrap();
     assert_eq!(deleted, 5);
     let snap = e.snapshot_owned();
-    let spec = query::build_index_scan_spec(
-        &mut cat, PREFIX, "users", "by_age", None, None, None, 100, true,
-    )
-    .unwrap();
+    let spec =
+        query::build_index_scan_spec(&cat, PREFIX, "users", "by_age", None, None, None, 100, true)
+            .unwrap();
     assert!(query::execute_index_scan(&snap, &spec)
         .unwrap()
         .rows
@@ -169,7 +167,7 @@ fn filtered_write_recheck_skips_stale_candidates() {
     // Phase 1 (as docdispatch does it): select candidates matching count == 4.
     let filter = Filter::parse_bytes(br#"{"count":4}"#).unwrap();
     let snap = e.snapshot_owned();
-    let ids = query::find_ids(&snap, &mut cat, PREFIX, "users", &filter, 100).unwrap();
+    let ids = query::find_ids(&snap, &cat, PREFIX, "users", &filter, 100).unwrap();
     assert_eq!(ids.len(), 1);
     drop(snap);
 
@@ -185,7 +183,7 @@ fn filtered_write_recheck_skips_stale_candidates() {
 
     // The document kept the concurrent writer's value (5), not 6.
     let snap = e.snapshot_owned();
-    let body = query::get_by_id(&snap, &mut cat, PREFIX, "users", b"u1")
+    let body = query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
         .unwrap()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -197,7 +195,7 @@ fn filtered_write_recheck_skips_stale_candidates() {
         store::delete_ids(&mut e, &mut cat, PREFIX, "users", &ids, Some(&filter)).unwrap();
     assert_eq!(deleted, 0, "stale candidate must not be deleted");
     let snap = e.snapshot_owned();
-    assert!(query::get_by_id(&snap, &mut cat, PREFIX, "users", b"u1")
+    assert!(query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
         .unwrap()
         .is_some());
 
@@ -256,7 +254,7 @@ fn filtered_positional_set_maintains_indexes() {
     let snap = e.snapshot_owned();
     let page = query::execute_find(
         &snap,
-        &mut cat,
+        &cat,
         PREFIX,
         "orders",
         &FindSpec {
@@ -279,7 +277,7 @@ fn filtered_positional_set_maintains_indexes() {
     // Old status index entry is gone.
     let old = query::execute_find(
         &snap,
-        &mut cat,
+        &cat,
         PREFIX,
         "orders",
         &FindSpec {
@@ -316,12 +314,12 @@ fn if_match_succeeds_when_revision_current() {
     )
     .unwrap();
     assert!(seq > 0);
-    let rev = store::doc_revision(&e, &mut cat, PREFIX, "users", b"u1")
+    let rev = store::doc_revision(&e, &cat, PREFIX, "users", b"u1")
         .unwrap()
         .unwrap();
     assert_eq!(rev, seq);
 
-    store::check_if_match(&e, &mut cat, PREFIX, "users", b"u1", rev).unwrap();
+    store::check_if_match(&e, &cat, PREFIX, "users", b"u1", rev).unwrap();
     let new_seq = store::upsert(
         &mut e,
         &mut cat,
@@ -335,12 +333,12 @@ fn if_match_succeeds_when_revision_current() {
     assert!(new_seq > rev);
 
     assert!(matches!(
-        store::check_if_match(&e, &mut cat, PREFIX, "users", b"u1", rev),
+        store::check_if_match(&e, &cat, PREFIX, "users", b"u1", rev),
         Err(zydecodb_document::error::DocError::StaleRevision)
     ));
 
     let upd = UpdateDoc::parse_bytes(br#"{"$inc":{"n":1}}"#).unwrap();
-    let cur = store::doc_revision(&e, &mut cat, PREFIX, "users", b"u1")
+    let cur = store::doc_revision(&e, &cat, PREFIX, "users", b"u1")
         .unwrap()
         .unwrap();
     let after =
@@ -351,7 +349,7 @@ fn if_match_succeeds_when_revision_current() {
         Err(zydecodb_document::error::DocError::StaleRevision)
     ));
     assert!(matches!(
-        store::check_if_match(&e, &mut cat, PREFIX, "users", b"missing", 1),
+        store::check_if_match(&e, &cat, PREFIX, "users", b"missing", 1),
         Err(zydecodb_document::error::DocError::StaleRevision)
     ));
 }
@@ -551,7 +549,7 @@ fn updating_indexed_field_moves_the_entry() {
     let snap = e.snapshot_owned();
     // Old bucket [30,31) is empty; new bucket [40,41) has u1.
     let old = query::build_index_scan_spec(
-        &mut cat,
+        &cat,
         PREFIX,
         "users",
         "by_age",
@@ -568,7 +566,7 @@ fn updating_indexed_field_moves_the_entry() {
         .is_empty());
 
     let new = query::build_index_scan_spec(
-        &mut cat,
+        &cat,
         PREFIX,
         "users",
         "by_age",
@@ -608,13 +606,12 @@ fn delete_removes_doc_and_index_entries() {
     assert!(!store::delete(&mut e, &mut cat, PREFIX, "users", b"u1").unwrap());
 
     let snap = e.snapshot_owned();
-    assert!(query::get_by_id(&snap, &mut cat, PREFIX, "users", b"u1")
+    assert!(query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
         .unwrap()
         .is_none());
-    let spec = query::build_index_scan_spec(
-        &mut cat, PREFIX, "users", "by_age", None, None, None, 10, false,
-    )
-    .unwrap();
+    let spec =
+        query::build_index_scan_spec(&cat, PREFIX, "users", "by_age", None, None, None, 10, false)
+            .unwrap();
     assert!(query::execute_index_scan(&snap, &spec)
         .unwrap()
         .rows
@@ -650,7 +647,7 @@ fn pagination_walks_all_rows_in_order() {
     loop {
         let snap = e.snapshot_owned();
         let spec = query::build_index_scan_spec(
-            &mut cat,
+            &cat,
             PREFIX,
             "users",
             "by_age",
@@ -724,10 +721,9 @@ fn define_index_backfills_existing_documents() {
     .unwrap();
 
     let snap = e.snapshot_owned();
-    let spec = query::build_index_scan_spec(
-        &mut cat, PREFIX, "users", "by_age", None, None, None, 10, false,
-    )
-    .unwrap();
+    let spec =
+        query::build_index_scan_spec(&cat, PREFIX, "users", "by_age", None, None, None, 10, false)
+            .unwrap();
     assert_eq!(
         doc_ids(&query::execute_index_scan(&snap, &spec).unwrap()),
         vec![b"u2".to_vec(), b"u1".to_vec()]
@@ -983,7 +979,7 @@ fn oversized_document_batch_is_rejected() {
     assert!(matches!(err, DocError::BatchTooLarge(_)));
     // Nothing persisted.
     let snap = e.snapshot_owned();
-    assert!(query::get_by_id(&snap, &mut cat, PREFIX, "users", b"u1")
+    assert!(query::get_by_id(&snap, &cat, PREFIX, "users", b"u1")
         .unwrap()
         .is_none());
 }
@@ -1050,12 +1046,12 @@ fn expires_at_change_rewrites_index_keys_for_compaction_reclaim() {
     e.drain_compaction().unwrap();
 
     let snap = e.snapshot_owned();
-    assert!(query::get_by_id(&snap, &mut cat, PREFIX, "sess", b"s1")
+    assert!(query::get_by_id(&snap, &cat, PREFIX, "sess", b"s1")
         .unwrap()
         .is_none());
     let page = query::execute_find(
         &snap,
-        &mut cat,
+        &cat,
         PREFIX,
         "sess",
         &FindSpec {
