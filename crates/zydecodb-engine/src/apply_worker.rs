@@ -203,35 +203,41 @@ fn apply_worker_loop(
 ) {
     while let Ok(ApplyCommand::Run(p)) = work_rx.recv() {
         let metrics_ref = metrics.lock().expect("apply metrics lock").clone();
-        if let Err(e) = durable_append(
-            &manifest_file,
-            &p.manifest_records,
-            metrics_ref.as_deref(),
-            &manifest_sync_window,
-        ) {
-            tracing::error!(error = %e, "apply worker manifest fsync failed");
-            failed.store(true, Ordering::Release);
-            pending_count.fetch_sub(1, Ordering::Release);
-            continue;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            durable_append(
+                &manifest_file,
+                &p.manifest_records,
+                metrics_ref.as_deref(),
+                &manifest_sync_window,
+            )?;
+            crate::failpoints::failpoint_result(
+                crate::failpoints::APPLY_AFTER_FSYNC_BEFORE_PUBLISH,
+            )?;
+            Ok::<ReadyCatalogApply, crate::errors::EngineError>(ReadyCatalogApply {
+                manifest_records: p.manifest_records,
+                add_metas: p.add_metas,
+                remove_sstable_ids: p.remove_sstable_ids,
+                unlink_wal_up_to: p.unlink_wal_up_to,
+                flush_max_seq: p.flush_max_seq,
+                compaction: p.compaction,
+            })
+        }));
+        match result {
+            Ok(Ok(ready_apply)) => {
+                ready.lock().expect("apply ready lock").push(ready_apply);
+                pending_count.fetch_sub(1, Ordering::Release);
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "apply worker manifest apply failed");
+                failed.store(true, Ordering::Release);
+                pending_count.fetch_sub(1, Ordering::Release);
+            }
+            Err(_) => {
+                tracing::error!("apply worker panicked");
+                failed.store(true, Ordering::Release);
+                pending_count.fetch_sub(1, Ordering::Release);
+            }
         }
-        if let Err(e) =
-            crate::failpoints::failpoint_result(crate::failpoints::APPLY_AFTER_FSYNC_BEFORE_PUBLISH)
-        {
-            tracing::error!(error = %e, "apply worker publish aborted at failpoint");
-            failed.store(true, Ordering::Release);
-            pending_count.fetch_sub(1, Ordering::Release);
-            continue;
-        }
-        let ready_apply = ReadyCatalogApply {
-            manifest_records: p.manifest_records,
-            add_metas: p.add_metas,
-            remove_sstable_ids: p.remove_sstable_ids,
-            unlink_wal_up_to: p.unlink_wal_up_to,
-            flush_max_seq: p.flush_max_seq,
-            compaction: p.compaction,
-        };
-        ready.lock().expect("apply ready lock").push(ready_apply);
-        pending_count.fetch_sub(1, Ordering::Release);
     }
 }
 

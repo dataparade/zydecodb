@@ -7,6 +7,7 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -20,6 +21,7 @@ jobs:
       - name: Test
         run: cargo test --all
       - name: Failpoint tests
+        timeout-minutes: 15
         run: cargo test -p zydecodb-engine --features failpoints --test crash_matrix --test resilience_failpoints -- --test-threads=1
       - name: Ops drills (restore / PITR / promote)
         run: cargo test -p zydecodb --test restore_equivalence --test pitr_restore --test promote_under_load -- --test-threads=1

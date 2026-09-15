@@ -89,13 +89,14 @@ impl Engine {
     }
 
     pub(crate) fn drain_flush(&mut self) -> EngineResult<()> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
         loop {
             self.poll_flush()?;
             if let Some(err) = self.flush_scheduler.take_worker_failure() {
-                if err.contains("injected failpoint") {
-                    return Err(EngineError::Io(err));
-                }
-                tracing::warn!(error = %err, "flush worker error; continuing drain");
+                return Err(EngineError::Io(err));
+            }
+            if Instant::now() >= deadline {
+                return Err(EngineError::Io("flush worker drain timeout".into()));
             }
             if self.flush_scheduler.is_worker_busy() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -108,6 +109,13 @@ impl Engine {
                 self.finish_pending_applies()?;
                 break;
             }
+            // Flush I/O finished but the catalog apply did not: the memtable
+            // stays in `immutable` and `flush_in_flight` stays set, so the
+            // submit path above cannot make progress. Surface the apply
+            // failure instead of sleeping until the drain deadline.
+            if self.apply_scheduler.take_failed() {
+                return Err(EngineError::Io("background apply failed".into()));
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         Ok(())
@@ -116,6 +124,7 @@ impl Engine {
     pub fn poll_flush(&mut self) -> EngineResult<usize> {
         let results = self.flush_scheduler.poll_results();
         let mut applied = 0usize;
+        let mut worker_failed = false;
         for result in results {
             match result {
                 Ok(r) => {
@@ -129,10 +138,17 @@ impl Engine {
                     // is resubmitted on the next attempt.
                     self.flush_in_flight = false;
                     self.flush_scheduler.note_worker_failed(e);
+                    worker_failed = true;
                 }
             }
         }
-        self.try_submit_flush();
+        // Same rule as poll_compaction: do not resubmit in the same pass that
+        // recorded a worker failure. try_submit_flush would otherwise requeue
+        // the same memtable against an armed panic failpoint and drain_flush
+        // would spin forever (this is what burned the 6h CI rust job).
+        if !worker_failed {
+            self.try_submit_flush();
+        }
         applied += self.drain_catalog_apply()?;
         Ok(applied)
     }
@@ -189,16 +205,14 @@ impl Engine {
     /// and `force_flush`.
     pub fn drain_compaction(&mut self) -> EngineResult<()> {
         self.request_compaction();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
         loop {
             self.poll_compaction()?;
             if let Some(err) = self.compaction_scheduler.take_worker_failure() {
-                if err.contains("injected failpoint") {
-                    return Err(EngineError::Io(err));
-                }
-                // Worker panic (e.g. failpoint "panic" mode) — stop retrying in this
-                // drain; the catalog is unchanged and a later drain can replan.
-                tracing::warn!(error = %err, "compaction worker error; aborting drain");
-                break;
+                return Err(EngineError::Io(err));
+            }
+            if Instant::now() >= deadline {
+                return Err(EngineError::Io("compaction worker drain timeout".into()));
             }
             if !self.compaction_scheduler.is_worker_busy() {
                 if self.plan_compaction_job().is_none()

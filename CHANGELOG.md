@@ -6,6 +6,15 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+- rustls `0.23.40` → `0.23.45` (`RUSTSEC-2026-0285`: TLS 1.3 handshake
+  messages accepted across encryption-level boundaries).
+- `drain_flush` no longer resubmits a failed flush in the same poll, and
+  both flush and compaction drains abort on worker failure / 30s timeout.
+  The apply worker now catches failpoint panics and marks the apply failed
+  instead of dying and leaving `finish_pending_applies` blocked. Those two
+  loops are what burned the 6h CI rust job. The rust job now has a
+  45-minute timeout (15 minutes on the failpoint step).
+
 Correctness, security and availability fixes from the tier-1 audit. No wire
 changes; conformance vectors are unchanged.
 
