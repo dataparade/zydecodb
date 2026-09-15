@@ -405,7 +405,22 @@ fn main() {
             ReplicaCommands::Promote { config, from } => {
                 let cfg = load_config(&config);
                 let from = resolve_from(from, cfg.replica.from.clone());
-                match zydecodb::replica::promote(&from, &cfg.wal_dir, &cfg.data_dir) {
+                let hmac_key = cfg
+                    .replica
+                    .hmac_key_file
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "replica promote requires replica.hmac_key_file — the shipped stream \
+                         must be HMAC-authenticated during the drain. Set hmac_key_file to \
+                         the same path used by the primary's [shipping].hmac_key_file \
+                         (chmod 600)"
+                            .to_string()
+                    })
+                    .and_then(zydecodb::config::load_hmac_key);
+                match hmac_key.and_then(|key| {
+                    zydecodb::replica::promote(&from, &cfg.wal_dir, &cfg.data_dir, &key)
+                        .map_err(|e| e.to_string())
+                }) {
                     Ok(out) => {
                         println!(
                             "promoted: drained {} segment(s), epoch {} -> {} (applied_seq {})",
@@ -421,7 +436,7 @@ fn main() {
                         );
                         Ok(())
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(e),
                 }
             }
         },

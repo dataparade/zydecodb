@@ -19,7 +19,7 @@ from . import _protocol as proto
 from .change_stream import ChangeStream
 from .collection import Collection
 from .errors import ConnectionError as ZConnectionError
-from .errors import ServerBusyError, ZydecoError, from_status
+from .errors import ConfigError, ServerBusyError, ZydecoError, from_status
 from .pool import ConnectionPool
 from .transaction import transaction as _transaction_cm
 
@@ -47,7 +47,17 @@ class Client:
         backoff_base: float = 0.05,
         backoff_cap: float = 2.0,
         tls: Optional[TlsOption] = None,
+        watch_idle_timeout: float = 45.0,
     ):
+        """
+        `timeout` is the per-request socket timeout. `watch_idle_timeout` is
+        the socket timeout of the dedicated connection behind `watch()`: how
+        long a change stream may stay silent before the driver gives up. It
+        must exceed the server's `change_streams.heartbeat_ms` (default 15s),
+        otherwise an idle stream dies between heartbeats.
+        """
+        if watch_idle_timeout <= 0:
+            raise ConfigError("watch_idle_timeout must be > 0")
         self._pool = ConnectionPool(
             host,
             port,
@@ -59,6 +69,7 @@ class Client:
         self._max_retries = max(0, max_retries)
         self._backoff_base = backoff_base
         self._backoff_cap = backoff_cap
+        self._watch_idle_timeout = watch_idle_timeout
 
     # --- lifecycle ---
 

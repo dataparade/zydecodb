@@ -160,7 +160,13 @@ fn promote_under_load_keeps_shipped_acks() {
     }
 
     let t0 = Instant::now();
-    let out = replica::promote(&ship_dir, &replica_wal, &replica_data).unwrap();
+    let out = replica::promote(
+        &ship_dir,
+        &replica_wal,
+        &replica_data,
+        &std::fs::read(&hmac_key).unwrap(),
+    )
+    .unwrap();
     let promote_ms = t0.elapsed().as_millis();
     eprintln!(
         "promote_under_load promote_ms={promote_ms} new_epoch={}",
@@ -238,13 +244,13 @@ fn fenced_old_primary_refuses_after_promote() {
     replica::write_fence(&ship, 1).unwrap();
     let data = tmp.path().join("data");
     let wal = tmp.path().join("wal");
+    let hmac = tmp.path().join("hmac");
+    write_secret_file(&hmac, b"fence-hmac-key-material-padded-32b!");
     let t0 = Instant::now();
-    let out = replica::promote(&ship, &wal, &data).unwrap();
+    let out = replica::promote(&ship, &wal, &data, &std::fs::read(&hmac).unwrap()).unwrap();
     eprintln!("promote_timing_ms={}", t0.elapsed().as_millis());
     replica::write_fence(&ship, out.new_epoch).unwrap();
 
-    let hmac = tmp.path().join("hmac");
-    write_secret_file(&hmac, b"fence-hmac-key-material-padded-32b!");
     let addr = free_addr();
     let mut cfg = named_base_config(&tmp, "old", addr);
     cfg.shipping = ShippingConfig {

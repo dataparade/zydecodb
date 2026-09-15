@@ -7,11 +7,14 @@ reachable, so a plain `pytest` run stays green offline; CI starts a server first
 
 import os
 import socket
+import threading
+import time
 import uuid
 
 import pytest
 
 from zydecodb import Client, ConflictError
+from zydecodb.errors import ServerError
 
 HOST = os.environ.get("ZYDECODB_TEST_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ZYDECODB_TEST_PORT", "9470"))
@@ -158,3 +161,50 @@ def test_bounded_transaction(db, coll):
     tx.put(b"tx-rollback", b"nope")
     tx.rollback()
     assert db.get(b"tx-rollback") is None
+
+
+def test_watch_idle_timeout_is_decoupled_from_request_timeout():
+    # A 1s request timeout must not apply to the dedicated Watch connection:
+    # an idle stream only carries a server heartbeat every heartbeat_ms (3s in
+    # CI), so with the request timeout the blocking read below would die.
+    client = Client(HOST, PORT, api_key=API_KEY, timeout=1.0)
+    try:
+        coll = client.collection(f"pytest_{uuid.uuid4().hex[:12]}")
+        coll.insert_one({"_seed": True})  # Watch requires an existing collection.
+        stream = coll.watch()
+        try:
+            stream.__enter__()
+        except ServerError as e:
+            stream.close()
+            if "change stream" in str(e):
+                pytest.skip(f"change streams not enabled on server: {e}")
+            raise
+
+        got = []
+        failed = []
+
+        def consume():
+            try:
+                for event in stream:
+                    got.append(event)
+                    return
+            except Exception as e:  # noqa: BLE001 - surfaced via `failed`
+                failed.append(e)
+
+        reader = threading.Thread(target=consume, daemon=True)
+        reader.start()
+        # Several request-timeout windows with no events; only heartbeats flow.
+        time.sleep(5.0)
+        assert not failed, f"idle watch died: {failed[0]!r}"
+        assert reader.is_alive(), "watch reader exited without an event"
+
+        doc_id = coll.insert_one({"n": 1})
+        reader.join(10.0)
+        assert not failed, f"watch failed after write: {failed[0]!r}"
+        assert got, "no change event received"
+        assert got[0].op == "upsert"
+        assert got[0].doc_id == doc_id
+        assert got[0].document["n"] == 1
+        stream.close()
+    finally:
+        client.close()

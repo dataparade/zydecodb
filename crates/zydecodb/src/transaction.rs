@@ -316,11 +316,16 @@ pub fn handle_control(
                 return e;
             }
             match commit_transaction(engine, catalog, &state) {
-                Ok(seq) => {
-                    commit.commit(seq, false);
-                    with_tx_metrics(engine, |m| m.tx_commit_total.inc());
-                    ResponseEnvelope::ok(wire::encode_commit_response(seq))
-                }
+                Ok(seq) => match commit.commit(seq, false) {
+                    Ok(()) => {
+                        with_tx_metrics(engine, |m| m.tx_commit_total.inc());
+                        ResponseEnvelope::ok(wire::encode_commit_response(seq))
+                    }
+                    Err(e) => {
+                        with_tx_metrics(engine, |m| m.tx_abort_total.inc());
+                        e.to_response()
+                    }
+                },
                 Err(e) => {
                     // Transaction is already cleared (taken); surface error.
                     with_tx_metrics(engine, |m| m.tx_abort_total.inc());
@@ -359,7 +364,7 @@ pub fn handle_in_transaction(
         Command::Get => Some(tx_get(tx, session, security, &req.payload)),
         Command::Put => Some(tx_put(tx, session, security, &req.payload)),
         Command::Del => Some(tx_del(tx, session, security, &req.payload)),
-        Command::DocGetRev => Some(tx_doc_get_rev(tx, catalog, &req.payload)),
+        Command::DocGetRev => Some(tx_doc_get_rev(tx, catalog, session, &req.payload)),
         Command::DocPut => Some(tx_doc_put(tx, catalog, session, &req.payload, None)),
         Command::DocPutIfMatch => Some(tx_doc_put_if_match(tx, catalog, session, &req.payload)),
         Command::DocDel => Some(tx_doc_del(tx, catalog, session, &req.payload)),
@@ -409,7 +414,9 @@ fn tx_put(
         Ok(p) => p,
         Err(e) => return ResponseEnvelope::error(e.status(), &e.to_string()),
     };
-    if let Some(resp) = crate::security::check_key_prefix_acl(session, &p.key) {
+    if let Some(resp) = crate::security::check_key_prefix_acl(session, &p.key)
+        .or_else(|| crate::security::check_reserved_client_key(&p.key))
+    {
         return resp;
     }
     let key = storage_key(session, &p.key, security.legacy_single_tenant);
@@ -439,7 +446,9 @@ fn tx_del(
         Ok(p) => p,
         Err(e) => return ResponseEnvelope::error(e.status(), &e.to_string()),
     };
-    if let Some(resp) = crate::security::check_key_prefix_acl(session, &p.key) {
+    if let Some(resp) = crate::security::check_key_prefix_acl(session, &p.key)
+        .or_else(|| crate::security::check_reserved_client_key(&p.key))
+    {
         return resp;
     }
     let key = storage_key(session, &p.key, security.legacy_single_tenant);
@@ -470,12 +479,16 @@ fn ensure_kv_base(tx: &mut TransactionState, key: &[u8]) -> DocResult<()> {
 fn tx_doc_get_rev(
     tx: &TransactionState,
     catalog: &SharedCatalog,
+    session: &SessionState,
     payload: &[u8],
 ) -> ResponseEnvelope {
     let (collection, doc_id) = match wire::decode_doc_get_rev(payload) {
         Ok(v) => v,
         Err(e) => return err_response(&e),
     };
+    if let Some(resp) = crate::security::check_collection_prefix_acl(session, &collection) {
+        return resp;
+    }
     let dk = DocKey {
         collection: collection.clone(),
         doc_id: doc_id.clone(),
@@ -886,12 +899,13 @@ fn commit_under_lock(
         // Empty commit: still succeeds with current seq (no WAL write).
         return Ok(engine.snapshot_owned().seq_upper());
     }
-    // One slot is reserved for the catalog counter blob.
-    if key_map.len() + 1 > MAX_BATCH_KEYS {
+    // One slot is reserved per collection whose document count moves (its
+    // counter record commits in the same WAL record).
+    let deltas: Vec<(u32, i64)> = deltas.into_iter().filter(|(_, d)| *d != 0).collect();
+    if key_map.len() + deltas.len() > MAX_BATCH_KEYS {
         return Err(DocError::BatchTooLarge(key_map.len()));
     }
     let ops: Vec<BatchOp> = key_map.into_values().collect();
-    let deltas: Vec<(u32, i64)> = deltas.into_iter().collect();
     store::commit_with_deltas(engine, catalog, ops, &deltas)
 }
 

@@ -20,13 +20,58 @@
 //!
 //! A per-request `relaxed` flag lets an individual write opt out of the
 //! durability wait even in `Sync` mode (ack-after-buffer for that write).
+//!
+//! Fsync failure is sticky and fails closed. After `fsync(2)` reports an error
+//! the kernel may already have dropped the dirty pages, so a later successful
+//! fsync proves nothing about the writes buffered before it. The coordinator
+//! therefore records the first failure, wakes every waiter with
+//! [`CommitError`], and never syncs again; the server refuses new writes
+//! (reads keep working) and `/readyz` reports 503 until the process restarts.
 
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::error;
 use zydecodb_engine::engine_handle::EngineHandle;
+use zydecodb_engine::errors::{EngineError, Status};
+use zydecodb_engine::frame::ResponseEnvelope;
 use zydecodb_engine::wal_sync::WalSync;
+
+/// The WAL fsync thread failed. The write this was returned for is not known
+/// to be durable, and the coordinator refuses all further writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitError {
+    /// The underlying I/O error text from the first failed fsync.
+    pub reason: String,
+}
+
+impl fmt::Display for CommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WAL fsync failed ({}); write not durable; writes refused until restart",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for CommitError {}
+
+impl CommitError {
+    /// Wire response for a write refused or unacknowledged because of a
+    /// coordinator failure.
+    pub fn to_response(&self) -> ResponseEnvelope {
+        ResponseEnvelope::error(Status::IoError, &self.to_string())
+    }
+}
+
+impl From<CommitError> for EngineError {
+    fn from(e: CommitError) -> Self {
+        EngineError::Io(e.to_string())
+    }
+}
 
 /// How the server establishes durability for acknowledged writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +89,8 @@ struct CommitState {
     /// Highest `seq` known fsynced to disk.
     synced_seq: u64,
     shutdown: bool,
+    /// Set once by the first failed fsync; never cleared.
+    failed: Option<String>,
 }
 
 /// Owns the single fsync thread and the condvars that connection threads wait
@@ -55,9 +102,12 @@ pub struct CommitCoordinator {
     wal_sync: Arc<zydecodb_engine::wal_sync::WalSync>,
     mode: DurabilityMode,
     state: Mutex<CommitState>,
+    /// Lock-free mirror of `state.failed.is_some()` so the per-request write
+    /// gate in the server loop never takes the state mutex.
+    failed: AtomicBool,
     /// Signaled when a `Sync`-mode waiter raises `requested_seq`, or on stop.
     work: Condvar,
-    /// Signaled when `synced_seq` advances, or on stop.
+    /// Signaled when `synced_seq` advances, on failure, or on stop.
     done: Condvar,
 }
 
@@ -76,7 +126,9 @@ impl CommitCoordinator {
                 requested_seq: 0,
                 synced_seq: 0,
                 shutdown: false,
+                failed: None,
             }),
+            failed: AtomicBool::new(false),
             work: Condvar::new(),
             done: Condvar::new(),
         })
@@ -97,11 +149,34 @@ impl CommitCoordinator {
     /// Make `seq` durable according to the configured mode. In `Sync` mode this
     /// blocks (unless `relaxed`) until `seq` is fsynced; in `Periodic` mode it
     /// returns immediately and the background tick provides durability.
-    pub fn commit(&self, seq: u64, relaxed: bool) {
+    ///
+    /// Returns `Err` once the fsync thread has failed: the write may not be on
+    /// disk and the caller must not acknowledge it as durable. Relaxed and
+    /// periodic writes get the same `Err` so no caller acks into a dead WAL.
+    pub fn commit(&self, seq: u64, relaxed: bool) -> Result<(), CommitError> {
         match self.mode {
             DurabilityMode::Sync if !relaxed => self.await_durable(seq),
-            _ => {}
+            _ => match self.failure() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
         }
+    }
+
+    /// `Some` once the fsync thread has hit an I/O error. Sticky until restart.
+    pub fn failure(&self) -> Option<CommitError> {
+        if !self.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        let st = self.state.lock().unwrap();
+        st.failed.as_ref().map(|reason| CommitError {
+            reason: reason.clone(),
+        })
+    }
+
+    /// Lock-free check for the server's per-request write gate.
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
     }
 
     /// Highest sequence known fsynced (change streams must not emit beyond this).
@@ -113,8 +188,8 @@ impl CommitCoordinator {
             .max(self.wal_sync.synced_seq())
     }
 
-    /// Block until `seq` is fsynced, or `timeout` elapses, or shutdown.
-    /// Returns true if `seq` is durable.
+    /// Block until `seq` is fsynced, or `timeout` elapses, or shutdown, or the
+    /// fsync thread has failed. Returns true if `seq` is durable.
     pub fn wait_durable(&self, seq: u64, timeout: Duration) -> bool {
         let mut st = self.state.lock().unwrap();
         if st.synced_seq.max(self.wal_sync.synced_seq()) >= seq {
@@ -125,7 +200,10 @@ impl CommitCoordinator {
         }
         self.work.notify_one();
         let deadline = Instant::now() + timeout;
-        while st.synced_seq.max(self.wal_sync.synced_seq()) < seq && !st.shutdown {
+        while st.synced_seq.max(self.wal_sync.synced_seq()) < seq
+            && !st.shutdown
+            && st.failed.is_none()
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -138,6 +216,11 @@ impl CommitCoordinator {
 
     /// Block until the durable watermark advances past `seq`, then return.
     /// Used by change streams waiting for new fsynced writes.
+    ///
+    /// After an fsync failure the watermark can never advance, so this simply
+    /// runs out its (bounded) `timeout`. It deliberately does not return early
+    /// on failure: the watch loop calls it back-to-back, and an immediate
+    /// return would turn every idle change stream into a busy loop.
     pub fn wait_durable_advance(&self, after_seq: u64, timeout: Duration) -> u64 {
         let mut st = self.state.lock().unwrap();
         let mut durable = st.synced_seq.max(self.wal_sync.synced_seq());
@@ -163,18 +246,33 @@ impl CommitCoordinator {
     }
 
     /// Block until `seq` is fsynced, or the coordinator is shutting down (in
-    /// which case `Engine::shutdown` provides the final durability point).
-    fn await_durable(&self, seq: u64) {
+    /// which case `Engine::shutdown` provides the final durability point), or
+    /// the fsync thread has failed (`Err`: `seq` is not known to be durable).
+    fn await_durable(&self, seq: u64) -> Result<(), CommitError> {
         let mut st = self.state.lock().unwrap();
         if st.synced_seq >= seq {
-            return;
+            return Ok(());
+        }
+        if let Some(reason) = &st.failed {
+            return Err(CommitError {
+                reason: reason.clone(),
+            });
         }
         if seq > st.requested_seq {
             st.requested_seq = seq;
         }
         self.work.notify_one();
-        while st.synced_seq < seq && !st.shutdown {
+        while st.synced_seq < seq && !st.shutdown && st.failed.is_none() {
             st = self.done.wait(st).unwrap();
+        }
+        if st.synced_seq >= seq {
+            return Ok(());
+        }
+        match &st.failed {
+            Some(reason) => Err(CommitError {
+                reason: reason.clone(),
+            }),
+            None => Ok(()),
         }
     }
 
@@ -198,7 +296,9 @@ impl CommitCoordinator {
             // WAL-sync locks are never held together, so there is no lock-order
             // inversion with writers.
             drop(st);
-            self.fsync_once();
+            if !self.fsync_once() {
+                return;
+            }
             st = self.state.lock().unwrap();
         }
     }
@@ -210,7 +310,9 @@ impl CommitCoordinator {
                 return;
             }
             drop(st);
-            self.fsync_once();
+            if !self.fsync_once() {
+                return;
+            }
             st = self.state.lock().unwrap();
             if st.shutdown {
                 return;
@@ -223,7 +325,12 @@ impl CommitCoordinator {
     /// Fsync the WAL once (off the engine lock) and publish the new durable seq
     /// to any waiters. Strict-ack is preserved: `done` is notified only after
     /// `WalSync::sync` returns, i.e. after the fsync has actually completed.
-    fn fsync_once(&self) {
+    ///
+    /// Returns `false` after an fsync error. The failure is recorded, every
+    /// waiter is woken so it can return [`CommitError`], and the caller must
+    /// stop the fsync loop: a later fsync cannot be trusted to cover the
+    /// writes that were buffered when this one failed.
+    fn fsync_once(&self) -> bool {
         match self.wal_sync.sync() {
             Ok(seq) => {
                 let mut st = self.state.lock().unwrap();
@@ -231,8 +338,21 @@ impl CommitCoordinator {
                     st.synced_seq = seq;
                     self.done.notify_all();
                 }
+                true
             }
-            Err(e) => error!(error = %e, "WAL fsync failed in commit coordinator"),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "WAL fsync failed in commit coordinator; refusing writes until restart"
+                );
+                let mut st = self.state.lock().unwrap();
+                if st.failed.is_none() {
+                    st.failed = Some(e.to_string());
+                }
+                self.failed.store(true, Ordering::Release);
+                self.done.notify_all();
+                false
+            }
         }
     }
 
@@ -281,11 +401,82 @@ mod tests {
             let mut e = engine.write();
             e.put(b"\x01k".to_vec(), b"v".to_vec(), 0).unwrap()
         };
-        coord.commit(seq, false);
+        coord.commit(seq, false).unwrap();
         // After commit() returns in Sync mode, the seq must be fsynced.
         let synced = coord.state.lock().unwrap().synced_seq;
         assert!(synced >= seq);
         coord.stop();
+    }
+
+    /// An fsync error must wake the blocked Sync-mode waiter with an error
+    /// (not hang it), stick, and refuse every later commit in any mode.
+    #[cfg(unix)]
+    #[test]
+    fn fsync_failure_fails_closed() {
+        use std::os::fd::OwnedFd;
+        // fsync(2) on a pipe fails with EINVAL, giving a deterministic I/O
+        // error without touching a filesystem.
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let pipe_file = std::fs::File::from(OwnedFd::from(writer));
+
+        let wal_sync = WalSync::new(0);
+        wal_sync.set_active(Arc::new(pipe_file));
+        let coord = CommitCoordinator::from_wal_sync(Arc::clone(&wal_sync), DurabilityMode::Sync);
+        let thread = coord.spawn().unwrap();
+        assert!(coord.failure().is_none());
+
+        wal_sync.advance_buffered(1);
+        let start = Instant::now();
+        let err = coord.commit(1, false).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "waiter did not return promptly after fsync failure"
+        );
+        assert!(err.to_string().contains("writes refused until restart"));
+        assert!(coord.is_failed());
+        assert_eq!(coord.failure(), Some(err.clone()));
+        assert_eq!(err.to_response().status, Status::IoError);
+
+        // Sticky: later commits of any flavor are refused without blocking.
+        wal_sync.advance_buffered(2);
+        assert_eq!(coord.commit(2, false), Err(err.clone()));
+        assert_eq!(coord.commit(2, true), Err(err.clone()));
+        assert!(!coord.wait_durable(2, Duration::from_millis(50)));
+        // Already-durable seqs stay durable.
+        assert!(coord.wait_durable(0, Duration::from_millis(10)));
+
+        // The fsync thread has exited; stop/join must not hang.
+        coord.stop();
+        thread.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_mode_fsync_failure_is_reported_on_next_commit() {
+        use std::os::fd::OwnedFd;
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let wal_sync = WalSync::new(0);
+        wal_sync.set_active(Arc::new(std::fs::File::from(OwnedFd::from(writer))));
+        let coord = CommitCoordinator::from_wal_sync(
+            Arc::clone(&wal_sync),
+            DurabilityMode::Periodic {
+                interval: Duration::from_millis(10),
+            },
+        );
+        let thread = coord.spawn().unwrap();
+        wal_sync.advance_buffered(1);
+        let mut failed = false;
+        for _ in 0..100 {
+            if coord.is_failed() {
+                failed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(failed, "periodic tick never observed the fsync error");
+        assert!(coord.commit(1, false).is_err());
+        coord.stop();
+        thread.join().unwrap();
     }
 
     #[test]
@@ -298,7 +489,7 @@ mod tests {
             e.put(b"\x01k".to_vec(), b"v".to_vec(), 0).unwrap()
         };
         let start = Instant::now();
-        coord.commit(seq, true);
+        coord.commit(seq, true).unwrap();
         // Relaxed must return promptly without waiting on the fsync thread.
         assert!(start.elapsed() < Duration::from_millis(50));
         coord.stop();
@@ -320,7 +511,7 @@ mod tests {
         };
         // commit() returns immediately in periodic mode (no wait).
         let start = Instant::now();
-        coord.commit(seq, false);
+        coord.commit(seq, false).unwrap();
         assert!(start.elapsed() < Duration::from_millis(20));
         // The background tick makes it durable within a few intervals.
         let mut durable = false;
@@ -359,7 +550,7 @@ mod tests {
                 e.put(b"\x01durable".to_vec(), b"value".to_vec(), 0)
                     .unwrap()
             };
-            coord.commit(seq, false);
+            coord.commit(seq, false).unwrap();
             coord.stop();
             // Join the coordinator so its engine Arc is released; otherwise the
             // background thread can outlive this block and keep the data_dir lock

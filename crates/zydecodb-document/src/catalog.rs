@@ -1,20 +1,146 @@
 //! Collection/index catalog.
 //!
-//! The whole catalog is persisted as ONE JSON blob under a single `KS_SYSTEM`
-//! key and cached in memory behind an `RwLock`. A single blob (read-modify-
-//! write) avoids needing a system-keyspace range scan, which the engine does
-//! not expose; the catalog is small (metadata only).
+//! The schema (collections, indexes, id allocators) is persisted as ONE JSON
+//! blob under a single `KS_SYSTEM` key and cached in memory behind an
+//! `RwLock`. A single blob (read-modify-write) avoids needing a system-keyspace
+//! range scan, which the engine does not expose; the schema is small and only
+//! changes on DDL.
+//!
+//! Live counters (`doc_count`, `entry_count`) change on every document write,
+//! so they do NOT live in the blob: each collection has its own small binary
+//! counter record under [`COUNTER_SYS_PREFIX`], written in the same WAL record
+//! as the document ops that move it (see `store::write_counted_chunk`). A
+//! document write therefore costs one ~30-byte system put instead of a rewrite
+//! of the whole catalog. The blob is rewritten on DDL only, and every DDL
+//! rewrite also writes every collection's counter record, which is what seeds
+//! counters for a catalog written by an older version (those blobs still carry
+//! counts, and [`Catalog::load`] falls back to them when a counter record is
+//! missing).
 //!
 //! Collections are identified by `(prefix, name)` so each tenant's namespace is
 //! isolated by its storage prefix while ids stay globally unique.
 
 use crate::error::{DocError, DocResult};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use zydecodb_engine::engine::Engine;
+use zydecodb_engine::keys::MAX_BATCH_KEYS;
 
 /// System key for the catalog blob: `KS_SYSTEM` (0x00) + `"doc/catalog"`.
 pub const CATALOG_SYS_KEY: &[u8] = b"\x00doc/catalog";
+
+/// System key prefix for per-collection counter records: `KS_SYSTEM` (0x00) +
+/// `"doc/cnt/"` + `collection_id` (u32 BE).
+pub const COUNTER_SYS_PREFIX: &[u8] = b"\x00doc/cnt/";
+
+/// Counter record key for `collection_id`.
+pub fn counter_sys_key(collection_id: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(COUNTER_SYS_PREFIX.len() + 4);
+    k.extend_from_slice(COUNTER_SYS_PREFIX);
+    k.extend_from_slice(&collection_id.to_be_bytes());
+    k
+}
+
+/// One collection's live counters, the value of its counter record.
+///
+/// Fixed little-endian layout: `doc_count: u64`, `n: u32`, then `n` pairs of
+/// `(index_id: u32, entry_count: u64)`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CollectionCounters {
+    pub doc_count: u64,
+    /// `(index_id, entry_count)` per index, in catalog order.
+    pub indexes: Vec<(u32, u64)>,
+}
+
+impl CollectionCounters {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + self.indexes.len() * 12);
+        out.extend_from_slice(&self.doc_count.to_le_bytes());
+        out.extend_from_slice(&(self.indexes.len() as u32).to_le_bytes());
+        for (id, n) in &self.indexes {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> DocResult<Self> {
+        let corrupt = || DocError::Corrupt("truncated collection counter record".into());
+        let u64_at = |off: usize| -> DocResult<u64> {
+            bytes
+                .get(off..off + 8)
+                .and_then(|s| s.try_into().ok())
+                .map(u64::from_le_bytes)
+                .ok_or_else(corrupt)
+        };
+        let u32_at = |off: usize| -> DocResult<u32> {
+            bytes
+                .get(off..off + 4)
+                .and_then(|s| s.try_into().ok())
+                .map(u32::from_le_bytes)
+                .ok_or_else(corrupt)
+        };
+        let doc_count = u64_at(0)?;
+        let n = u32_at(8)? as usize;
+        if bytes.len() != 12 + n * 12 {
+            return Err(DocError::Corrupt(format!(
+                "collection counter record length {} does not match {} index entries",
+                bytes.len(),
+                n
+            )));
+        }
+        let mut indexes = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = 12 + i * 12;
+            indexes.push((u32_at(off)?, u64_at(off + 4)?));
+        }
+        Ok(CollectionCounters { doc_count, indexes })
+    }
+}
+
+/// A counter change to commit atomically with a batch of document ops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterDelta {
+    /// A document was inserted (`+1`) or removed (`-1`); every index on the
+    /// collection moves by the same amount (one entry per document per index).
+    Doc { collection_id: u32, delta: i64 },
+    /// Document count only. Used by the TTL sweep, where a doc key and its
+    /// index keys are tombstoned and counted independently.
+    DocOnly { collection_id: u32, delta: i64 },
+    /// One index's entry count only (TTL sweep). Index ids are globally
+    /// unique, so the owning collection is looked up from the catalog.
+    Index { index_id: u32, delta: i64 },
+}
+
+/// Post-write counters for the collections a batch touches. Built from the
+/// live catalog before the write ([`Catalog::counter_update`]) and folded back
+/// in only after the batch commits ([`Catalog::apply_counter_update`]), so a
+/// failed write leaves the in-memory counters untouched without cloning the
+/// catalog.
+#[derive(Debug, Default)]
+pub struct CounterUpdate {
+    touched: BTreeMap<u32, CollectionCounters>,
+}
+
+impl CounterUpdate {
+    /// Number of counter records the update writes (one per touched collection).
+    pub fn len(&self) -> usize {
+        self.touched.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.touched.is_empty()
+    }
+
+    /// System puts to include in the batch, one per touched collection.
+    pub fn sys_puts(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.touched
+            .iter()
+            .map(|(id, c)| (counter_sys_key(*id), c.encode()))
+            .collect()
+    }
+}
 
 fn directions_all_ascending(dirs: &[bool]) -> bool {
     dirs.iter().all(|&d| d)
@@ -36,8 +162,10 @@ pub struct IndexMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expire_after_seconds: Option<u64>,
     /// Exact count of live index entries. Maintained in the same engine-lock
-    /// critical section as document writes; `0` in old catalog blobs.
-    #[serde(default)]
+    /// critical section as document writes and persisted in the collection's
+    /// counter record, never in the catalog blob (`default` still accepts the
+    /// count from blobs written by older versions).
+    #[serde(default, skip_serializing)]
     pub entry_count: u64,
 }
 
@@ -64,8 +192,10 @@ pub struct CollectionMeta {
     pub name: String,
     pub indexes: Vec<IndexMeta>,
     /// Exact count of live documents. Maintained in the same engine-lock
-    /// critical section as document writes; `0` in old catalog blobs.
-    #[serde(default)]
+    /// critical section as document writes and persisted in the collection's
+    /// counter record, never in the catalog blob (`default` still accepts the
+    /// count from blobs written by older versions).
+    #[serde(default, skip_serializing)]
     pub doc_count: u64,
 }
 
@@ -91,30 +221,153 @@ pub type SharedCatalog = Arc<RwLock<Catalog>>;
 
 impl Catalog {
     /// Load the catalog from the engine, or return an empty catalog if none has
-    /// been written yet.
+    /// been written yet. Read-only: the schema comes from the blob and each
+    /// collection's counters from its counter record. A collection without a
+    /// counter record (blob written by an older version, before its first
+    /// counted write) keeps the counts carried in the blob.
     pub fn load(engine: &Engine) -> DocResult<Self> {
-        match engine.sys_get(CATALOG_SYS_KEY)? {
+        let mut cat: Catalog = match engine.sys_get(CATALOG_SYS_KEY)? {
             Some(bytes) => {
-                serde_json::from_slice(&bytes).map_err(|e| DocError::Corrupt(e.to_string()))
+                serde_json::from_slice(&bytes).map_err(|e| DocError::Corrupt(e.to_string()))?
             }
-            None => Ok(Catalog::default()),
+            None => return Ok(Catalog::default()),
+        };
+        for c in &mut cat.collections {
+            let Some(bytes) = engine.sys_get(&counter_sys_key(c.id))? else {
+                continue;
+            };
+            let counters = CollectionCounters::decode(&bytes)?;
+            c.doc_count = counters.doc_count;
+            for idx in &mut c.indexes {
+                if let Some((_, n)) = counters.indexes.iter().find(|(id, _)| *id == idx.id) {
+                    idx.entry_count = *n;
+                }
+            }
         }
+        Ok(cat)
     }
 
-    /// Persist the catalog as the single system blob.
+    /// Persist the schema blob and every collection's counter record. DDL only:
+    /// document writes never call this (they update counter records through
+    /// [`Catalog::counter_update`]). The blob and the first
+    /// `MAX_BATCH_KEYS - 1` counters commit in one WAL record; any further
+    /// counters follow in their own records (rewriting an unchanged counter is
+    /// idempotent, so a crash between records loses nothing). Fsyncs before
+    /// returning, matching the durability of the old single system put.
     pub fn persist(&self, engine: &mut Engine) -> DocResult<()> {
         let bytes = serde_json::to_vec(self).map_err(|e| DocError::Corrupt(e.to_string()))?;
-        engine.sys_put(CATALOG_SYS_KEY.to_vec(), bytes)?;
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(1 + self.collections.len());
+        puts.push((CATALOG_SYS_KEY.to_vec(), bytes));
+        for c in &self.collections {
+            puts.push((counter_sys_key(c.id), Self::counters_of(c).encode()));
+        }
+        for chunk in puts.chunks(MAX_BATCH_KEYS) {
+            engine.write_batch_with_sys(Vec::new(), chunk.to_vec())?;
+        }
+        engine.sync_wal()?;
         Ok(())
     }
 
+    fn counters_of(c: &CollectionMeta) -> CollectionCounters {
+        CollectionCounters {
+            doc_count: c.doc_count,
+            indexes: c.indexes.iter().map(|i| (i.id, i.entry_count)).collect(),
+        }
+    }
+
+    fn collection_by_id(&self, collection_id: u32) -> Option<&CollectionMeta> {
+        self.collections.iter().find(|c| c.id == collection_id)
+    }
+
+    /// Owning collection of an index (ids are globally unique).
+    pub fn collection_id_for_index(&self, index_id: u32) -> Option<u32> {
+        self.collections
+            .iter()
+            .find(|c| c.indexes.iter().any(|i| i.id == index_id))
+            .map(|c| c.id)
+    }
+
+    /// Compute the counter records a batch must write for `deltas`, without
+    /// mutating the catalog. Zero deltas and deltas for unknown collections or
+    /// indexes touch nothing. Counts saturate at zero rather than wrapping;
+    /// exactness is enforced by the drift tests, not by panicking in prod.
+    pub fn counter_update(&self, deltas: &[CounterDelta]) -> CounterUpdate {
+        let mut upd = CounterUpdate::default();
+        for d in deltas {
+            let (collection_id, delta) = match *d {
+                CounterDelta::Doc {
+                    collection_id,
+                    delta,
+                }
+                | CounterDelta::DocOnly {
+                    collection_id,
+                    delta,
+                } => (collection_id, delta),
+                CounterDelta::Index { index_id, delta } => {
+                    match self.collection_id_for_index(index_id) {
+                        Some(c) => (c, delta),
+                        None => continue,
+                    }
+                }
+            };
+            if delta == 0 {
+                continue;
+            }
+            let Some(coll) = self.collection_by_id(collection_id) else {
+                continue;
+            };
+            let entry = upd
+                .touched
+                .entry(collection_id)
+                .or_insert_with(|| Self::counters_of(coll));
+            match *d {
+                CounterDelta::Doc { .. } => {
+                    entry.doc_count = entry.doc_count.saturating_add_signed(delta);
+                    for (_, n) in &mut entry.indexes {
+                        *n = n.saturating_add_signed(delta);
+                    }
+                }
+                CounterDelta::DocOnly { .. } => {
+                    entry.doc_count = entry.doc_count.saturating_add_signed(delta);
+                }
+                CounterDelta::Index { index_id, .. } => {
+                    if let Some((_, n)) = entry.indexes.iter_mut().find(|(id, _)| *id == index_id) {
+                        *n = n.saturating_add_signed(delta);
+                    }
+                }
+            }
+        }
+        upd
+    }
+
+    /// Fold a committed [`CounterUpdate`] into the in-memory counters.
+    pub fn apply_counter_update(&mut self, upd: &CounterUpdate) {
+        for (collection_id, counters) in &upd.touched {
+            let Some(c) = self.collections.iter_mut().find(|c| c.id == *collection_id) else {
+                continue;
+            };
+            c.doc_count = counters.doc_count;
+            for idx in &mut c.indexes {
+                if let Some((_, n)) = counters.indexes.iter().find(|(id, _)| *id == idx.id) {
+                    idx.entry_count = *n;
+                }
+            }
+        }
+    }
+
     /// Remove every collection (and its indexes) stored under `prefix`, returning
-    /// the number removed. Used for tenant offboarding: the caller deletes the
-    /// underlying document/index keys separately and then persists the catalog.
-    pub fn remove_collections_with_prefix(&mut self, prefix: &[u8]) -> usize {
-        let before = self.collections.len();
+    /// the ids removed. Used for tenant offboarding: the caller deletes the
+    /// underlying document/index keys and the removed collections' counter
+    /// records separately and then persists the catalog.
+    pub fn remove_collections_with_prefix(&mut self, prefix: &[u8]) -> Vec<u32> {
+        let removed: Vec<u32> = self
+            .collections
+            .iter()
+            .filter(|c| c.prefix == prefix)
+            .map(|c| c.id)
+            .collect();
         self.collections.retain(|c| c.prefix != prefix);
-        before - self.collections.len()
+        removed
     }
 
     /// Look up a collection by `(prefix, name)`.
@@ -129,40 +382,8 @@ impl Catalog {
         &self.collections
     }
 
-    /// Apply a document-count delta to a collection. Every index's
-    /// `entry_count` moves by the same delta: each document contributes
-    /// exactly one entry per index. Saturates at zero rather than wrapping —
-    /// exactness is enforced by the drift tests, not by panicking in prod.
-    pub fn add_doc_count(&mut self, collection_id: u32, delta: i64) {
-        if let Some(c) = self.collections.iter_mut().find(|c| c.id == collection_id) {
-            c.doc_count = c.doc_count.saturating_add_signed(delta);
-            for idx in &mut c.indexes {
-                idx.entry_count = idx.entry_count.saturating_add_signed(delta);
-            }
-        }
-    }
-
-    /// Apply a document-count delta WITHOUT touching index entry counts.
-    /// Used by the TTL sweep, where a doc key and its index keys are
-    /// tombstoned together and counted independently.
-    pub fn add_doc_count_only(&mut self, collection_id: u32, delta: i64) {
-        if let Some(c) = self.collections.iter_mut().find(|c| c.id == collection_id) {
-            c.doc_count = c.doc_count.saturating_add_signed(delta);
-        }
-    }
-
-    /// Apply an entry-count delta to one index (ids are globally unique).
-    /// Used by the TTL sweep, which tombstones index keys directly.
-    pub fn add_index_entry_count(&mut self, index_id: u32, delta: i64) {
-        for c in &mut self.collections {
-            if let Some(idx) = c.indexes.iter_mut().find(|i| i.id == index_id) {
-                idx.entry_count = idx.entry_count.saturating_add_signed(delta);
-                return;
-            }
-        }
-    }
-
-    /// Set an index's entry count outright (backfill).
+    /// Set an index's entry count outright (backfill). DDL only: the caller
+    /// persists the catalog (blob + counter records) afterwards.
     pub fn set_index_entry_count(&mut self, index_id: u32, count: u64) {
         for c in &mut self.collections {
             if let Some(idx) = c.indexes.iter_mut().find(|i| i.id == index_id) {

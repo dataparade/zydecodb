@@ -54,6 +54,11 @@ with Client("127.0.0.1", 9470, api_key="YOUR_KEY") as db:
   `create_index`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.
 - **Raw KV with TTL.** Side-channel `put` (with `expires_at`), `get`, and `delete` methods on `Client` for session data that needs a time-to-live.
+- **Change streams.** `collection.watch()` opens a dedicated connection and
+  yields `ChangeEvent`s. That connection uses `watch_idle_timeout` (default
+  45s), not the per-request `timeout`; it must exceed the server's
+  `change_streams.heartbeat_ms` (default 15s) or an idle stream dies between
+  heartbeats.
 - **TLS.** Pass `tls=True` for system CA defaults, or an `ssl.SSLContext` for custom roots / verification.
 
 ## Optimistic concurrency

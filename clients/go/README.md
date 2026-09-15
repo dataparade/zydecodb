@@ -89,6 +89,11 @@ func main() {
   `CreateIndex`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.
 - **Raw KV with TTL.** Side-channel `Put` (with `expiresAt`), `Get`, and `Delete` methods on `Client` for session data that needs a time-to-live.
+- **Change streams.** `coll.Watch(ctx, nil)` opens a dedicated connection;
+  `Next` returns `ChangeEvent`s. That connection uses `WithWatchIdleTimeout`
+  (default 45s), not `WithTimeout`; it must exceed the server's
+  `change_streams.heartbeat_ms` (default 15s) or an idle stream dies between
+  heartbeats.
 - **TLS.** `WithTLS(nil)` uses system roots and infers SNI from the dial address; pass a custom `*tls.Config` when you need private CAs or other settings.
 
 ## Optimistic concurrency

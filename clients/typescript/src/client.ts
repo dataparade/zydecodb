@@ -35,8 +35,17 @@ import { Transaction } from "./transaction.ts";
 
 export interface ClientOptions {
   apiKey?: string;
-  /** Per-request I/O timeout in ms (default 5000). */
+  /**
+   * Per-request I/O timeout in ms (default 5000). Does not apply to an open
+   * Watch stream; see `watchIdleTimeoutMs`.
+   */
   timeoutMs?: number;
+  /**
+   * How long an open Watch stream may stay silent before it fails, in ms
+   * (default 45000). Must exceed the server's `change_streams.heartbeat_ms`
+   * (default 15000), otherwise an idle stream dies between heartbeats.
+   */
+  watchIdleTimeoutMs?: number;
   /** Maximum pooled connections (default 8). */
   poolSize?: number;
   /** Retries for idempotent operations on transient failures (default 2). */
@@ -82,6 +91,8 @@ export class Client {
   private readonly maxRetries: number;
   private readonly backoffBaseMs: number;
   private readonly backoffCapMs: number;
+  /** Idle timeout applied to Watch stream reads (see `ClientOptions`). */
+  readonly watchIdleTimeoutMs: number;
 
   constructor(address = "127.0.0.1:9470", options: ClientOptions = {}) {
     const { host, port } = parseAddress(address);
@@ -96,6 +107,11 @@ export class Client {
     this.maxRetries = Math.max(0, options.maxRetries ?? 2);
     this.backoffBaseMs = options.backoffBaseMs ?? 50;
     this.backoffCapMs = options.backoffCapMs ?? 2000;
+    const idle = options.watchIdleTimeoutMs ?? 45_000;
+    if (!Number.isFinite(idle) || idle <= 0) {
+      throw new ZydecoError("watchIdleTimeoutMs must be a positive number");
+    }
+    this.watchIdleTimeoutMs = idle;
   }
 
   close(): void {

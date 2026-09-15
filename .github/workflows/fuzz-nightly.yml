@@ -13,6 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Restore fuzz corpus
@@ -24,6 +26,12 @@ jobs:
             fuzz-corpus-
       - name: Fuzz all targets
         working-directory: fuzz
+        env:
+          # rust-toolchain.toml pins 1.91; cargo-fuzz needs nightly for -Z
+          # sanitizer flags. Without this override every run since 2026-08-07
+          # died in the first target's build with "the option `Z` is only
+          # accepted on the nightly compiler" and fuzzed nothing.
+          RUSTUP_TOOLCHAIN: nightly
         run: |
           set -euo pipefail
           targets=(
@@ -44,7 +52,9 @@ jobs:
           for t in "${targets[@]}"; do
             echo "==> fuzz $t"
             mkdir -p "corpus/$t"
-            cargo fuzz run "$t" -- -max_total_time=900 -artifact_prefix="artifacts/${t}-"
+            # Workspace release LTO + ASAN/sancov + rust-lld drops __sancov_gen_
+            # symbols (cargo-fuzz#384/#404), same as the fuzz-smoke gate.
+            cargo +nightly fuzz run "$t" --sanitizer none -- -max_total_time=900 -artifact_prefix="artifacts/${t}-"
           done
       - name: Save fuzz corpus
         if: always()

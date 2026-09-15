@@ -326,8 +326,17 @@ pub fn drop_tenant_on_engine(
         .delete_prefix(prefix.clone())
         .map_err(|e| e.to_string())?;
 
-    let removed = catalog.remove_collections_with_prefix(&prefix);
+    let removed_ids = catalog.remove_collections_with_prefix(&prefix);
+    let removed = removed_ids.len();
     catalog.persist(engine).map_err(|e| e.to_string())?;
+    // The removed collections' counter records are unreachable once the
+    // schema no longer lists them; clearing them is housekeeping, not
+    // correctness, so a failure here is logged rather than fatal.
+    for id in removed_ids {
+        if let Err(e) = engine.sys_del(zydecodb_document::catalog::counter_sys_key(id)) {
+            tracing::warn!(error = %e, collection_id = id, "failed to remove counter record");
+        }
+    }
 
     if compact {
         engine.compact_all().map_err(|e| e.to_string())?;

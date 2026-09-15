@@ -114,6 +114,9 @@ jobs:
             echo '[security]'
             echo 'require_auth = "false"'
             echo 'keys_file = "/tmp/zdb/keys.toml"'
+            echo '[change_streams]'
+            echo 'enabled = true'
+            echo 'heartbeat_ms = 3000'
           } > /tmp/zdb.toml
           ./target/debug/zydecodb serve --config /tmp/zdb.toml &
           echo $! > /tmp/zdb.pid
@@ -160,6 +163,9 @@ jobs:
             echo '[security]'
             echo 'require_auth = "false"'
             echo 'keys_file = "/tmp/zdb/keys.toml"'
+            echo '[change_streams]'
+            echo 'enabled = true'
+            echo 'heartbeat_ms = 3000'
           } > /tmp/zdb.toml
           ./target/debug/zydecodb serve --config /tmp/zdb.toml &
           echo $! > /tmp/zdb.pid
@@ -209,6 +215,9 @@ jobs:
             echo '[security]'
             echo 'require_auth = "false"'
             echo 'keys_file = "/tmp/zdb/keys.toml"'
+            echo '[change_streams]'
+            echo 'enabled = true'
+            echo 'heartbeat_ms = 3000'
           } > /tmp/zdb.toml
           ./target/debug/zydecodb serve --config /tmp/zdb.toml &
           echo $! > /tmp/zdb.pid

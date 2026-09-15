@@ -302,7 +302,7 @@ fn replica_soak_failover_cycles() {
             .unwrap();
             eng.shutdown().unwrap();
         }
-        let out = replica::promote(&ship_dir, &replica_wal, &replica_data).unwrap();
+        let out = replica::promote(&ship_dir, &replica_wal, &replica_data, &hmac_bytes).unwrap();
         assert!(
             out.new_epoch > out.previous_epoch,
             "cycle {cycle}: epoch must advance"

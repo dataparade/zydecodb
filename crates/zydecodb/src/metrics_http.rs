@@ -10,7 +10,12 @@
 //! remote binds require a bearer `token`. When a token is configured (loopback
 //! or not), `/metrics` requires `Authorization: Bearer <token>`; `/healthz` and
 //! `/readyz` stay unauthenticated so probes keep working.
+//!
+//! `/readyz` answers 503 once the commit coordinator has recorded a WAL fsync
+//! failure: the process is alive and serving reads, but it refuses writes until
+//! it is restarted, so it must be taken out of a write-serving rotation.
 
+use crate::commit::CommitCoordinator;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -48,6 +53,7 @@ pub fn spawn(
     metrics: Arc<Metrics>,
     shutdown: Arc<Mutex<bool>>,
     token: Option<String>,
+    commit: Arc<CommitCoordinator>,
 ) -> std::io::Result<JoinHandle<()>> {
     let server = Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?;
     info!(%addr, auth = token.is_some(), "metrics endpoint listening (/metrics /healthz /readyz)");
@@ -58,7 +64,7 @@ pub fn spawn(
                 break;
             }
             match server.recv_timeout(Duration::from_millis(250)) {
-                Ok(Some(req)) => handle(req, &metrics, token.as_deref()),
+                Ok(Some(req)) => handle(req, &metrics, token.as_deref(), &commit),
                 Ok(None) => continue,
                 Err(e) => {
                     error!(error = %e, "metrics http receive failed");
@@ -68,7 +74,7 @@ pub fn spawn(
         })
 }
 
-fn handle(req: Request, metrics: &Metrics, token: Option<&str>) {
+fn handle(req: Request, metrics: &Metrics, token: Option<&str>, commit: &CommitCoordinator) {
     if *req.method() != Method::Get {
         let _ = req.respond(Response::from_string("method not allowed\n").with_status_code(405));
         return;
@@ -89,7 +95,10 @@ fn handle(req: Request, metrics: &Metrics, token: Option<&str>) {
                 .with_header(content_type("text/plain; version=0.0.4"))
         }
         "/healthz" => Response::from_string("ok\n").with_status_code(200),
-        "/readyz" => Response::from_string("ready\n").with_status_code(200),
+        "/readyz" => match commit.failure() {
+            Some(e) => Response::from_string(format!("not ready: {e}\n")).with_status_code(503),
+            None => Response::from_string("ready\n").with_status_code(200),
+        },
         _ => Response::from_string("not found\n").with_status_code(404),
     };
     let _ = req.respond(resp);

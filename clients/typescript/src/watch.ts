@@ -74,7 +74,9 @@ export class ChangeStream implements AsyncIterable<ChangeEvent> {
       await this.open();
       while (true) {
         this.throwIfAborted();
-        const res = await this.conn!.waitResponse();
+        // Idle timeout, not the request timeout: a quiet stream only carries
+        // a heartbeat every `change_streams.heartbeat_ms`.
+        const res = await this.conn!.waitResponse(this.client.watchIdleTimeoutMs);
         if (res.status !== Status.Ok) {
           throw fromStatus(res.status, "Watch", res.body);
         }

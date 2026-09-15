@@ -8,6 +8,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/dataparade/zydecodb/clients/go/internal/proto"
 )
 
 // Integration tests against a live ZydecoDB server. Set ZYDECODB_TEST_HOST /
@@ -354,5 +356,73 @@ func TestLiveBoundedTransaction(t *testing.T) {
 	gone, err := c.Get(ctx, []byte("tx-rollback"))
 	if err != nil || gone != nil {
 		t.Fatalf("rollback must leave nothing: %v %q", err, gone)
+	}
+}
+
+func TestLiveWatchIdleTimeoutIsDecoupledFromRequestTimeout(t *testing.T) {
+	// A 1s request timeout must not apply to the dedicated Watch connection:
+	// an idle stream only carries a server heartbeat every heartbeat_ms (3s in
+	// CI), so with the request timeout the blocking Next below would fail.
+	addr := testAddr()
+	if nc, err := net.DialTimeout("tcp", addr, time.Second); err != nil {
+		t.Skipf("no ZydecoDB server at %s: %v", addr, err)
+	} else {
+		_ = nc.Close()
+	}
+	opts := []Option{WithTimeout(time.Second)}
+	if key := os.Getenv("ZYDECODB_TEST_API_KEY"); key != "" {
+		opts = append(opts, WithAPIKey(key))
+	}
+	c := NewClient(addr, opts...)
+	defer c.Close()
+	ctx := context.Background()
+
+	coll := c.Collection(uniqueCollection())
+	if _, err := coll.InsertOne(ctx, Document{"_seed": true}, false, 0); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+	stream, err := coll.Watch(ctx, nil)
+	if err != nil {
+		if s, ok := serverStatus(err); ok && s == proto.StatusForbidden {
+			t.Skipf("change streams not enabled on server: %v", err)
+		}
+		t.Fatalf("watch: %v", err)
+	}
+	defer stream.Close()
+
+	type result struct {
+		ev  *ChangeEvent
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ev, err := stream.Next(ctx)
+		done <- result{ev, err}
+	}()
+
+	// Several request-timeout windows with no events; only heartbeats flow.
+	select {
+	case r := <-done:
+		t.Fatalf("idle watch ended early: ev=%v err=%v", r.ev, r.err)
+	case <-time.After(5 * time.Second):
+	}
+
+	docID, err := coll.InsertOne(ctx, Document{"n": 1.0}, false, 0)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("watch failed after write: %v", r.err)
+		}
+		if r.ev.Op != "upsert" || r.ev.DocID != docID {
+			t.Fatalf("unexpected event: %+v (want upsert of %s)", r.ev, docID)
+		}
+		if r.ev.Document["n"] != 1.0 {
+			t.Fatalf("unexpected document: %+v", r.ev.Document)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no change event within 10s of the write")
 	}
 }

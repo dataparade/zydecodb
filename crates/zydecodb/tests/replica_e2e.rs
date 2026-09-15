@@ -182,7 +182,15 @@ fn promotion_bumps_epoch_and_fences_old_primary() {
     // Promote a replica against this stream: epoch must advance to 2.
     let replica_data = tmp.path().join("replica_data");
     let replica_wal = tmp.path().join("replica_wal");
-    let out = replica::promote(&ship, &replica_wal, &replica_data).unwrap();
+    let hmac_key = tmp.path().join("ship.hmac");
+    write_secret_file(&hmac_key, b"e2e-shipping-hmac-key-material-32b!!");
+    let out = replica::promote(
+        &ship,
+        &replica_wal,
+        &replica_data,
+        &std::fs::read(&hmac_key).unwrap(),
+    )
+    .unwrap();
     assert_eq!(out.previous_epoch, 1);
     assert_eq!(out.new_epoch, 2);
     assert_eq!(replica::read_epoch(&replica_data), 2);
@@ -194,8 +202,6 @@ fn promotion_bumps_epoch_and_fences_old_primary() {
     // The OLD primary (epoch 1, no EPOCH file) tries to restart against the same
     // stream. serve must refuse before binding a socket to avoid split-brain.
     let old_addr = free_addr();
-    let hmac_key = tmp.path().join("ship.hmac");
-    write_secret_file(&hmac_key, b"e2e-shipping-hmac-key-material-32b!!");
     let mut old_cfg = named_base_config(&tmp, "old_primary", old_addr);
     old_cfg.shipping = ShippingConfig {
         ship_dir: Some(ship.clone()),

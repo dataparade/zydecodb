@@ -24,9 +24,11 @@ type ChangeStream struct {
 }
 
 // Watch opens a dedicated change stream on collection. resumeToken may be nil
-// or empty to start after the current durable watermark.
+// or empty to start after the current durable watermark. The stream's
+// connection uses the client's watch idle timeout (WithWatchIdleTimeout), not
+// the per-request timeout, so an idle stream survives between heartbeats.
 func (c *Client) Watch(ctx context.Context, collection string, resumeToken []byte) (*ChangeStream, error) {
-	nc, err := c.pool.openDedicated(ctx)
+	nc, err := c.pool.openDedicated(ctx, c.watchIdleTimeout)
 	if err != nil {
 		return nil, err
 	}

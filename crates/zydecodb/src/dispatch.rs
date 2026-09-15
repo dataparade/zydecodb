@@ -211,7 +211,9 @@ fn handle_put(
     match PutPayload::decode(&req.payload) {
         Ok(p) => {
             // ACL check needs only the session; do it before touching the lock.
-            if let Some(resp) = crate::security::check_key_prefix_acl(&session, &p.key) {
+            if let Some(resp) = crate::security::check_key_prefix_acl(&session, &p.key)
+                .or_else(|| crate::security::check_reserved_client_key(&p.key))
+            {
                 return InnerOutcome {
                     response: resp,
                     session,
@@ -322,7 +324,9 @@ fn handle_del(
     }
     match KeyPayload::decode(&req.payload) {
         Ok(p) => {
-            if let Some(resp) = crate::security::check_key_prefix_acl(&session, &p.key) {
+            if let Some(resp) = crate::security::check_key_prefix_acl(&session, &p.key)
+                .or_else(|| crate::security::check_reserved_client_key(&p.key))
+            {
                 return InnerOutcome {
                     response: resp,
                     session,

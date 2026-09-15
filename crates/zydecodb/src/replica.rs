@@ -342,8 +342,18 @@ pub struct PromoteOutcome {
 /// file-only (no running server). The caller restarts `serve` without a
 /// replication source afterwards; the new primary stamps its epoch into its
 /// ship stream, fencing an old primary that re-attaches to the same stream.
-pub fn promote(from: &Path, wal_dir: &Path, data_dir: &Path) -> EngineResult<PromoteOutcome> {
-    let mut rep = Replica::new(from.to_path_buf(), wal_dir.to_path_buf());
+///
+/// `hmac_key` is mandatory: the drain verifies every shipped entry's HMAC the
+/// same way `serve` does, so a writer to the ship directory cannot slip a
+/// forged segment in during failover.
+pub fn promote(
+    from: &Path,
+    wal_dir: &Path,
+    data_dir: &Path,
+    hmac_key: &[u8],
+) -> EngineResult<PromoteOutcome> {
+    let mut rep = Replica::new(from.to_path_buf(), wal_dir.to_path_buf())
+        .with_hmac_key(Some(hmac_key.to_vec()));
     let mut drained = Vec::new();
     loop {
         let out = rep.sync()?;
@@ -619,6 +629,7 @@ mod tests {
         let replica_wal = tmp.path().join("replica_wal");
         let data = tmp.path().join("data");
 
+        let key = b"promote-unit-test-hmac-key-material-32b!";
         make_segment(&primary_wal, 1, b"one");
         make_segment(&primary_wal, 2, b"two");
         ship_segment(
@@ -627,9 +638,53 @@ mod tests {
             1,
             10,
             ShipMode::Copy,
-            None,
+            Some(key),
         )
         .unwrap();
+        ship_segment(
+            &primary_wal.join(wal::segment_filename(2)),
+            &ship,
+            2,
+            20,
+            ShipMode::Copy,
+            Some(key),
+        )
+        .unwrap();
+        // The stream already carries a fence epoch of 3.
+        write_fence(&ship, 3).unwrap();
+
+        let out = promote(&ship, &replica_wal, &data, key).unwrap();
+        assert_eq!(out.drained, vec![1, 2], "drains every delivered segment");
+        assert_eq!(out.applied_max_seq, 20);
+        // new_epoch = max(local 1, fence 3) + 1 = 4.
+        assert_eq!(out.new_epoch, 4);
+        assert_eq!(read_epoch(&data), 4, "epoch persisted to data_dir");
+    }
+
+    /// A segment whose `shipped.log` line carries a correct sha256 but no HMAC
+    /// (what an attacker with write access to the ship dir can produce) must
+    /// not be drained by promote. Only the authenticated segment is installed.
+    #[test]
+    fn promote_refuses_unauthenticated_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary_wal = tmp.path().join("primary_wal");
+        let ship = tmp.path().join("ship");
+        let replica_wal = tmp.path().join("replica_wal");
+        let data = tmp.path().join("data");
+
+        let key = b"promote-unit-test-hmac-key-material-32b!";
+        make_segment(&primary_wal, 1, b"one");
+        make_segment(&primary_wal, 2, b"forged");
+        ship_segment(
+            &primary_wal.join(wal::segment_filename(1)),
+            &ship,
+            1,
+            10,
+            ShipMode::Copy,
+            Some(key),
+        )
+        .unwrap();
+        // Forged: valid hash line, no HMAC.
         ship_segment(
             &primary_wal.join(wal::segment_filename(2)),
             &ship,
@@ -639,14 +694,36 @@ mod tests {
             None,
         )
         .unwrap();
-        // The stream already carries a fence epoch of 3.
-        write_fence(&ship, 3).unwrap();
 
-        let out = promote(&ship, &replica_wal, &data).unwrap();
-        assert_eq!(out.drained, vec![1, 2], "drains every delivered segment");
-        assert_eq!(out.applied_max_seq, 20);
-        // new_epoch = max(local 1, fence 3) + 1 = 4.
-        assert_eq!(out.new_epoch, 4);
-        assert_eq!(read_epoch(&data), 4, "epoch persisted to data_dir");
+        let err = promote(&ship, &replica_wal, &data, key).expect_err("forged entry must fail");
+        assert!(err.to_string().contains("hmac"), "got {err}");
+        assert!(
+            replica_wal.join(wal::segment_filename(1)).exists(),
+            "authenticated segment 1 is installed"
+        );
+        assert!(
+            !replica_wal.join(wal::segment_filename(2)).exists(),
+            "forged segment 2 must not be installed"
+        );
+
+        // Wrong key on an otherwise valid stream is refused as well.
+        let ship2 = tmp.path().join("ship2");
+        ship_segment(
+            &primary_wal.join(wal::segment_filename(1)),
+            &ship2,
+            1,
+            10,
+            ShipMode::Copy,
+            Some(key),
+        )
+        .unwrap();
+        let err = promote(
+            &tmp.path().join("ship2"),
+            &tmp.path().join("replica_wal2"),
+            &tmp.path().join("data2"),
+            b"a-different-key-of-sufficient-length-32b",
+        )
+        .expect_err("wrong key must fail");
+        assert!(err.to_string().contains("hmac"), "got {err}");
     }
 }

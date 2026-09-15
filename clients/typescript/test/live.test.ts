@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import { test } from "node:test";
 
-import { Client, ConflictError, type Document } from "../src/index.ts";
+import { AuthError, Client, ConflictError, type Document } from "../src/index.ts";
 
 const HOST = process.env.ZYDECODB_TEST_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.ZYDECODB_TEST_PORT ?? "9470");
@@ -201,6 +201,80 @@ test("bounded transaction", { skip }, async () => {
     const committed = await db.get(key);
     assert.equal(committed?.toString("utf8"), "v1");
   } finally {
+    db.close();
+  }
+});
+
+/** Resolve to `fallback` if `p` has not settled within `ms`. Clears its timer. */
+function settleWithin<T, F>(p: Promise<T>, ms: number, fallback: F): Promise<T | F> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+test("watch idle timeout is decoupled from request timeout", { skip }, async (t) => {
+  // A 1s request timeout must not apply to the dedicated Watch connection: an
+  // idle stream only carries a server heartbeat every heartbeat_ms (3s in CI),
+  // so with the request timeout the pending read below would fail.
+  const db = new Client(`${HOST}:${PORT}`, {
+    ...(API_KEY ? { apiKey: API_KEY } : {}),
+    timeoutMs: 1000,
+  });
+  const coll = db.collection(uniqueCollection());
+  const stream = coll.watch();
+  let iterator: AsyncIterator<unknown> | null = null;
+  let firstSettled = false;
+  try {
+    await coll.insertOne({ _seed: true }); // Watch requires an existing collection.
+    iterator = stream[Symbol.asyncIterator]();
+    // The first next() opens the subscription, then blocks on the stream.
+    const first = iterator.next();
+    first.then(
+      () => (firstSettled = true),
+      () => (firstSettled = true), // settled below; never leave it unhandled
+    );
+
+    const IDLE = Symbol("idle");
+    let early: unknown;
+    try {
+      // Several request-timeout windows with no events; only heartbeats flow.
+      early = await settleWithin(first, 5000, IDLE);
+    } catch (e) {
+      if (e instanceof AuthError) {
+        t.skip(`change streams not enabled on server: ${e.message}`);
+        return;
+      }
+      throw new Error(`idle watch died: ${String(e)}`);
+    }
+    assert.equal(early, IDLE, "idle watch produced an event before any write");
+
+    const docId = await coll.insertOne({ n: 1 });
+    const res = await settleWithin(first, 10_000, null);
+    assert.ok(res, "no change event within 10s of the write");
+    assert.equal(res.done, false);
+    const ev = res.value as { op: string; docId: string; document: Record<string, unknown> | null };
+    assert.equal(ev.op, "upsert");
+    assert.equal(ev.docId, docId);
+    assert.equal(ev.document?.n, 1);
+  } finally {
+    if (firstSettled) {
+      // Generator is parked at a yield; return() runs its cleanup.
+      await iterator?.return?.();
+    } else {
+      // A read is still pending; return() would queue behind it. Drop the
+      // socket instead so the failure path does not wait for the idle timeout.
+      await stream.close();
+    }
     db.close();
   }
 });

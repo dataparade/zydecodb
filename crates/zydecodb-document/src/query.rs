@@ -83,9 +83,10 @@ pub fn get_by_id_with_revision(
         .collection(prefix, collection)
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
     let dk = keys::doc_key(prefix, coll.id, doc_id);
-    Ok(snap
-        .get_with_seq(&dk)?
-        .map(|(stored, rev)| (stored_to_json_vec(&stored), rev)))
+    match snap.get_with_seq(&dk)? {
+        Some((stored, rev)) => Ok(Some((stored_to_json_vec(&stored)?, rev))),
+        None => Ok(None),
+    }
 }
 
 /// Build a scan spec from the catalog and (optional) JSON-array bounds. Bounds
@@ -175,7 +176,10 @@ pub fn execute_index_scan(snap: &SnapshotHandle, spec: &ScanSpec) -> DocResult<Q
         let body = if spec.include_bodies {
             let mut dk = spec.doc_prefix.clone();
             dk.extend_from_slice(&doc_id);
-            snap.get(&dk)?.map(|stored| stored_to_json_vec(&stored))
+            match snap.get(&dk)? {
+                Some(stored) => Some(stored_to_json_vec(&stored)?),
+                None => None,
+            }
         } else {
             None
         };
@@ -356,7 +360,10 @@ fn sort_eq(sort: &[(String, bool)], expected: &[(String, bool)]) -> bool {
 /// (raw-wire writes) did not include it. A body that already has `_id` keeps
 /// its value (the driver convention).
 pub(crate) fn check_filter(stored: &[u8], filter: &crate::filter::Filter, doc_id: &[u8]) -> bool {
-    let kind = stored[0];
+    // An empty (corrupt) body is evaluated as an empty ZDoc view: it has no
+    // fields, so only a match-all filter selects it, and the row builder
+    // then reports it as Corrupt instead of silently hiding it.
+    let kind = stored.first().copied().unwrap_or(crate::store::VK_ZDOC);
     let payload = crate::store::strip_value_kind(stored);
     let temp_zdoc;
     let view = if kind == crate::store::VK_ZDOC {
@@ -371,13 +378,23 @@ pub(crate) fn check_filter(stored: &[u8], filter: &crate::filter::Filter, doc_id
     filter.matches(view, Some(doc_id))
 }
 
-fn parse_doc(stored: &[u8], doc_id: &[u8]) -> Option<serde_json::Value> {
-    let kind = stored[0];
+/// Decode a stored body for a result row. A ZDoc body that does not decode is
+/// corruption and surfaces as `Err(Corrupt)` naming the document; a legacy
+/// raw-JSON body that fails to parse is skipped (`Ok(None)`), as before.
+fn parse_doc(stored: &[u8], doc_id: &[u8]) -> DocResult<Option<serde_json::Value>> {
+    let kind = crate::store::value_kind(stored)?;
     let payload = crate::store::strip_value_kind(stored);
     let mut v = if kind == crate::store::VK_ZDOC {
-        crate::binary::ValueView::new(payload).to_value().ok()?
+        crate::binary::ValueView::new(payload)
+            .to_value()
+            .map_err(|e| {
+                DocError::Corrupt(format!("document {}: {e}", String::from_utf8_lossy(doc_id)))
+            })?
     } else {
-        serde_json::from_slice(payload).ok()?
+        match serde_json::from_slice(payload) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        }
     };
 
     if let serde_json::Value::Object(map) = &mut v {
@@ -386,7 +403,7 @@ fn parse_doc(stored: &[u8], doc_id: &[u8]) -> Option<serde_json::Value> {
                 serde_json::Value::String(String::from_utf8_lossy(doc_id).into_owned())
             });
     }
-    Some(v)
+    Ok(Some(v))
 }
 
 fn make_row(doc_id: Vec<u8>, body: &Value, proj: &Option<Projection>) -> DocResult<QueryRow> {
@@ -422,7 +439,7 @@ fn row_from_stored(
             }));
         }
     }
-    match parse_doc(stored, &doc_id) {
+    match parse_doc(stored, &doc_id)? {
         Some(v) => Ok(Some(make_row(doc_id, &v, proj)?)),
         None => Ok(None),
     }
@@ -1018,7 +1035,7 @@ pub fn distinct(
         &doc_prefix,
         prefix_len,
         |doc_id, stored| {
-            if let Some(v) = parse_doc(stored, &doc_id) {
+            if let Some(v) = parse_doc(stored, &doc_id)? {
                 let val = encoding::extract_path(&v, field);
                 if seen
                     .binary_search_by(|probe| encoding::cmp_values(probe, &val))
@@ -1076,7 +1093,8 @@ fn stream_offset_page(
 }
 
 fn extract_sort_keys(stored: &[u8], sort: &[(String, bool)]) -> Vec<Vec<u8>> {
-    let kind = stored[0];
+    // An empty (corrupt) body sorts as all-null keys rather than panicking.
+    let kind = stored.first().copied().unwrap_or(crate::store::VK_RAW);
     let payload = crate::store::strip_value_kind(stored);
     let temp_zdoc;
     let view = if kind == crate::store::VK_ZDOC {

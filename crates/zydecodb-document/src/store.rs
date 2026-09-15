@@ -4,7 +4,7 @@
 //! all index put/delete ops succeed or fail together (one WAL record, one CRC),
 //! so a crash can never leave indexes disagreeing with the body.
 
-use crate::catalog::{Catalog, CollectionMeta, IndexMeta};
+use crate::catalog::{Catalog, CollectionMeta, CounterDelta, IndexMeta};
 use crate::error::{DocError, DocResult};
 use crate::{encoding, keys};
 use serde_json::Value;
@@ -73,19 +73,27 @@ pub fn strip_value_kind(stored: &[u8]) -> &[u8] {
     stored.get(1..).unwrap_or(&[])
 }
 
-pub fn stored_to_json_vec(stored: &[u8]) -> Vec<u8> {
-    if stored.is_empty() {
-        return Vec::new();
-    }
-    let kind = stored[0];
+/// The `value_kind` byte of a stored body. An empty body cannot have been
+/// written by this layer (every write pushes the kind byte first), so it is
+/// reported as corruption rather than indexed.
+pub fn value_kind(stored: &[u8]) -> DocResult<u8> {
+    stored
+        .first()
+        .copied()
+        .ok_or_else(|| DocError::Corrupt("empty stored document body".into()))
+}
+
+/// Decode a stored body to JSON bytes. A body that cannot be decoded (empty,
+/// or a ZDoc payload whose structure does not fit its bytes) is reported as
+/// [`DocError::Corrupt`] instead of being handed back as an empty document.
+pub fn stored_to_json_vec(stored: &[u8]) -> DocResult<Vec<u8>> {
+    let kind = value_kind(stored)?;
     let payload = strip_value_kind(stored);
     if kind == VK_ZDOC {
-        let Ok(val) = crate::binary::ValueView::new(payload).to_value() else {
-            return Vec::new();
-        };
-        serde_json::to_vec(&val).unwrap_or_default()
+        let val = crate::binary::ValueView::new(payload).to_value()?;
+        serde_json::to_vec(&val).map_err(|e| DocError::Corrupt(e.to_string()))
     } else {
-        payload.to_vec()
+        Ok(payload.to_vec())
     }
 }
 
@@ -345,8 +353,8 @@ fn upsert_ops_with_old_inner(
         });
     }
 
-    // One batch slot is reserved for the catalog blob (counter updates commit
-    // in the same WAL record as the document write).
+    // One batch slot is reserved for this collection's counter record (it
+    // commits in the same WAL record as the document write).
     if ops.len() + 1 > MAX_BATCH_KEYS {
         return Err(DocError::BatchTooLarge(ops.len()));
     }
@@ -463,16 +471,25 @@ pub fn delete_ops(
 
     let mut ops: Vec<BatchOp> = vec![BatchOp::Del { key: doc_key }];
     let payload = strip_value_kind(&stored);
-    if stored[0] == VK_ZDOC {
-        let view = crate::binary::ValueView::new(payload);
-        for k in index_keys_for_view(coll, prefix, doc_id, &view) {
-            ops.push(BatchOp::Del { key: k });
+    // A body that cannot be decoded (empty or garbage) has no derivable index
+    // keys; the body row is still removed so an operator can clear it.
+    match stored.first() {
+        Some(&VK_ZDOC) => {
+            let view = crate::binary::ValueView::new(payload);
+            for k in index_keys_for_view(coll, prefix, doc_id, &view) {
+                ops.push(BatchOp::Del { key: k });
+            }
         }
-    } else if let Ok(old) = serde_json::from_slice::<Value>(payload) {
-        for k in index_keys_for(coll, prefix, doc_id, &old) {
-            ops.push(BatchOp::Del { key: k });
+        Some(_) => {
+            if let Ok(old) = serde_json::from_slice::<Value>(payload) {
+                for k in index_keys_for(coll, prefix, doc_id, &old) {
+                    ops.push(BatchOp::Del { key: k });
+                }
+            }
         }
+        None => {}
     }
+    // One slot reserved for this collection's counter record.
     if ops.len() + 1 > MAX_BATCH_KEYS {
         return Err(DocError::BatchTooLarge(ops.len()));
     }
@@ -529,26 +546,30 @@ pub fn delete_ids(
     Ok(deleted)
 }
 
-/// Commit one batch atomically with the catalog counter blob: the updated
-/// catalog is a system put inside the SAME self-framed WAL record as the
-/// document ops, so a torn crash replays both or neither. The in-memory
-/// catalog is replaced only after the commit succeeds.
+/// Commit one batch atomically with its counter records: the post-write
+/// counters of every collection `deltas` touch are system puts inside the SAME
+/// self-framed WAL record as the document ops, so a torn crash replays both or
+/// neither. The in-memory catalog is updated only after the commit succeeds.
+/// The caller must have reserved one batch slot per touched collection.
 fn write_counted_chunk(
     engine: &mut Engine,
     catalog: &mut Catalog,
-    working: &mut Catalog,
     ops: Vec<BatchOp>,
+    deltas: &[CounterDelta],
 ) -> DocResult<u64> {
-    let bytes = serde_json::to_vec(working).map_err(|e| DocError::Corrupt(e.to_string()))?;
-    let seq = engine
-        .write_batch_with_sys(ops, vec![(crate::catalog::CATALOG_SYS_KEY.to_vec(), bytes)])?;
-    *catalog = working.clone();
+    let upd = catalog.counter_update(deltas);
+    if ops.len() + upd.len() > MAX_BATCH_KEYS {
+        return Err(DocError::BatchTooLarge(ops.len()));
+    }
+    let seq = engine.write_batch_with_sys(ops, upd.sys_puts())?;
+    catalog.apply_counter_update(&upd);
     Ok(seq)
 }
 
 /// Single-batch commit with counter deltas spanning multiple collections
-/// (bounded transactions). The whole set must fit in one batch (one slot is
-/// reserved for the catalog blob). Returns the committed seq.
+/// (bounded transactions). The whole set must fit in one batch: `ops` plus
+/// one counter record per collection with a non-zero delta. Returns the
+/// committed seq.
 pub fn commit_with_deltas(
     engine: &mut Engine,
     catalog: &mut Catalog,
@@ -558,21 +579,22 @@ pub fn commit_with_deltas(
     if ops.is_empty() {
         return Ok(0);
     }
-    if ops.len() + 1 > MAX_BATCH_KEYS {
-        return Err(DocError::BatchTooLarge(ops.len()));
-    }
-    let mut working = catalog.clone();
-    for (coll_id, delta) in deltas {
-        working.add_doc_count(*coll_id, *delta);
-    }
-    write_counted_chunk(engine, catalog, &mut working, ops)
+    let deltas: Vec<CounterDelta> = deltas
+        .iter()
+        .filter(|(_, delta)| *delta != 0)
+        .map(|&(collection_id, delta)| CounterDelta::Doc {
+            collection_id,
+            delta,
+        })
+        .collect();
+    write_counted_chunk(engine, catalog, ops, &deltas)
 }
 
 /// Submit pre-built per-document writes: one atomic batch when the total fits,
-/// otherwise chunked. Each chunk carries the catalog blob reflecting every
-/// delta up through that chunk, so a crash between chunks leaves counters
-/// matching exactly the committed chunks. Returns the last committed seq (0
-/// when there was nothing to write).
+/// otherwise chunked. Each chunk carries the counter records of every
+/// collection it touches, reflecting every delta up through that chunk, so a
+/// crash between chunks leaves counters matching exactly the committed chunks.
+/// Returns the last committed seq (0 when there was nothing to write).
 pub(crate) fn commit_batches(
     engine: &mut Engine,
     catalog: &mut Catalog,
@@ -583,26 +605,39 @@ pub(crate) fn commit_batches(
         return Ok(0);
     }
 
-    let mut working = catalog.clone();
-    // One slot per batch is reserved for the catalog system put.
-    let chunk_limit = MAX_BATCH_KEYS - 1;
-    let mut all: Vec<BatchOp> = Vec::with_capacity(std::cmp::min(total, chunk_limit));
+    let mut all: Vec<BatchOp> = Vec::with_capacity(std::cmp::min(total, MAX_BATCH_KEYS));
+    let mut deltas: Vec<CounterDelta> = Vec::new();
+    // Collections with a non-zero delta in the current chunk: each one costs
+    // a batch slot for its counter record.
+    let mut touched: BTreeSet<u32> = BTreeSet::new();
     let mut last_seq = 0u64;
     for mut w in per_doc {
         if w.ops.is_empty() {
             continue;
         }
-        // If adding this doc's ops would exceed the chunk limit, flush what we have
-        if all.len() + w.ops.len() > chunk_limit && !all.is_empty() {
-            last_seq =
-                write_counted_chunk(engine, catalog, &mut working, std::mem::take(&mut all))?;
+        let counts = w.doc_delta != 0;
+        let slots_after =
+            touched.len() + usize::from(counts && !touched.contains(&w.collection_id));
+        // Flush when this document's ops plus the chunk's counter records
+        // would overflow the batch. A single document always fits an empty
+        // chunk: its builders reserve one slot for its own counter record.
+        if !all.is_empty() && all.len() + w.ops.len() + slots_after > MAX_BATCH_KEYS {
+            last_seq = write_counted_chunk(engine, catalog, std::mem::take(&mut all), &deltas)?;
+            deltas.clear();
+            touched.clear();
         }
-        working.add_doc_count(w.collection_id, w.doc_delta);
+        if counts {
+            touched.insert(w.collection_id);
+            deltas.push(CounterDelta::Doc {
+                collection_id: w.collection_id,
+                delta: w.doc_delta,
+            });
+        }
         all.append(&mut w.ops);
     }
 
     if !all.is_empty() {
-        last_seq = write_counted_chunk(engine, catalog, &mut working, all)?;
+        last_seq = write_counted_chunk(engine, catalog, all, &deltas)?;
     }
     Ok(last_seq)
 }
@@ -666,9 +701,9 @@ pub fn current_json_body(
         .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
     let dk = keys::doc_key(prefix, coll.id, doc_id);
     match engine.get(&dk)? {
-        Some(stored) if !stored.is_empty() => {
+        Some(stored) => {
             let payload = strip_value_kind(&stored);
-            if stored[0] == VK_ZDOC {
+            if value_kind(&stored)? == VK_ZDOC {
                 Ok(Some(crate::binary::ValueView::new(payload).to_value()?))
             } else {
                 Ok(Some(
@@ -677,7 +712,7 @@ pub fn current_json_body(
                 ))
             }
         }
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -794,9 +829,44 @@ pub fn derive_ttl_expires_at_view(
     }
 }
 
+/// The new index entry a stored body contributes during backfill:
+/// `(encoded_fields, expires_at)`. `None` skips a legacy JSON body that does
+/// not parse; a ZDoc body is always indexable (its view is total).
+fn backfill_entry(stored: &[u8], idx: &IndexMeta) -> DocResult<Option<(Vec<u8>, u64)>> {
+    let dirs = idx.ascending();
+    if value_kind(stored)? == VK_ZDOC {
+        let view = crate::binary::ValueView::new(strip_value_kind(stored));
+        return Ok(Some((
+            encoding::encode_fields_from_view_with_directions(&view, &idx.fields, &dirs),
+            derive_ttl_expires_at_view(&view, idx),
+        )));
+    }
+    let doc: Value = match serde_json::from_slice(strip_value_kind(stored)) {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    let vals: Vec<Value> = idx
+        .fields
+        .iter()
+        .map(|f| encoding::extract_path(&doc, f))
+        .collect();
+    Ok(Some((
+        encoding::encode_fields_with_directions(&vals, &dirs),
+        derive_ttl_expires_at(&doc, idx),
+    )))
+}
+
 /// Scan every existing document in a collection and write the new index's
 /// entries in chunks that respect `MAX_BATCH_KEYS`. Returns the number of
 /// entries written (the index's initial `entry_count`).
+///
+/// For a unique index the written range is then scanned once in key order:
+/// entries sort by `encoded_fields` and differ only in their `doc_id` suffix,
+/// so two adjacent entries with equal encodings mean two documents share a
+/// value. In that case every entry just written is removed again and
+/// [`DocError::DuplicateKey`] is returned, leaving the store as it was. TTL
+/// body stamps for a unique index are applied only after that check passes,
+/// so a rejected DDL never changes document expiry.
 fn backfill_index(
     engine: &mut Engine,
     prefix: &[u8],
@@ -806,6 +876,8 @@ fn backfill_index(
     let dprefix = keys::doc_prefix(prefix, collection_id);
     let dhi = keys::prefix_upper_bound(&dprefix);
     let prefix_len = prefix.len();
+    let is_ttl = idx.expire_after_seconds.is_some();
+    let stamp_ttl_inline = is_ttl && !idx.unique;
 
     // An owned snapshot does not borrow the engine, so we can write index
     // entries back through `&mut engine` while iterating the doc range. The
@@ -813,45 +885,26 @@ fn backfill_index(
     let snap = engine.snapshot_owned();
     let mut pending: Vec<BatchOp> = Vec::new();
     let mut entries: u64 = 0;
-    let mut rows = snap.scan(dprefix.clone(), dhi)?;
+    let mut rows = snap.scan(dprefix.clone(), dhi.clone())?;
     for item in rows.by_ref() {
         let (doc_key, stored) = item?;
         let doc_id = keys::doc_id_from_doc_key(prefix_len, &doc_key);
-        let dirs = idx.ascending();
-        let (enc, expires_at) = if stored[0] == VK_ZDOC {
-            let view = crate::binary::ValueView::new(strip_value_kind(&stored));
-            (
-                encoding::encode_fields_from_view_with_directions(&view, &idx.fields, &dirs),
-                derive_ttl_expires_at_view(&view, idx),
-            )
-        } else {
-            let doc: Value = match serde_json::from_slice(strip_value_kind(&stored)) {
-                Ok(d) => d,
-                Err(_) => continue, // skip unparseable bodies
-            };
-            let vals: Vec<Value> = idx
-                .fields
-                .iter()
-                .map(|f| encoding::extract_path(&doc, f))
-                .collect();
-            (
-                encoding::encode_fields_with_directions(&vals, &dirs),
-                derive_ttl_expires_at(&doc, idx),
-            )
+        let Some((enc, expires_at)) = backfill_entry(&stored, idx)? else {
+            continue;
         };
         let ikey = keys::index_key(prefix, collection_id, idx.id, &enc, &doc_id);
         pending.push(BatchOp::Put {
             key: ikey,
-            value: doc_id.clone(),
+            value: doc_id,
             expires_at,
         });
         entries += 1;
         // When creating a TTL index, stamp body expiry so existing docs become
         // invisible under lazy expiry without waiting for a later rewrite.
-        if idx.expire_after_seconds.is_some() && expires_at != 0 {
+        if stamp_ttl_inline && expires_at != 0 {
             pending.push(BatchOp::Put {
-                key: doc_key.clone(),
-                value: stored.clone(),
+                key: doc_key,
+                value: stored,
                 expires_at,
             });
         }
@@ -865,7 +918,105 @@ fn backfill_index(
     if !pending.is_empty() {
         engine.write_batch(pending)?;
     }
+
+    if idx.unique {
+        if unique_index_has_duplicate(engine, prefix, collection_id, idx.id)? {
+            remove_index_range(engine, prefix, collection_id, idx.id)?;
+            return Err(DocError::DuplicateKey(format!(
+                "unique index '{}' on {:?}: existing documents share a value",
+                idx.name, idx.fields
+            )));
+        }
+        if is_ttl {
+            let snap = engine.snapshot_owned();
+            let mut pending: Vec<BatchOp> = Vec::new();
+            let mut rows = snap.scan(dprefix, dhi)?;
+            for item in rows.by_ref() {
+                let (doc_key, stored) = item?;
+                let Some((_, expires_at)) = backfill_entry(&stored, idx)? else {
+                    continue;
+                };
+                if expires_at == 0 {
+                    continue;
+                }
+                pending.push(BatchOp::Put {
+                    key: doc_key,
+                    value: stored,
+                    expires_at,
+                });
+                if pending.len() >= MAX_BATCH_KEYS {
+                    let chunk = std::mem::take(&mut pending);
+                    engine.write_batch(chunk)?;
+                }
+            }
+            drop(rows);
+            drop(snap);
+            if !pending.is_empty() {
+                engine.write_batch(pending)?;
+            }
+        }
+    }
     Ok(entries)
+}
+
+/// True when two entries of the index share the same encoded field value.
+/// Index keys are `header | encoded_fields | doc_id` with the entry value
+/// equal to `doc_id`, so the encoding is `key[header .. key.len() - value.len()]`;
+/// the encoding is prefix-free, so equal slices mean equal values. O(1)
+/// memory: only the previous encoding is retained.
+fn unique_index_has_duplicate(
+    engine: &Engine,
+    prefix: &[u8],
+    collection_id: u32,
+    index_id: u32,
+) -> DocResult<bool> {
+    let lo = keys::index_prefix(prefix, collection_id, index_id);
+    let header = lo.len();
+    let hi = keys::prefix_upper_bound(&lo);
+    let snap = engine.snapshot_owned();
+    let mut prev: Option<Vec<u8>> = None;
+    for item in snap.scan(lo, hi)? {
+        let (key, doc_id) = item?;
+        let end = key.len().saturating_sub(doc_id.len());
+        let enc = key.get(header..end).unwrap_or(&[]);
+        match prev.as_mut() {
+            Some(p) if p.as_slice() == enc => return Ok(true),
+            Some(p) => {
+                p.clear();
+                p.extend_from_slice(enc);
+            }
+            None => prev = Some(enc.to_vec()),
+        }
+    }
+    Ok(false)
+}
+
+/// Delete every key under one index's range in `MAX_BATCH_KEYS` chunks. Used
+/// to undo a backfill whose unique check failed.
+fn remove_index_range(
+    engine: &mut Engine,
+    prefix: &[u8],
+    collection_id: u32,
+    index_id: u32,
+) -> DocResult<()> {
+    let lo = keys::index_prefix(prefix, collection_id, index_id);
+    let hi = keys::prefix_upper_bound(&lo);
+    let snap = engine.snapshot_owned();
+    let mut chunk: Vec<BatchOp> = Vec::new();
+    let mut rows = snap.scan(lo, hi)?;
+    for item in rows.by_ref() {
+        let (key, _) = item?;
+        chunk.push(BatchOp::Del { key });
+        if chunk.len() >= MAX_BATCH_KEYS {
+            engine.write_batch(std::mem::take(&mut chunk))?;
+        }
+    }
+    drop(rows);
+    drop(snap);
+    if !chunk.is_empty() {
+        engine.write_batch(chunk)?;
+    }
+    Ok(())
 }
 
 /// Durable TTL sweep with counter maintenance. Tombstones every expired
@@ -919,40 +1070,40 @@ pub fn sweep_expired_with_counts(engine: &mut Engine, catalog: &mut Catalog) -> 
     };
 
     let total = expired.len();
-    let chunk_limit = MAX_BATCH_KEYS - 1;
-    let mut working = catalog.clone();
+    // Each tombstone touches at most one collection's counter record, so
+    // half a batch of tombstones can never overflow with its counters.
+    let chunk_limit = MAX_BATCH_KEYS / 2;
     let mut chunk: Vec<BatchOp> = Vec::with_capacity(chunk_limit.min(total));
-    let mut chunk_deltas: Vec<SweepDelta> = Vec::with_capacity(chunk_limit.min(total));
+    let mut chunk_deltas: Vec<CounterDelta> = Vec::with_capacity(chunk_limit.min(total));
     for key in expired {
-        chunk_deltas.push(classify(&key));
+        // Doc keys move doc_count only; their index keys are swept (and
+        // counted) alongside as separate `Index` deltas.
+        match classify(&key) {
+            SweepDelta::Doc(collection_id) => chunk_deltas.push(CounterDelta::DocOnly {
+                collection_id,
+                delta: -1,
+            }),
+            SweepDelta::Index(index_id) => chunk_deltas.push(CounterDelta::Index {
+                index_id,
+                delta: -1,
+            }),
+            SweepDelta::Raw => {}
+        }
         chunk.push(BatchOp::Del { key });
         if chunk.len() >= chunk_limit {
-            apply_sweep_deltas(&mut working, &mut chunk_deltas);
-            write_counted_chunk(engine, catalog, &mut working, std::mem::take(&mut chunk))?;
+            write_counted_chunk(engine, catalog, std::mem::take(&mut chunk), &chunk_deltas)?;
+            chunk_deltas.clear();
         }
     }
     if !chunk.is_empty() {
-        apply_sweep_deltas(&mut working, &mut chunk_deltas);
-        write_counted_chunk(engine, catalog, &mut working, chunk)?;
+        write_counted_chunk(engine, catalog, chunk, &chunk_deltas)?;
     }
     Ok(total)
 }
 
-/// Counter delta for one swept key.
+/// Counter classification of one swept key.
 enum SweepDelta {
     Doc(u32),
     Index(u32),
     Raw,
-}
-
-fn apply_sweep_deltas(working: &mut Catalog, deltas: &mut Vec<SweepDelta>) {
-    for d in deltas.drain(..) {
-        match d {
-            // Doc keys move doc_count only; their index keys are swept (and
-            // counted) alongside as separate `Index` deltas.
-            SweepDelta::Doc(coll_id) => working.add_doc_count_only(coll_id, -1),
-            SweepDelta::Index(index_id) => working.add_index_entry_count(index_id, -1),
-            SweepDelta::Raw => {}
-        }
-    }
 }

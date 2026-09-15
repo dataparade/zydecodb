@@ -73,7 +73,7 @@ fn raw_kv_get_proceeds_during_in_flight_write_fsync() {
         SessionState::anonymous(),
         &security,
     );
-    commit.commit(out.commit_seq.unwrap(), false);
+    commit.commit(out.commit_seq.unwrap(), false).unwrap();
 
     // Delay the NEXT fsync by 500ms (the in-flight write's durability wait).
     fail::cfg(WAL_BEFORE_FSYNC, "sleep(500)").unwrap();
@@ -89,7 +89,7 @@ fn raw_kv_get_proceeds_during_in_flight_write_fsync() {
             &security,
         );
         // Blocks ~500ms in await_durable while the coordinator's fsync sleeps.
-        commit_w.commit(out.commit_seq.unwrap(), false);
+        commit_w.commit(out.commit_seq.unwrap(), false).unwrap();
     });
 
     // Let the writer buffer its append and the coordinator enter the fsync sleep.

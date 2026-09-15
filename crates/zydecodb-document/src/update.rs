@@ -12,13 +12,15 @@
 //! Each write reuses the atomic [`crate::store::upsert`]/[`crate::store::delete`]
 //! path, so the body and every secondary index move together in one WAL record.
 //! `update_many`/`delete_many` select candidate ids from a snapshot first, then
-//! apply one atomic batch per document (not globally atomic across the set).
+//! commit the whole set through [`crate::store::commit_batches`] (one WAL
+//! record when it fits in a batch, chunked otherwise).
 
 use crate::error::{DocError, DocResult};
 use crate::filter::{Atom, Filter};
 use crate::store::{self, strip_value_kind};
 use crate::{catalog::Catalog, keys};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zydecodb_engine::engine::Engine;
@@ -526,7 +528,7 @@ fn updated_body(
             return Ok(None);
         }
     }
-    let old: Value = if stored[0] == crate::store::VK_ZDOC {
+    let old: Value = if store::value_kind(&stored)? == crate::store::VK_ZDOC {
         crate::binary::ValueView::new(strip_value_kind(&stored)).to_value()?
     } else {
         serde_json::from_slice(strip_value_kind(&stored))
@@ -600,11 +602,19 @@ pub fn apply_to_id_if_match(
     }
 }
 
-/// Apply `update` to many documents. With no unique index on the collection and
-/// a combined op count within one batch, the whole set is updated atomically
-/// (isolated from concurrent readers). When a unique index is present, updates
-/// run sequentially so each commit is visible to the next uniqueness check
-/// (preserving correct enforcement). Returns the number of documents modified.
+/// Apply `update` to many documents as one atomic set: every document's new
+/// body and index diff is built first, then the whole set is committed in
+/// `MAX_BATCH_KEYS`-sized chunks (see [`store::commit_batches`]). Returns the
+/// number of documents modified.
+///
+/// Unique indexes are enforced twice. [`store::upsert_ops_with_old`] checks
+/// each new body against the *committed* index, and this function tracks the
+/// encodings claimed by earlier documents in the same call so that two
+/// documents updated to the same value in one batch are rejected before
+/// anything is written. Without the second check the merged batch would
+/// commit both entries (they differ only in their doc-id suffix) and the
+/// index would silently hold a duplicate. Any [`DocError::DuplicateKey`]
+/// leaves the collection unchanged.
 ///
 /// `filter`, when given, is re-verified per document under the engine lock:
 /// candidates whose current body no longer matches are skipped (and not
@@ -619,22 +629,41 @@ pub fn apply_to_ids(
     update: &UpdateDoc,
     filter: Option<&crate::filter::Filter>,
 ) -> DocResult<u64> {
-    let _coll = catalog
+    let unique: Vec<crate::catalog::IndexMeta> = catalog
         .collection(prefix, collection)
-        .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?;
+        .ok_or_else(|| DocError::CollectionNotFound(collection.to_string()))?
+        .indexes
+        .iter()
+        .filter(|i| i.unique)
+        .cloned()
+        .collect();
 
-    // A unique index makes intra-batch conflicts possible (two updated docs
-    // could collide on the same value); the merged batch could not detect that
-    // because each carries a distinct doc-id suffix. For now, we still batch
-    // everything and rely on the engine's write_batch uniqueness check, but
-    // if that fails, we would ideally fall back to sequential. Since we are
-    // optimizing the happy path, we'll try the batch first.
+    // (index_id, encoded unique fields) already taken by a document earlier in
+    // this batch. Mirrors `validate_unique_indexes` on the transaction path.
+    let mut claimed: HashSet<(u32, Vec<u8>)> = HashSet::new();
     let mut per_doc: Vec<store::WriteOps> = Vec::with_capacity(ids.len());
     let mut modified: u64 = 0;
     for id in ids {
         if let Some((bytes, old)) =
             updated_body(engine, catalog, prefix, collection, id, update, filter)?
         {
+            if !unique.is_empty() {
+                let view = crate::binary::ValueView::new(&bytes);
+                for idx in &unique {
+                    let enc = crate::encoding::encode_fields_from_view_with_directions(
+                        &view,
+                        &idx.fields,
+                        &idx.ascending(),
+                    );
+                    if !claimed.insert((idx.id, enc)) {
+                        return Err(DocError::DuplicateKey(format!(
+                            "unique index '{}' on {:?}: two documents in the same update \
+                             would share a value",
+                            idx.name, idx.fields
+                        )));
+                    }
+                }
+            }
             let w = store::upsert_ops_with_old(
                 engine,
                 catalog,

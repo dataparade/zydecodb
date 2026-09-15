@@ -202,6 +202,20 @@ The `[metrics]` HTTP endpoint binds loopback by default. A non-loopback bind is
 `token`; `/metrics` then demands `Authorization: Bearer <token>` (constant-time
 compared) while `/healthz` and `/readyz` stay open for probes.
 
+`/readyz` returns `503` after a WAL fsync failure (see below); `/healthz` stays
+`200` because the process is alive and still serving reads.
+
+#### WAL fsync failure (fail closed)
+
+If the group-commit `fsync(2)` ever returns an error, the server treats the WAL
+as untrustworthy for the rest of the process lifetime: the write waiting on that
+fsync gets `IoError` (`WAL fsync failed (...); write not durable; writes refused
+until restart`), every later write command is refused with the same status
+before it reaches the memtable, reads keep working, and `/readyz` reports `503`.
+A later successful fsync is not trusted because the kernel may already have
+dropped the dirty pages. Fix the disk, then restart the process; WAL replay on
+open recovers whatever did reach disk.
+
 #### WAL shipping integrity (HMAC)
 
 When `[shipping] ship_dir` is set, `hmac_key_file` is **required**: each
@@ -611,6 +625,10 @@ mechanics and applies a cooperative epoch fence.
 
    This drains every delivered segment into the WAL and bumps this node's
    promotion **epoch** (in `data_dir/EPOCH`) past anything seen in the stream.
+   `replica promote` requires `[replica].hmac_key_file` (the same key the
+   primary ships with) and refuses to drain any segment whose `shipped.log`
+   entry lacks a valid HMAC — the same rule `serve` applies. A promote without
+   a key file is an error.
 
 4. **Restart as a primary.** Remove the `[replica].from` setting (and the
    `--replica-from` flag) and start `serve` against the *same* `data_dir` and

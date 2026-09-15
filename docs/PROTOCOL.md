@@ -243,8 +243,8 @@ indexer.
 | `0x01` | `NotFound` | Missing key/document (drivers often map to absence, not an exception) |
 | `0x02` | `Error` | Generic server failure |
 | `0x03` | `Conflict` | Constraint / revision conflict |
-| `0x04` | `IoError` | I/O failure |
-| `0x05` | `InvalidKey` | Malformed key |
+| `0x04` | `IoError` | I/O failure. Also returned for every write once the server's WAL fsync has failed: the message reads `WAL fsync failed (...); write not durable; writes refused until restart`. Reads keep working; the node must be restarted before it accepts writes again |
+| `0x05` | `InvalidKey` | Malformed key, or a raw-KV write to a reserved key (a key starting with `d` or `i` followed by byte `0x00` aliases the document/index keyspace and is refused on `Put`/`Del`; reads are unaffected) |
 | `0x06` | `InvalidValue` | Malformed value / document body |
 | `0x07` | `EngineBusy` | Load shedding / rate limit (idempotent ops may retry) |
 | `0x08` | `ProtocolError` | Malformed payload, unused flag bits, unknown/unimplemented opcode |

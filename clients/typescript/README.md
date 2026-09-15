@@ -54,6 +54,11 @@ try {
   `createIndex`, with `$`-operators, sort, projection, and skip/limit.
   Pagination is repeatable-read across pages.
 - **Raw KV with TTL.** Side-channel `put` (with `expiresAt`), `get`, and `delete` methods on `Client` for session data that needs a time-to-live.
+- **Change streams.** `coll.watch()` returns an async iterable of
+  `ChangeEvent`s over a dedicated connection. That connection uses
+  `watchIdleTimeoutMs` (default 45000), not `timeoutMs`; it must exceed the
+  server's `change_streams.heartbeat_ms` (default 15000) or an idle stream dies
+  between heartbeats.
 - **TLS.** Pass `tls: true` for system CA defaults, or a `tls.ConnectionOptions`
   object for custom roots / SNI / `rejectUnauthorized`.
 

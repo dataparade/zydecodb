@@ -64,6 +64,13 @@ class Connection:
         if status != proto.STATUS_OK:
             raise from_status(status, "SessionInit", payload)
 
+    def set_timeout(self, timeout: float) -> None:
+        """Change the socket timeout for subsequent I/O (used by Watch to switch
+        from the request timeout to the stream idle timeout after connecting)."""
+        self._timeout = timeout
+        if self._sock is not None:
+            self._sock.settimeout(timeout)
+
     @property
     def connected(self) -> bool:
         return self._sock is not None

@@ -379,14 +379,18 @@ impl Atom {
                 None => !list.iter().any(Value::is_null),
             },
             Atom::Type(name) => type_match(field, name),
+            // A corrupt element (offset out of range) is skipped: it can never
+            // satisfy an operand, and `$all` over a corrupt array is false.
             Atom::All(operands) => match field.and_then(|v| v.as_array()) {
-                Some(arr) => operands
-                    .iter()
-                    .all(|op| (0..arr.len()).any(|i| value_eq_view(arr.get(i).unwrap(), op))),
+                Some(arr) => operands.iter().all(|op| {
+                    (0..arr.len()).any(|i| arr.get(i).is_some_and(|e| value_eq_view(e, op)))
+                }),
                 None => false,
             },
             Atom::ElemMatch(sub) => match field.and_then(|v| v.as_array()) {
-                Some(arr) => (0..arr.len()).any(|i| sub.matches(arr.get(i).unwrap(), None)),
+                Some(arr) => {
+                    (0..arr.len()).any(|i| arr.get(i).is_some_and(|e| sub.matches(e, None)))
+                }
                 None => false,
             },
             Atom::Regex { re, .. } => match field.and_then(|v| v.as_str()) {
@@ -515,55 +519,55 @@ fn cmp_scalar_view(a: crate::binary::ValueView<'_>, b: &Value) -> Option<Orderin
         return Some(a_type.cmp(&b_type));
     }
 
+    // Same type tag on both sides here; a `None` from the view side means the
+    // stored bytes are truncated, and a corrupt value orders against nothing.
     match a_type {
         0 => Some(Ordering::Equal),
-        1 => {
-            let ab = a.as_bool().unwrap();
-            let bb = b.as_bool().unwrap();
-            Some(ab.cmp(&bb))
-        }
-        2 => {
-            let af = a.as_f64().unwrap();
-            let bf = b.as_f64().unwrap();
-            af.partial_cmp(&bf)
-        }
-        3 => {
-            let a_str = a.as_str().unwrap();
-            let b_str = b.as_str().unwrap();
-            Some(a_str.cmp(b_str))
-        }
+        1 => Some(a.as_bool()?.cmp(&b.as_bool()?)),
+        2 => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        3 => Some(a.as_str()?.cmp(b.as_str()?)),
         _ => None,
     }
 }
 
+/// Structural equality between a stored view and a filter literal. A corrupt
+/// view (truncated container, offset out of range) is never equal to anything.
 fn value_eq_view(a: crate::binary::ValueView<'_>, b: &Value) -> bool {
     if a.type_byte() == crate::binary::TYPE_ARRAY && b.is_array() {
-        let a_arr = a.as_array().unwrap();
-        let b_arr = b.as_array().unwrap();
-        if a_arr.len() != b_arr.len() {
+        let (Some(a_arr), Some(b_arr)) = (a.as_array(), b.as_array()) else {
+            return false;
+        };
+        let Some(n) = a_arr.checked_len() else {
+            return false;
+        };
+        if n != b_arr.len() {
             return false;
         }
-        for i in 0..a_arr.len() {
-            if !value_eq_view(a_arr.get(i).unwrap(), &b_arr[i]) {
-                return false;
+        for i in 0..n {
+            match a_arr.get(i) {
+                Some(av) if value_eq_view(av, &b_arr[i]) => {}
+                _ => return false,
             }
         }
         return true;
     }
     if a.type_byte() == crate::binary::TYPE_OBJECT && b.is_object() {
-        let a_obj = a.as_object().unwrap();
-        let b_obj = b.as_object().unwrap();
-        if a_obj.len() != b_obj.len() {
+        let (Some(a_obj), Some(b_obj)) = (a.as_object(), b.as_object()) else {
+            return false;
+        };
+        let Some(n) = a_obj.checked_len() else {
+            return false;
+        };
+        if n != b_obj.len() {
             return false;
         }
-        for i in 0..a_obj.len() {
-            let (k, v) = a_obj.get_at(i).unwrap();
-            if let Some(bv) = b_obj.get(k) {
-                if !value_eq_view(v, bv) {
-                    return false;
-                }
-            } else {
+        for i in 0..n {
+            let Some((k, v)) = a_obj.get_at(i) else {
                 return false;
+            };
+            match b_obj.get(k) {
+                Some(bv) if value_eq_view(v, bv) => {}
+                _ => return false,
             }
         }
         return true;

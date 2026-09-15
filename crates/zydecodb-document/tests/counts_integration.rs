@@ -27,6 +27,14 @@ fn counts(cat: &Catalog, name: &str) -> (u64, Vec<u64>) {
     )
 }
 
+/// Seq of the newest version of a system key (`None` when absent). A rewrite
+/// with identical bytes still gets a new seq, so this detects any write.
+fn sys_seq(e: &Engine, key: &[u8]) -> Option<u64> {
+    e.snapshot_get_with_seq(u64::MAX, key)
+        .unwrap()
+        .map(|(_, seq)| seq)
+}
+
 #[test]
 fn upsert_replace_delete_round_trip() {
     let dir = TempDir::new().unwrap();
@@ -380,4 +388,204 @@ fn crash_after_sweep_does_not_double_decrement() {
     let swept = store::sweep_expired_with_counts(&mut e, &mut cat).unwrap();
     assert_eq!(swept, 0);
     assert_eq!(counts(&cat, "sessions"), (1, vec![]));
+}
+
+/// The schema blob is DDL-only: document writes move the per-collection
+/// counter records and never rewrite the blob.
+#[test]
+fn document_writes_do_not_rewrite_the_catalog_blob() {
+    use zydecodb_document::catalog::{counter_sys_key, CollectionCounters, CATALOG_SYS_KEY};
+
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    cat.add_index(PREFIX, "users", "by_age", vec!["age".into()], false, None)
+        .unwrap();
+    cat.persist(&mut e).unwrap();
+    let coll_id = cat.collection(PREFIX, "users").unwrap().id;
+    let blob_before = e.sys_get(CATALOG_SYS_KEY).unwrap().unwrap();
+    let blob_seq_before = sys_seq(&e, CATALOG_SYS_KEY).unwrap();
+    // The blob carries no counts at all.
+    let text = String::from_utf8(blob_before.clone()).unwrap();
+    assert!(!text.contains("doc_count"), "{text}");
+    assert!(!text.contains("entry_count"), "{text}");
+
+    for i in 0..50u32 {
+        let id = format!("u{i}");
+        let body = format!("{{\"age\":{i}}}");
+        store::upsert(
+            &mut e,
+            &mut cat,
+            PREFIX,
+            "users",
+            id.as_bytes(),
+            body.as_bytes(),
+            false,
+        )
+        .unwrap();
+    }
+    for i in 0..10u32 {
+        let id = format!("u{i}");
+        assert!(store::delete(&mut e, &mut cat, PREFIX, "users", id.as_bytes()).unwrap());
+    }
+    assert_eq!(counts(&cat, "users"), (40, vec![40]));
+
+    // Same bytes, same version: the blob was not written again.
+    let blob_after = e.sys_get(CATALOG_SYS_KEY).unwrap().unwrap();
+    assert_eq!(blob_before, blob_after);
+    assert_eq!(sys_seq(&e, CATALOG_SYS_KEY), Some(blob_seq_before));
+
+    // The counter record carries the live counts.
+    let rec = e.sys_get(&counter_sys_key(coll_id)).unwrap().unwrap();
+    let dec = CollectionCounters::decode(&rec).unwrap();
+    assert_eq!(dec.doc_count, 40);
+    assert_eq!(dec.indexes, vec![(0, 40)]);
+
+    // And a reopen reads them back from the record, not the blob.
+    drop(e);
+    let e2 = open(&dir);
+    let cat2 = Catalog::load(&e2).unwrap();
+    assert_eq!(counts(&cat2, "users"), (40, vec![40]));
+}
+
+/// A catalog blob written by a version that stored counts inline still loads
+/// with those counts, keeps them across an unrelated DDL (which rewrites the
+/// blob without counts and seeds the counter records) and across a reopen.
+#[test]
+fn legacy_blob_with_inline_counts_migrates_without_losing_them() {
+    use zydecodb_document::catalog::{counter_sys_key, CATALOG_SYS_KEY};
+
+    let dir = TempDir::new().unwrap();
+    let legacy = serde_json::json!({
+        "next_collection_id": 2,
+        "next_index_id": 2,
+        "collections": [
+            {
+                "id": 0,
+                "prefix": [1],
+                "name": "users",
+                "doc_count": 1234,
+                "indexes": [
+                    {"id": 0, "name": "by_age", "fields": ["age"], "unique": false, "entry_count": 1234},
+                    {"id": 1, "name": "by_email", "fields": ["email"], "unique": true, "entry_count": 1200}
+                ]
+            },
+            {
+                "id": 1,
+                "prefix": [1],
+                "name": "orders",
+                "doc_count": 77,
+                "indexes": []
+            }
+        ]
+    });
+    {
+        let mut e = open(&dir);
+        e.sys_put(
+            CATALOG_SYS_KEY.to_vec(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        e.shutdown().unwrap();
+    }
+
+    let mut e = open(&dir);
+    let mut cat = Catalog::load(&e).unwrap();
+    assert_eq!(counts(&cat, "users"), (1234, vec![1234, 1200]));
+    assert_eq!(counts(&cat, "orders"), (77, vec![]));
+    // No counter records yet: the counts came from the blob.
+    assert!(e.sys_get(&counter_sys_key(0)).unwrap().is_none());
+    assert!(e.sys_get(&counter_sys_key(1)).unwrap().is_none());
+
+    // A write to one collection moves only that collection's record.
+    store::upsert(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "orders",
+        b"o1",
+        br#"{"total":5}"#,
+        false,
+    )
+    .unwrap();
+    assert_eq!(counts(&cat, "orders"), (78, vec![]));
+    assert!(e.sys_get(&counter_sys_key(1)).unwrap().is_some());
+    assert!(e.sys_get(&counter_sys_key(0)).unwrap().is_none());
+
+    // An unrelated DDL rewrites the blob (dropping inline counts) and seeds
+    // every collection's counter record, so nothing is lost.
+    store::define_index(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "orders",
+        "by_total",
+        vec!["total".into()],
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(counts(&cat, "users"), (1234, vec![1234, 1200]));
+    assert_eq!(counts(&cat, "orders"), (78, vec![1]));
+    let text = String::from_utf8(e.sys_get(CATALOG_SYS_KEY).unwrap().unwrap()).unwrap();
+    assert!(!text.contains("doc_count"), "{text}");
+    assert!(e.sys_get(&counter_sys_key(0)).unwrap().is_some());
+
+    // Crash (no clean shutdown) and reopen: counts come back from the records.
+    drop(e);
+    let e = open(&dir);
+    let cat = Catalog::load(&e).unwrap();
+    assert_eq!(counts(&cat, "users"), (1234, vec![1234, 1200]));
+    assert_eq!(counts(&cat, "orders"), (78, vec![1]));
+}
+
+/// A multi-collection transaction-style commit writes one counter record per
+/// collection with a non-zero delta, and the batch limit accounts for them.
+#[test]
+fn commit_with_deltas_touches_one_record_per_collection() {
+    use zydecodb_document::catalog::{counter_sys_key, CollectionCounters};
+    use zydecodb_engine::engine::BatchOp;
+
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    let a = cat.ensure_collection(PREFIX, "a");
+    let b = cat.ensure_collection(PREFIX, "b");
+    let c = cat.ensure_collection(PREFIX, "c");
+    cat.persist(&mut e).unwrap();
+
+    let mut ops = Vec::new();
+    for coll in [a, b] {
+        ops.push(BatchOp::Put {
+            key: zydecodb_document::keys::doc_key(PREFIX, coll, b"x"),
+            value: b"\x00{}".to_vec(),
+            expires_at: 0,
+        });
+    }
+    let seq_c_before = sys_seq(&e, &counter_sys_key(c));
+    store::commit_with_deltas(&mut e, &mut cat, ops, &[(a, 1), (b, 1), (c, 0)]).unwrap();
+    assert_eq!(counts(&cat, "a"), (1, vec![]));
+    assert_eq!(counts(&cat, "b"), (1, vec![]));
+    assert_eq!(counts(&cat, "c"), (0, vec![]));
+    let rec =
+        CollectionCounters::decode(&e.sys_get(&counter_sys_key(a)).unwrap().unwrap()).unwrap();
+    assert_eq!(rec.doc_count, 1);
+    // Zero delta: c's record was not rewritten.
+    assert_eq!(sys_seq(&e, &counter_sys_key(c)), seq_c_before);
+
+    // MAX_BATCH_KEYS ops plus two counter records overflow the batch.
+    let too_many: Vec<BatchOp> = (0..zydecodb_engine::keys::MAX_BATCH_KEYS - 1)
+        .map(|i| BatchOp::Put {
+            key: zydecodb_document::keys::doc_key(PREFIX, a, format!("k{i}").as_bytes()),
+            value: b"\x00{}".to_vec(),
+            expires_at: 0,
+        })
+        .collect();
+    let err = store::commit_with_deltas(&mut e, &mut cat, too_many, &[(a, 1), (b, 1)]).unwrap_err();
+    assert!(matches!(
+        err,
+        zydecodb_document::error::DocError::BatchTooLarge(_)
+    ));
+    // Nothing moved on the failed commit.
+    assert_eq!(counts(&cat, "a"), (1, vec![]));
 }

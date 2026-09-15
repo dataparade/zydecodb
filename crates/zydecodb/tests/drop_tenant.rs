@@ -84,12 +84,42 @@ fn drop_tenant_on_engine_live_path_leaves_other_tenant() {
         .put(tenant_key(&tenant_b, b":k1"), b"b1".to_vec(), 0)
         .unwrap();
     let mut catalog = Catalog::load(&engine).unwrap();
+    // A collection per tenant, each with a counted document, so the drop has
+    // catalog entries and counter records to clean up.
+    let prefix_a: Vec<u8> = [&[zydecodb_engine::keys::KS_USER][..], &tenant_a[..]].concat();
+    let prefix_b: Vec<u8> = [&[zydecodb_engine::keys::KS_USER][..], &tenant_b[..]].concat();
+    catalog.ensure_collection(&prefix_a, "docs");
+    catalog.ensure_collection(&prefix_b, "docs");
+    catalog.persist(&mut engine).unwrap();
+    for prefix in [&prefix_a, &prefix_b] {
+        zydecodb_document::store::upsert(
+            &mut engine,
+            &mut catalog,
+            prefix,
+            "docs",
+            b"d1",
+            br#"{"n":1}"#,
+            false,
+        )
+        .unwrap();
+    }
+    let coll_a = catalog.collection(&prefix_a, "docs").unwrap().id;
+    let coll_b = catalog.collection(&prefix_b, "docs").unwrap().id;
+    let counter_key = zydecodb_document::catalog::counter_sys_key;
+    assert!(engine.sys_get(&counter_key(coll_a)).unwrap().is_some());
 
     // Simulate live drop while the engine remains open (server holds data_dir).
     let result =
         zydecodb::admin::drop_tenant_on_engine(&mut engine, &mut catalog, &tenant_a, false)
             .unwrap();
-    assert_eq!(result.deleted_keys, 1);
+    // Raw key + document key for tenant A.
+    assert_eq!(result.deleted_keys, 2);
+    assert_eq!(result.removed_collections, 1);
+    assert!(catalog.collection(&prefix_a, "docs").is_none());
+    assert_eq!(catalog.collection(&prefix_b, "docs").unwrap().doc_count, 1);
+    // Tenant A's counter record is gone; tenant B's survives.
+    assert!(engine.sys_get(&counter_key(coll_a)).unwrap().is_none());
+    assert!(engine.sys_get(&counter_key(coll_b)).unwrap().is_some());
     assert_eq!(engine.get(&tenant_key(&tenant_a, b":k1")).unwrap(), None);
     assert_eq!(
         engine.get(&tenant_key(&tenant_b, b":k1")).unwrap(),

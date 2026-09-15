@@ -490,6 +490,7 @@ impl Server {
                     Arc::clone(&metrics),
                     Arc::clone(&self.shutdown),
                     config.metrics.token.clone(),
+                    Arc::clone(&commit),
                 )?)
             }
             None => None,
@@ -1152,6 +1153,25 @@ fn serve_stream<S: Read + Write>(
             continue;
         }
 
+        // Fail closed after a WAL fsync error: no further write may enter the
+        // memtable, because nothing can make it durable until restart. Reads
+        // keep working. Rollback is allowed so a client can clear its
+        // transaction state; it never touches the WAL.
+        if commit.is_failed() && is_write_command(req.command) && req.command != Command::Rollback {
+            let resp = commit
+                .failure()
+                .map(|e| e.to_response())
+                .unwrap_or_else(|| {
+                    zydecodb_engine::frame::ResponseEnvelope::error(
+                        zydecodb_engine::errors::Status::IoError,
+                        "WAL fsync failed; writes refused until restart",
+                    )
+                });
+            write_response(stream, &resp)?;
+            stream.flush()?;
+            continue;
+        }
+
         if req.command == Command::SessionInit
             && security.require_auth
             && !session.authenticated
@@ -1272,10 +1292,10 @@ fn serve_stream<S: Read + Write>(
             // Make a raw-KV write durable before acknowledging. The engine lock
             // was released above; the coordinator batches this fsync with any
             // other writers' (real group commit).
-            if let Some(seq) = outcome.commit_seq {
-                commit.commit(seq, false);
+            match outcome.commit_seq.map(|seq| commit.commit(seq, false)) {
+                Some(Err(e)) => e.to_response(),
+                _ => outcome.response,
             }
-            outcome.response
         };
 
         if let Some(tm) = tenant_metrics {

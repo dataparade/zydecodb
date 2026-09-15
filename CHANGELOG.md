@@ -6,6 +6,61 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+Correctness, security and availability fixes from the tier-1 audit. No wire
+changes; conformance vectors are unchanged.
+
+### Server
+
+- Catalog counters (`doc_count` / `entry_count`) moved out of the catalog
+  blob into one small per-collection system record (`\x00doc/cnt/` +
+  collection id), written in the same WAL record as the document ops. The
+  schema blob is now rewritten on DDL only, not on every document write.
+  Blobs written by older versions still carry inline counts; they load as
+  before and each collection's counter record is created on its first counted
+  write or the next DDL. `admin drop-tenant` removes the dropped collections'
+  counter records.
+- Raw-KV `Put` / `Del` (auto-commit and in-transaction) reject client keys
+  starting with `d` or `i` followed by `0x00` with `InvalidKey`: that is the
+  only key shape that aliases the document/index keyspace. Natural keys such
+  as `device:1` are unaffected. Reads are unrestricted.
+- ZDoc reader is total over arbitrary bytes: `ObjectView` / `ArrayView` /
+  `ValueView` bounds-check every offset and length; malformed or truncated
+  stored bodies surface as `Corrupt` errors from `Find`, `Get`, updates and
+  deletes instead of aborting the server. Covered by unit tests, an
+  integration test that plants garbage bodies, and the `zdoc_valueview` fuzz
+  target (now also exercises keyed lookups).
+- The nightly fuzz workflow had failed identically on every run since
+  2026-08-07 (`rust-toolchain.toml` pins 1.91; the job never selected
+  nightly, so cargo-fuzz's `-Z` flags hit stable rustc before any target ran).
+  It now forces nightly and builds with `--sanitizer none` like the CI
+  fuzz-smoke gate.
+- Unique indexes are enforced in the two paths that skipped them:
+  `UpdateMany` fails with `Conflict` (and changes nothing) when two documents
+  in the same batch would claim the same unique value; defining a unique index
+  over pre-existing duplicates fails with `Conflict`, leaves the catalog
+  unchanged and removes the partially written index range (TTL indexes are
+  not stamped onto documents until uniqueness is confirmed).
+- `replica promote` requires `[replica].hmac_key_file` and verifies each
+  shipped segment's HMAC before draining; sha256 alone no longer suffices.
+  Promote without a key file is an error.
+- WAL fsync failure fails closed instead of hanging `Sync` writers: the commit
+  coordinator records the failure, wakes all waiters, rejects further writes
+  with `IoError` ("WAL fsync failed; write not durable; writes refused until
+  restart"), keeps serving reads, and `/readyz` returns `503`. Under
+  `--features failpoints` the path is covered end to end.
+- In-transaction `DocGetRev` applies the collection-prefix ACL like every
+  other document command (`Forbidden` on a disallowed collection).
+
+### Drivers
+
+- Watch streams no longer die under the default request timeout. The dedicated
+  Watch connection uses its own idle timeout (default 45s, must exceed the
+  server's `change_streams.heartbeat_ms`): Python `Client(watch_idle_timeout=)`,
+  Go `WithWatchIdleTimeout`, TypeScript `watchIdleTimeoutMs`. Driver CI runs
+  the live suites with change streams enabled and an idle-watch test.
+- Python `zydecodb.__version__` is `1.1.0`, matching `pyproject.toml`; a test
+  keeps them in sync.
+
 ## [1.1.0] - 2026-08-26
 
 Bounded `$lookup` on the existing `Aggregate` opcode. Not Mongo aggregation

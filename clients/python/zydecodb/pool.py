@@ -57,9 +57,19 @@ class ConnectionPool:
         conn.connect()
         return conn
 
-    def open_dedicated(self) -> Connection:
-        """Open a fresh connection that is not drawn from the pool."""
-        return self._new_connection()
+    def open_dedicated(self, idle_timeout: Optional[float] = None) -> Connection:
+        """Open a fresh connection that is not drawn from the pool.
+
+        Connect, TLS and SessionInit stay bounded by the pool's per-request
+        timeout; afterwards the socket timeout becomes `idle_timeout` if given.
+        Streaming callers (Watch) pass an idle timeout longer than the request
+        timeout, since a healthy but quiet stream only sees a server heartbeat
+        every `change_streams.heartbeat_ms`.
+        """
+        conn = self._new_connection()
+        if idle_timeout is not None:
+            conn.set_timeout(idle_timeout)
+        return conn
 
     def acquire(self) -> Connection:
         """Check out a healthy connection, creating one if capacity allows or

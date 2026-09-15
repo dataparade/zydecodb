@@ -492,6 +492,148 @@ fn doc_and_kv_prefix_acl() {
     handle.join().unwrap();
 }
 
+// ---------- raw-KV / document keyspace aliasing ----------
+
+/// A raw-KV key of the form `d\0...` or `i\0...` lands inside the document
+/// layer's key range (`'d'|u32 BE coll_id|doc_id`). Writes there are refused
+/// with InvalidKey on both the auto-commit and the transactional path; reads
+/// stay open; a natural key with a non-zero second byte is unaffected.
+#[test]
+fn raw_kv_rejects_document_alias_keys() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let keys_file = tmp.path().join("keys.toml");
+    let secret =
+        KeyStore::create_key(&keys_file, "k", KeyRole::ReadWrite, ZERO_TENANT, vec![]).unwrap();
+
+    let addr = free_addr();
+    let config = auth_config(&tmp, addr, keys_file);
+    let server = zydecodb::server::Server::new();
+    let shutdown = server.shutdown_flag();
+    let handle = thread::spawn(move || server.run(config).unwrap());
+
+    let mut stream = wait_connect(addr);
+    assert_eq!(session_init(&mut stream, &secret), Status::Ok);
+
+    // Create collection "c" so its id (0, first collection) is real, then
+    // write one document.
+    let idx = zydecodb_document::wire::IndexDefPayload {
+        collection: "c".into(),
+        index_name: "by_n".into(),
+        fields: vec!["n".into()],
+        unique: false,
+        expire_after_seconds: 0,
+        directions: vec![true],
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::IndexDef, idx.encode()),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+    let doc = zydecodb_document::wire::DocPutPayload {
+        collection: "c".into(),
+        doc_id: b"d1".to_vec(),
+        body: br#"{"n":1}"#.to_vec(),
+        relaxed: false,
+        expires_at: 0,
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::DocPut, doc.encode()),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+
+    // Exactly the storage key of document c/d1 as a raw client key.
+    let mut alias_doc = vec![zydecodb_document::keys::REC_DOC];
+    alias_doc.extend_from_slice(&0u32.to_be_bytes());
+    alias_doc.extend_from_slice(b"d1");
+    let mut alias_idx = vec![zydecodb_document::keys::REC_INDEX];
+    alias_idx.extend_from_slice(&0u32.to_be_bytes());
+    alias_idx.extend_from_slice(&0u32.to_be_bytes());
+
+    let put = |key: &[u8]| {
+        PutPayload {
+            routing_key: [0u8; 16],
+            txid: 0,
+            expires_at: 0,
+            key: key.to_vec(),
+            value: vec![0x03],
+        }
+        .encode()
+    };
+    let key_only = |key: &[u8]| {
+        KeyPayload {
+            routing_key: [0u8; 16],
+            snapshot_seq: 0,
+            key: key.to_vec(),
+        }
+        .encode()
+    };
+
+    for k in [&alias_doc[..], &alias_idx[..], b"d\0", b"i\0x"] {
+        write_request(&mut stream, &RequestEnvelope::new(Command::Put, put(k)));
+        let resp = read_response(&mut stream);
+        assert_eq!(resp.status, Status::InvalidKey, "Put {k:?}");
+        assert!(String::from_utf8_lossy(&resp.payload).contains("reserved"));
+        write_request(
+            &mut stream,
+            &RequestEnvelope::new(Command::Del, key_only(k)),
+        );
+        assert_eq!(
+            read_response(&mut stream).status,
+            Status::InvalidKey,
+            "Del {k:?}"
+        );
+    }
+
+    // Staged inside a transaction: same refusal, transaction stays open.
+    write_request(&mut stream, &RequestEnvelope::new(Command::Begin, vec![]));
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::Put, put(&alias_doc)),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::InvalidKey);
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::Del, key_only(&alias_doc)),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::InvalidKey);
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::Rollback, vec![]),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+
+    // Reads of the aliased range are not blocked (they return the stored body).
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::Get, key_only(&alias_doc)),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+
+    // Natural keys starting with d/i are fine.
+    for k in [&b"device:1"[..], b"id-42", b"d", b"i"] {
+        write_request(&mut stream, &RequestEnvelope::new(Command::Put, put(k)));
+        assert_eq!(read_response(&mut stream).status, Status::Ok, "Put {k:?}");
+    }
+
+    // The document is still intact.
+    let q = zydecodb_document::wire::QueryPayload::ById {
+        collection: "c".into(),
+        doc_id: b"d1".to_vec(),
+    };
+    write_request(
+        &mut stream,
+        &RequestEnvelope::new(Command::Query, q.encode()),
+    );
+    assert_eq!(read_response(&mut stream).status, Status::Ok);
+
+    drop(stream);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
 // ---------- DoS bound: sort buffer ----------
 
 /// A small configured max_sort_buffer rejects an oversized sorted result

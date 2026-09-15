@@ -50,8 +50,20 @@ func (p *pool) isClosed() bool {
 	return p.closed
 }
 
-func (p *pool) openDedicated(ctx context.Context) (*conn, error) {
-	return dial(ctx, p.addr, p.timeout, p.apiKey, p.tlsConf)
+// openDedicated dials a connection outside the pool. Connect, TLS handshake and
+// SessionInit stay bounded by the per-request timeout; afterwards the
+// connection's I/O timeout becomes idleTimeout. Streaming callers (Watch) pass
+// an idle timeout longer than the per-request timeout, since a quiet stream
+// only sees a heartbeat every heartbeat_ms.
+func (p *pool) openDedicated(ctx context.Context, idleTimeout time.Duration) (*conn, error) {
+	c, err := dial(ctx, p.addr, p.timeout, p.apiKey, p.tlsConf)
+	if err != nil {
+		return nil, err
+	}
+	if idleTimeout > 0 {
+		c.timeout = idleTimeout
+	}
+	return c, nil
 }
 
 // acquire checks out a healthy connection, creating one if capacity allows or

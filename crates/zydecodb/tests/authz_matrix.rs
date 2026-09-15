@@ -559,6 +559,39 @@ fn authz_matrix_anonymous_and_roles() {
             Status::Forbidden,
             "acl/DocPutIfMatch-users",
         );
+        // In-transaction reads honor the same collection ACL as auto-commit reads.
+        expect(&mut s, Command::Begin, vec![], Status::Ok, "acl/Begin");
+        expect(
+            &mut s,
+            Command::DocGetRev,
+            QueryPayload::ById {
+                collection: "users".into(),
+                doc_id: b"x".to_vec(),
+            }
+            .encode(),
+            Status::Forbidden,
+            "acl/tx-DocGetRev-users",
+        );
+        let got = roundtrip(
+            &mut s,
+            Command::DocGetRev,
+            QueryPayload::ById {
+                collection: "events".into(),
+                doc_id: b"x".to_vec(),
+            }
+            .encode(),
+        );
+        assert!(
+            matches!(got, Status::Ok | Status::NotFound),
+            "acl/tx-DocGetRev-events got {got:?}"
+        );
+        expect(
+            &mut s,
+            Command::Rollback,
+            vec![],
+            Status::Ok,
+            "acl/Rollback",
+        );
     }
 
     shutdown_join(&shutdown, handle);

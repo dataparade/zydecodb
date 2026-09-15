@@ -434,6 +434,90 @@ fn unique_index_rejects_duplicate_value() {
     assert!(matches!(err, DocError::DuplicateKey(_)));
 }
 
+/// `update_many` that would set two documents to the same unique value must
+/// fail before anything is written: neither body changes and the unique index
+/// keeps exactly one entry per document. The committed-state check alone
+/// cannot see this (neither doc owns the value yet); the batch-level claim
+/// tracking must.
+#[test]
+fn update_many_rejects_intra_batch_unique_collision() {
+    use serde_json::json;
+    use zydecodb_document::update::{self, UpdateDoc};
+
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    cat.add_index(
+        PREFIX,
+        "users",
+        "by_email",
+        vec!["email".into()],
+        true,
+        None,
+    )
+    .unwrap();
+    cat.persist(&mut e).unwrap();
+    for (id, email) in [(b"u1", "a@x.com"), (b"u2", "b@x.com"), (b"u3", "c@x.com")] {
+        let body = serde_json::to_vec(&json!({"email": email, "grp": 1})).unwrap();
+        store::upsert(&mut e, &mut cat, PREFIX, "users", id, &body, false).unwrap();
+    }
+    let coll_id = cat.collection(PREFIX, "users").unwrap().id;
+    let idx_id = cat.collection(PREFIX, "users").unwrap().indexes[0].id;
+    let index_entries = |e: &Engine| -> Vec<Vec<u8>> {
+        let lo = keys::index_prefix(PREFIX, coll_id, idx_id);
+        let hi = keys::prefix_upper_bound(&lo);
+        let snap = e.snapshot_owned();
+        snap.scan(lo, hi).unwrap().map(|r| r.unwrap().1).collect()
+    };
+    assert_eq!(index_entries(&e).len(), 3);
+
+    let ids: Vec<Vec<u8>> = vec![b"u1".to_vec(), b"u2".to_vec(), b"u3".to_vec()];
+    let collide = UpdateDoc::parse(&json!({"$set": {"email": "same@x.com"}})).unwrap();
+    let err =
+        update::apply_to_ids(&mut e, &mut cat, PREFIX, "users", &ids, &collide, None).unwrap_err();
+    assert!(matches!(err, DocError::DuplicateKey(_)), "got {err:?}");
+
+    // Nothing changed: bodies, index cardinality, and counters.
+    let snap = e.snapshot_owned();
+    for (id, email) in [(b"u1", "a@x.com"), (b"u2", "b@x.com"), (b"u3", "c@x.com")] {
+        let body = query::get_by_id(&snap, &cat, PREFIX, "users", id)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["email"], json!(email), "{}", String::from_utf8_lossy(id));
+    }
+    drop(snap);
+    let mut entries = index_entries(&e);
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![b"u1".to_vec(), b"u2".to_vec(), b"u3".to_vec()]
+    );
+    assert_eq!(cat.collection(PREFIX, "users").unwrap().doc_count, 3);
+
+    // A non-colliding multi-doc update on the same unique field still commits
+    // atomically (each doc gets a distinct value).
+    let inc = UpdateDoc::parse(&json!({"$set": {"grp": 2}})).unwrap();
+    let n = update::apply_to_ids(&mut e, &mut cat, PREFIX, "users", &ids, &inc, None).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(index_entries(&e).len(), 3);
+
+    // Filtered update_many where only one candidate still matches: no claim
+    // conflict, since the other candidates are skipped.
+    let filter = zydecodb_document::filter::Filter::parse(&json!({"email": "a@x.com"})).unwrap();
+    let n = update::apply_to_ids(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "users",
+        &ids,
+        &collide,
+        Some(&filter),
+    )
+    .unwrap();
+    assert_eq!(n, 1);
+}
+
 #[test]
 fn updating_indexed_field_moves_the_entry() {
     let dir = TempDir::new().unwrap();
@@ -662,6 +746,180 @@ fn define_index_backfills_existing_documents() {
         .any(|i| i.name == "by_age"));
 }
 
+/// Defining a unique index over documents that already share a value must
+/// fail with DuplicateKey, leave the catalog (in memory and on disk)
+/// unchanged, and leave no index keys behind. Once the duplicate is fixed the
+/// same DDL succeeds and later duplicate writes are rejected.
+#[test]
+fn define_unique_index_over_existing_duplicates_is_rejected_cleanly() {
+    use serde_json::json;
+
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    let coll_id = cat.ensure_collection(PREFIX, "users");
+    cat.persist(&mut e).unwrap();
+
+    // Enough documents to span several backfill chunks, with one duplicate
+    // pair buried in the middle (ZDoc and raw JSON bodies mixed).
+    let n = zydecodb_engine::keys::MAX_BATCH_KEYS * 2 + 7;
+    for i in 0..n {
+        let email = if i == n / 2 {
+            "dup@x.com".to_string()
+        } else {
+            format!("u{i}@x.com")
+        };
+        let body = json!({"email": email, "i": i});
+        if i % 2 == 0 {
+            let zdoc = zydecodb_document::binary::ZDocBuilder::from_value(&body);
+            store::upsert(
+                &mut e,
+                &mut cat,
+                PREFIX,
+                "users",
+                format!("u{i}").as_bytes(),
+                &zdoc,
+                true,
+            )
+            .unwrap();
+        } else {
+            store::upsert(
+                &mut e,
+                &mut cat,
+                PREFIX,
+                "users",
+                format!("u{i}").as_bytes(),
+                &serde_json::to_vec(&body).unwrap(),
+                false,
+            )
+            .unwrap();
+        }
+    }
+    // The second half of the duplicate pair, at the very end of the range.
+    store::upsert(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "users",
+        b"zz-dup",
+        br#"{"email":"dup@x.com","i":-1}"#,
+        false,
+    )
+    .unwrap();
+    let before_blob = e
+        .sys_get(zydecodb_document::catalog::CATALOG_SYS_KEY)
+        .unwrap()
+        .unwrap();
+    let before_cat = cat.clone();
+    let next_index_id = 0u32; // no index defined yet: the first id handed out
+
+    let err = store::define_index(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "users",
+        "by_email",
+        vec!["email".into()],
+        true,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, DocError::DuplicateKey(_)), "got {err:?}");
+
+    // Catalog untouched in memory and on disk.
+    assert_eq!(cat, before_cat);
+    assert!(cat.collection(PREFIX, "users").unwrap().indexes.is_empty());
+    let after_blob = e
+        .sys_get(zydecodb_document::catalog::CATALOG_SYS_KEY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before_blob, after_blob);
+
+    // No orphan index keys under the id the failed DDL would have used.
+    let lo = keys::index_prefix(PREFIX, coll_id, next_index_id);
+    let hi = keys::prefix_upper_bound(&lo);
+    let snap = e.snapshot_owned();
+    assert_eq!(snap.scan(lo, hi).unwrap().count(), 0, "orphan index keys");
+    drop(snap);
+
+    // Fix the duplicate; the DDL now succeeds and enforces going forward.
+    assert!(store::delete(&mut e, &mut cat, PREFIX, "users", b"zz-dup").unwrap());
+    store::define_index(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "users",
+        "by_email",
+        vec!["email".into()],
+        true,
+        None,
+    )
+    .unwrap();
+    let idx = &cat.collection(PREFIX, "users").unwrap().indexes[0];
+    assert!(idx.unique);
+    assert_eq!(idx.entry_count, n as u64);
+    let err = store::upsert(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "users",
+        b"late",
+        br#"{"email":"dup@x.com"}"#,
+        false,
+    )
+    .unwrap_err();
+    assert!(matches!(err, DocError::DuplicateKey(_)));
+}
+
+/// A unique TTL index over duplicates must not stamp any document's expiry.
+/// A stamp rewrites the doc key, so an unchanged seq proves nothing was
+/// written back to the documents by the rejected DDL.
+#[test]
+fn rejected_unique_ttl_index_does_not_stamp_expiry() {
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    let coll_id = cat.ensure_collection(PREFIX, "sess");
+    cat.persist(&mut e).unwrap();
+    // A timestamp far enough in the future that the index entries are live
+    // when the duplicate scan runs.
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_600_000;
+    let body = format!(r#"{{"at":{at}}}"#);
+    for id in [b"s1", b"s2"] {
+        store::upsert(&mut e, &mut cat, PREFIX, "sess", id, body.as_bytes(), false).unwrap();
+    }
+    let seq_of = |e: &Engine, id: &[u8]| {
+        let k = keys::doc_key(PREFIX, coll_id, id);
+        e.get_with_seq(&k).unwrap().expect("doc present").1
+    };
+    let before = [seq_of(&e, b"s1"), seq_of(&e, b"s2")];
+
+    let err = store::define_index(
+        &mut e,
+        &mut cat,
+        PREFIX,
+        "sess",
+        "ttl_unique",
+        vec!["at".into()],
+        true,
+        Some(60),
+    )
+    .unwrap_err();
+    assert!(matches!(err, DocError::DuplicateKey(_)), "got {err:?}");
+
+    assert_eq!([seq_of(&e, b"s1"), seq_of(&e, b"s2")], before);
+    let snap = e.snapshot_owned();
+    for id in [b"s1", b"s2"] {
+        assert!(query::get_by_id(&snap, &cat, PREFIX, "sess", id)
+            .unwrap()
+            .is_some());
+    }
+}
+
 #[test]
 fn orphan_index_keys_without_catalog_entry_are_invisible() {
     let dir = TempDir::new().unwrap();
@@ -812,4 +1070,114 @@ fn expires_at_change_rewrites_index_keys_for_compaction_reclaim() {
     )
     .unwrap();
     assert!(page.rows.is_empty(), "expired body+index must both reclaim");
+}
+
+/// A garbage `VK_ZDOC` body planted directly through the engine (what raw-KV
+/// aliasing, disk corruption, or a legacy writer could leave behind) must
+/// surface as `DocError::Corrupt` from every read/write path. Before the
+/// reader was bounds-checked, `[0x03]` (an i64 tag with no payload) hit an
+/// `unwrap()` and, with `panic = "abort"`, took the whole server down.
+#[test]
+fn corrupt_zdoc_body_is_reported_not_a_panic() {
+    use serde_json::json;
+    use zydecodb_document::filter::Filter;
+    use zydecodb_document::query::FindSpec;
+    use zydecodb_document::update::{self, UpdateDoc};
+
+    let dir = TempDir::new().unwrap();
+    let mut e = open(&dir);
+    let mut cat = Catalog::default();
+    cat.add_index(PREFIX, "c", "by_n", vec!["n".into()], false, None)
+        .unwrap();
+    cat.persist(&mut e).unwrap();
+    store::upsert(&mut e, &mut cat, PREFIX, "c", b"good", br#"{"n":1}"#, false).unwrap();
+    let coll_id = cat.collection(PREFIX, "c").unwrap().id;
+
+    let garbage: [&[u8]; 6] = [
+        &[store::VK_ZDOC, 0x03],
+        &[store::VK_ZDOC, 0x05, 0xff, 0xff, 0xff, 0xff, b'a'],
+        &[store::VK_ZDOC, 0x07, 9, 0, 0, 0, 0xff, 0xff, 0xff, 0xff],
+        &[
+            store::VK_ZDOC,
+            0x07,
+            17,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            200,
+            0,
+            0,
+            0,
+            210,
+            0,
+            0,
+            0,
+        ],
+        &[store::VK_ZDOC, 0x06, 13, 0, 0, 0, 1, 0, 0, 0, 99, 0, 0, 0],
+        &[], // empty body
+    ];
+    let all = FindSpec {
+        filter: Filter::parse(&json!({})).unwrap(),
+        sort: vec![],
+        projection: None,
+        skip: 0,
+        limit: 10,
+        cursor: None,
+    };
+    let by_n = FindSpec {
+        filter: Filter::parse(&json!({"n": 1})).unwrap(),
+        ..all.clone()
+    };
+    for (i, bad) in garbage.iter().enumerate() {
+        let id = format!("bad{i}").into_bytes();
+        e.put(keys::doc_key(PREFIX, coll_id, &id), bad.to_vec(), 0)
+            .unwrap();
+        let snap = e.snapshot_owned();
+
+        let err = query::get_by_id(&snap, &cat, PREFIX, "c", &id).unwrap_err();
+        assert!(
+            matches!(err, DocError::Corrupt(_)),
+            "get_by_id #{i}: {err:?}"
+        );
+
+        let err = query::execute_find(&snap, &cat, PREFIX, "c", &all, query::MAX_SORT_BUFFER)
+            .unwrap_err();
+        assert!(matches!(err, DocError::Corrupt(_)), "find #{i}: {err:?}");
+
+        // Filtered paths evaluate the corrupt view: no match, no panic. The
+        // good document is still returned.
+        let page =
+            query::execute_find(&snap, &cat, PREFIX, "c", &by_n, query::MAX_SORT_BUFFER).unwrap();
+        assert_eq!(page.rows.len(), 1, "filtered find #{i}");
+        assert_eq!(page.rows[0].doc_id, b"good");
+        assert_eq!(
+            query::count(&snap, &cat, PREFIX, "c", &by_n.filter).unwrap(),
+            1
+        );
+        let n_distinct = query::distinct(&snap, &cat, PREFIX, "c", "n", &by_n.filter).unwrap();
+        assert_eq!(n_distinct, vec![json!(1)]);
+        drop(snap);
+
+        // Write paths that must decode the old body report Corrupt too.
+        let upd = UpdateDoc::parse(&json!({"$set": {"n": 2}})).unwrap();
+        let err = update::apply_to_id(&mut e, &mut cat, PREFIX, "c", &id, &upd).unwrap_err();
+        assert!(matches!(err, DocError::Corrupt(_)), "update #{i}: {err:?}");
+        let err = store::current_json_body(&e, &cat, PREFIX, "c", &id).unwrap_err();
+        assert!(
+            matches!(err, DocError::Corrupt(_)),
+            "current_json_body #{i}"
+        );
+
+        // Delete of a corrupt ZDoc body: the view yields no index keys, the
+        // body row itself is removed, and the collection is readable again.
+        assert!(store::delete(&mut e, &mut cat, PREFIX, "c", &id).unwrap());
+        let snap = e.snapshot_owned();
+        let page =
+            query::execute_find(&snap, &cat, PREFIX, "c", &all, query::MAX_SORT_BUFFER).unwrap();
+        assert_eq!(page.rows.len(), 1, "after delete #{i}");
+    }
 }

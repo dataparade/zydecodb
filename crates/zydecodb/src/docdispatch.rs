@@ -20,7 +20,7 @@ use zydecodb_document::query::{FindSpec, Projection};
 use zydecodb_document::update::UpdateDoc;
 use zydecodb_document::{query, store, update, wire};
 use zydecodb_engine::engine::Engine;
-use zydecodb_engine::errors::Status;
+use zydecodb_engine::errors::{EngineError, Status};
 use zydecodb_engine::frame::{Command, RequestEnvelope, ResponseEnvelope};
 use zydecodb_engine::keys::KS_USER;
 
@@ -101,7 +101,7 @@ fn ensure_collection_exists(
     };
     apply_pending_slowdown(slowdown);
     if let Some(seq) = ddl_seq {
-        commit.commit(seq, false);
+        commit.commit(seq, false).map_err(EngineError::from)?;
     }
     Ok(())
 }
@@ -271,10 +271,10 @@ fn doc_put(
         )
     });
     match outcome {
-        Ok(seq) => {
-            commit.commit(seq, p.relaxed);
-            ResponseEnvelope::ok(seq.to_be_bytes().to_vec())
-        }
+        Ok(seq) => match commit.commit(seq, p.relaxed) {
+            Ok(()) => ResponseEnvelope::ok(seq.to_be_bytes().to_vec()),
+            Err(e) => e.to_response(),
+        },
         Err(e) => err_response(&e),
     }
 }
@@ -310,10 +310,10 @@ fn doc_put_if_match(
         )
     });
     match outcome {
-        Ok(seq) => {
-            commit.commit(seq, p.relaxed);
-            ResponseEnvelope::ok(seq.to_be_bytes().to_vec())
-        }
+        Ok(seq) => match commit.commit(seq, p.relaxed) {
+            Ok(()) => ResponseEnvelope::ok(seq.to_be_bytes().to_vec()),
+            Err(e) => e.to_response(),
+        },
         Err(e) => err_response(&e),
     }
 }
@@ -339,7 +339,7 @@ fn doc_update_if_match(
         )
     });
     let seq = outcome?;
-    commit.commit(seq, p.relaxed);
+    commit.commit(seq, p.relaxed).map_err(EngineError::from)?;
     Ok(ResponseEnvelope::ok(seq.to_be_bytes().to_vec()))
 }
 
@@ -423,8 +423,10 @@ fn doc_del(
         Ok(deleted) => {
             // A delete-by-id is always durable-by-default (no relaxed flag on
             // DocDel); the seq it touched must reach disk before we ack.
-            commit.commit(outcome.1, false);
-            ResponseEnvelope::ok(vec![if deleted { 1 } else { 0 }])
+            match commit.commit(outcome.1, false) {
+                Ok(()) => ResponseEnvelope::ok(vec![if deleted { 1 } else { 0 }]),
+                Err(e) => e.to_response(),
+            }
         }
         Err(e) => err_response(&e),
     }
@@ -471,8 +473,10 @@ fn index_def(
     match outcome.0 {
         Ok(()) => {
             // DDL is always made durable before acknowledging.
-            commit.commit(outcome.1, false);
-            ResponseEnvelope::ok(vec![])
+            match commit.commit(outcome.1, false) {
+                Ok(()) => ResponseEnvelope::ok(vec![]),
+                Err(e) => e.to_response(),
+            }
         }
         Err(e) => err_response(&e),
     }
@@ -640,7 +644,7 @@ fn update_cmd(
         Ok((UpdateWriteOutcome::Upserted { upserted_id }, seq))
     })?;
     // One durability wait covers the whole (possibly atomic) write set above.
-    commit.commit(seq, p.relaxed);
+    commit.commit(seq, p.relaxed).map_err(EngineError::from)?;
     match outcome {
         UpdateWriteOutcome::Updated { modified } => Ok(ResponseEnvelope::ok(
             format!("{{\"matched\":{modified},\"modified\":{modified}}}").into_bytes(),
@@ -687,7 +691,7 @@ fn delete_cmd(
         let seq = guard.last_buffered_seq();
         Ok::<_, DocError>((deleted, seq))
     })?;
-    commit.commit(seq, p.relaxed);
+    commit.commit(seq, p.relaxed).map_err(EngineError::from)?;
     Ok(ResponseEnvelope::ok(
         format!("{{\"deleted\":{deleted}}}").into_bytes(),
     ))

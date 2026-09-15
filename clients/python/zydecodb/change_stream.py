@@ -31,7 +31,11 @@ class ChangeStream:
         self._client = client
         self._collection = collection
         self._resume = resume_token or b""
-        self._conn = client._pool.open_dedicated()
+        # The stream's socket timeout is the idle timeout, not the request
+        # timeout: a quiet stream only carries a heartbeat every
+        # `change_streams.heartbeat_ms`, which the default 5s request timeout
+        # would cut off.
+        self._conn = client._pool.open_dedicated(idle_timeout=client._watch_idle_timeout)
         self._opened = False
         self._closed = False
         self._last_token = b""

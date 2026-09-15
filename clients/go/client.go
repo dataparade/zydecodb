@@ -20,30 +20,41 @@ import (
 // are safe to repeat; non-idempotent operations (operator updates, deletes) are
 // never retried automatically.
 type Client struct {
-	pool        *pool
-	maxRetries  int
-	backoffBase time.Duration
-	backoffCap  time.Duration
+	pool             *pool
+	maxRetries       int
+	backoffBase      time.Duration
+	backoffCap       time.Duration
+	watchIdleTimeout time.Duration
 }
 
 // Option configures a Client.
 type Option func(*config)
 
 type config struct {
-	apiKey      string
-	timeout     time.Duration
-	poolSize    int
-	maxRetries  int
-	backoffBase time.Duration
-	backoffCap  time.Duration
-	tlsConf     *tls.Config
+	apiKey           string
+	timeout          time.Duration
+	poolSize         int
+	maxRetries       int
+	backoffBase      time.Duration
+	backoffCap       time.Duration
+	tlsConf          *tls.Config
+	watchIdleTimeout time.Duration
 }
 
 // WithAPIKey authenticates each connection with a SessionInit handshake.
 func WithAPIKey(key string) Option { return func(c *config) { c.apiKey = key } }
 
-// WithTimeout sets the per-request I/O timeout (default 5s).
+// WithTimeout sets the per-request I/O timeout (default 5s). It does not apply
+// to the dedicated Watch connection; see WithWatchIdleTimeout.
 func WithTimeout(d time.Duration) Option { return func(c *config) { c.timeout = d } }
+
+// WithWatchIdleTimeout sets how long a Watch stream may stay silent before
+// Next fails (default 45s). It must exceed the server's
+// change_streams.heartbeat_ms (default 15s), otherwise an idle stream dies
+// between heartbeats. Values <= 0 keep the default.
+func WithWatchIdleTimeout(d time.Duration) Option {
+	return func(c *config) { c.watchIdleTimeout = d }
+}
 
 // WithPoolSize sets the maximum number of pooled connections (default 8).
 func WithPoolSize(n int) Option { return func(c *config) { c.poolSize = n } }
@@ -69,11 +80,12 @@ func WithTLS(cfg *tls.Config) Option {
 // NewClient connects to a ZydecoDB server at addr (e.g. "127.0.0.1:9470").
 func NewClient(addr string, opts ...Option) *Client {
 	cfg := config{
-		timeout:     5 * time.Second,
-		poolSize:    8,
-		maxRetries:  2,
-		backoffBase: 50 * time.Millisecond,
-		backoffCap:  2 * time.Second,
+		timeout:          5 * time.Second,
+		poolSize:         8,
+		maxRetries:       2,
+		backoffBase:      50 * time.Millisecond,
+		backoffCap:       2 * time.Second,
+		watchIdleTimeout: 45 * time.Second,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -81,11 +93,15 @@ func NewClient(addr string, opts ...Option) *Client {
 	if cfg.maxRetries < 0 {
 		cfg.maxRetries = 0
 	}
+	if cfg.watchIdleTimeout <= 0 {
+		cfg.watchIdleTimeout = 45 * time.Second
+	}
 	return &Client{
-		pool:        newPool(addr, cfg.apiKey, cfg.timeout, cfg.poolSize, cfg.tlsConf),
-		maxRetries:  cfg.maxRetries,
-		backoffBase: cfg.backoffBase,
-		backoffCap:  cfg.backoffCap,
+		pool:             newPool(addr, cfg.apiKey, cfg.timeout, cfg.poolSize, cfg.tlsConf),
+		maxRetries:       cfg.maxRetries,
+		backoffBase:      cfg.backoffBase,
+		backoffCap:       cfg.backoffCap,
+		watchIdleTimeout: cfg.watchIdleTimeout,
 	}
 }
 

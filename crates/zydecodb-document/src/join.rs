@@ -136,7 +136,7 @@ fn view_to_scalar(v: &ValueView<'_>) -> DocResult<Option<Value>> {
 /// Decode a stored body to a JSON document with the virtual `_id` field
 /// injected (same convention as the find path).
 fn stored_to_doc(stored: &[u8], doc_id: &[u8]) -> DocResult<Value> {
-    let bytes = store::stored_to_json_vec(stored);
+    let bytes = store::stored_to_json_vec(stored)?;
     let mut doc: Value = serde_json::from_slice(&bytes)
         .map_err(|e| DocError::Corrupt(format!("invalid stored JSON: {e}")))?;
     if let Value::Object(map) = &mut doc {
