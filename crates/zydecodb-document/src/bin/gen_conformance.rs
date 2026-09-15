@@ -576,6 +576,22 @@ fn payload_vectors() -> Vec<Value> {
         Command::Aggregate,
         p.encode(),
     ));
+    let lookup_pipeline =
+        br#"[{"$lookup":{"from":"orders","localField":"_id","foreignField":"user_id","as":"orders"}}]"#;
+    let p = AggregatePayload {
+        collection: "users".into(),
+        pipeline: lookup_pipeline.to_vec(),
+    };
+    v.push(req(
+        "aggregate_lookup",
+        "Aggregate",
+        json!({
+            "collection":"users",
+            "pipeline_json":"[{\"$lookup\":{\"from\":\"orders\",\"localField\":\"_id\",\"foreignField\":\"user_id\",\"as\":\"orders\"}}]"
+        }),
+        Command::Aggregate,
+        p.encode(),
+    ));
 
     // ---- Begin / Commit / Rollback (empty payloads) ----
     v.push(req(

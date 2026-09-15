@@ -715,3 +715,303 @@ fn inlj_and_hash_return_identical_docs() {
     assert_eq!(indexed.strategy, JoinStrategy::Inlj);
     assert_eq!(hashed.docs, indexed.docs);
 }
+
+#[test]
+fn match_lookup_group_filters_then_counts() {
+    let (_dir, engine, catalog) = seed();
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$match": {"_id": "u1"}},
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }},
+            {"$group": {"_id": null, "n": {"$count": {}}}}
+        ])),
+    );
+    assert_eq!(rows, vec![json!({"_id": null, "n": 1})]);
+}
+
+#[test]
+fn lookup_max_memory_bytes_is_enforced() {
+    let (_dir, engine, catalog) = seed();
+    let err = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+        }}])),
+        AggregationLimits {
+            max_memory_bytes: 1,
+            ..Default::default()
+        },
+    );
+    let err = match err {
+        Ok(_) => panic!("expected memory bound error"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("join state exceeds 1 bytes"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn lookup_outer_scan_bound_is_enforced() {
+    let (_dir, engine, catalog) = seed();
+    let err = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+        }}])),
+        AggregationLimits {
+            max_scan_docs: 2,
+            ..Default::default()
+        },
+    );
+    let err = match err {
+        Ok(_) => panic!("expected outer scan bound error"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("query scan exceeds 2 candidate documents"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn dotted_join_fields_use_inlj() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "users");
+    catalog.ensure_collection(PREFIX, "orders");
+    catalog
+        .add_index(
+            PREFIX,
+            "orders",
+            "by_customer",
+            vec!["customer.id".into()],
+            false,
+            None,
+        )
+        .unwrap();
+    catalog.persist(&mut engine).unwrap();
+    put(
+        &mut engine,
+        &mut catalog,
+        "users",
+        "u1",
+        json!({"profile": {"uid": "u1"}}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "users",
+        "u2",
+        json!({"profile": {"uid": "u2"}}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o1",
+        json!({"customer": {"id": "u1"}, "total": 10}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o2",
+        json!({"customer": {"id": "u1"}, "total": 20}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o3",
+        json!({"customer": {"id": "u2"}, "total": 5}),
+    );
+
+    let pipe = pipeline(json!([{"$lookup": {
+        "from": "orders", "localField": "profile.uid", "foreignField": "customer.id", "as": "orders"
+    }}]));
+    let result = run_join(
+        &engine,
+        &catalog,
+        "users",
+        &pipe,
+        AggregationLimits::default(),
+    );
+    assert_eq!(result.strategy, JoinStrategy::Inlj);
+    assert_eq!(result.docs.len(), 2);
+    let by_id = |id: &str| result.docs.iter().find(|r| r["_id"] == json!(id)).unwrap();
+    assert_eq!(by_id("u1")["orders"].as_array().unwrap().len(), 2);
+    assert_eq!(by_id("u2")["orders"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn compound_leading_field_selects_inlj() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "users");
+    catalog.ensure_collection(PREFIX, "orders");
+    catalog
+        .add_index(
+            PREFIX,
+            "orders",
+            "by_user_total",
+            vec!["user_id".into(), "total".into()],
+            false,
+            None,
+        )
+        .unwrap();
+    catalog.persist(&mut engine).unwrap();
+    put(
+        &mut engine,
+        &mut catalog,
+        "users",
+        "u1",
+        json!({"name": "alice"}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "users",
+        "u2",
+        json!({"name": "bob"}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "users",
+        "u3",
+        json!({"name": "carol"}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o1",
+        json!({"user_id": "u1", "total": 10}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o2",
+        json!({"user_id": "u1", "total": 20}),
+    );
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o3",
+        json!({"user_id": "u2", "total": 5}),
+    );
+
+    let result = run_join(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+        }}])),
+        AggregationLimits::default(),
+    );
+    assert_eq!(result.strategy, JoinStrategy::Inlj);
+    let by_id = |id: &str| result.docs.iter().find(|r| r["_id"] == json!(id)).unwrap();
+    assert_eq!(by_id("u1")["orders"].as_array().unwrap().len(), 2);
+    assert_eq!(by_id("u2")["orders"].as_array().unwrap().len(), 1);
+    assert_eq!(by_id("u3")["orders"], json!([]));
+}
+
+#[test]
+fn compound_non_leading_field_falls_to_hash() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "users");
+    catalog.ensure_collection(PREFIX, "orders");
+    catalog
+        .add_index(
+            PREFIX,
+            "orders",
+            "by_total_user",
+            vec!["total".into(), "user_id".into()],
+            false,
+            None,
+        )
+        .unwrap();
+    catalog.persist(&mut engine).unwrap();
+    put(&mut engine, &mut catalog, "users", "u1", json!({}));
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o1",
+        json!({"user_id": "u1", "total": 10}),
+    );
+
+    let result = run_join(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+        }}])),
+        AggregationLimits::default(),
+    );
+    assert_eq!(result.strategy, JoinStrategy::Hash);
+    assert_eq!(result.docs[0]["orders"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn held_snapshot_misses_post_snap_inner_write() {
+    let (_dir, mut engine, mut catalog) = seed();
+    let pipe = pipeline(json!([{"$lookup": {
+        "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+    }}]));
+    let spec = pipe.lookup.as_ref().unwrap();
+    let snap = engine.snapshot_owned();
+
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o4",
+        json!({"user_id": "u1", "total": 99}),
+    );
+
+    let held = execute_lookup(
+        &snap,
+        PREFIX,
+        catalog.collection(PREFIX, "users").unwrap(),
+        catalog.collection(PREFIX, "orders").unwrap(),
+        &pipe.filter,
+        spec,
+        AggregationLimits::default(),
+    )
+    .unwrap();
+    let u1 = held.docs.iter().find(|r| r["_id"] == json!("u1")).unwrap();
+    assert_eq!(u1["orders"].as_array().unwrap().len(), 2);
+
+    let fresh = run_join(
+        &engine,
+        &catalog,
+        "users",
+        &pipe,
+        AggregationLimits::default(),
+    );
+    let u1 = fresh.docs.iter().find(|r| r["_id"] == json!("u1")).unwrap();
+    assert_eq!(u1["orders"].as_array().unwrap().len(), 3);
+}
