@@ -125,6 +125,7 @@ esac
 say ""
 say "Get started:"
 say "  zydecodb serve                # starts on 127.0.0.1:9470, data in ~/.zydecodb"
+say "  zydecodb --agent              # usage + examples for AI agents"
 say "  zydecodb update               # later: upgrade this binary from GitHub Releases"
 say ""
 say "Then, in another terminal, grab a driver:"
