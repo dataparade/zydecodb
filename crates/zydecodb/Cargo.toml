@@ -45,7 +45,7 @@ signal-hook = "0.3"
 polling = "3"
 arc-swap = "1.9.2"
 fail = { workspace = true, optional = true }
-ureq = { version = "2", default-features = true, features = ["json"] }
+ureq = { version = "3", default-features = true, features = ["json"] }
 flate2 = "1"
 tar = "0.4"
 tempfile = { workspace = true }
