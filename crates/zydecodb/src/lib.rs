@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod admin_dispatch;
+pub mod agent;
 pub mod commit;
 pub mod config;
 pub mod dispatch;

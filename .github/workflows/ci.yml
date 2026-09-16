@@ -132,6 +132,11 @@ jobs:
           ZYDECODB_TEST_HOST: 127.0.0.1
           ZYDECODB_TEST_PORT: "9470"
         run: pytest -q
+      - name: Agent-doc Python fences
+        env:
+          ZYDECODB_TEST_HOST: 127.0.0.1
+          ZYDECODB_TEST_PORT: "9470"
+        run: python3 scripts/run-agent-python-fences.py docs/agent/INDEX.md docs/agent/python.md
       - name: Stop ZydecoDB
         if: always()
         run: kill "$(cat /tmp/zdb.pid)" || true

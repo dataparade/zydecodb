@@ -212,13 +212,13 @@ The release workflow then:
 
 ```bash
 # Go — pin the module version (not @latest)
-go get github.com/dataparade/zydecodb/clients/go@v1.1.0
+go get github.com/dataparade/zydecodb/clients/go@v1.2.0
 
 # Python
-pip install zydecodb==1.1.0
+pip install zydecodb==1.2.0
 
 # TypeScript
-npm install zydecodb@1.1.0
+npm install zydecodb@1.2.0
 ```
 
 Unified releases still ship matching `X.Y.Z` tags for convenience. After 1.0,

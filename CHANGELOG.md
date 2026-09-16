@@ -6,6 +6,8 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-16
+
 - Miri is a required CI job (90-minute timeout). Tests Miri cannot
   execute are ignored: OS-thread / latency windows, the 200k-put
   write-loss probe, and `snapshot_is_a_consistent_readable_base`
@@ -31,6 +33,9 @@ changes; conformance vectors are unchanged.
 
 ### Server
 
+- `zydecodb --agent [TOPIC]` prints a versioned, topic-split usage contract
+  (install, official drivers, query/update limits, hard no's) embedded in the
+  binary so agents do not need the git tree.
 - Catalog counters (`doc_count` / `entry_count`) moved out of the catalog
   blob into one small per-collection system record (`\x00doc/cnt/` +
   collection id), written in the same WAL record as the document ops. The
@@ -78,7 +83,7 @@ changes; conformance vectors are unchanged.
   server's `change_streams.heartbeat_ms`): Python `Client(watch_idle_timeout=)`,
   Go `WithWatchIdleTimeout`, TypeScript `watchIdleTimeoutMs`. Driver CI runs
   the live suites with change streams enabled and an idle-watch test.
-- Python `zydecodb.__version__` is `1.1.0`, matching `pyproject.toml`; a test
+- Python `zydecodb.__version__` is `1.2.0`, matching `pyproject.toml`; a test
   keeps them in sync.
 
 ## [1.1.0] - 2026-08-26

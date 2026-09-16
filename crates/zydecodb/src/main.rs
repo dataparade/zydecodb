@@ -4,10 +4,25 @@ use tracing_subscriber::EnvFilter;
 use zydecodb::security::keys::KeyRole;
 
 #[derive(Parser)]
-#[command(name = "zydecodb", about = "ZydecoDB database server")]
+#[command(
+    name = "zydecodb",
+    about = "ZydecoDB database server",
+    arg_required_else_help = true,
+    after_help = "For AI agents: zydecodb --agent [TOPIC]"
+)]
 struct Cli {
+    /// Print agent instructions. Optional topic: python, go, typescript, query,
+    /// kv, tx, watch, aggregate, ops, pitfalls.
+    #[arg(
+        long,
+        value_name = "TOPIC",
+        num_args = 0..=1,
+        default_missing_value = "index",
+        global = true
+    )]
+    agent: Option<String>,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -269,6 +284,18 @@ fn install_panic_hook() {
 }
 
 fn main() {
+    let cli = Cli::parse();
+    if let Some(topic) = cli.agent.as_deref() {
+        match zydecodb::agent::render(topic) {
+            Ok(text) => print!("{text}"),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
@@ -281,8 +308,10 @@ fn main() {
     // tests install their own provider, which masked this in CI.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let cli = Cli::parse();
-    let result = match cli.command {
+    let Some(command) = cli.command else {
+        std::process::exit(2);
+    };
+    let result = match command {
         Commands::Serve {
             config,
             replica_from,

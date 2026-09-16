@@ -69,6 +69,7 @@ tls.key
 /website/
 /scripts/*
 !/scripts/install.sh
+!/scripts/run-agent-python-fences.py
 !/scripts/tenant-isolation-soak.sh
 !/scripts/soak.sh
 !/scripts/analyze-soak.py

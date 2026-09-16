@@ -191,6 +191,7 @@ cargo test --workspace
 
 ## More docs
 
+- `zydecodb --agent [TOPIC]` — short usage contract for AI agents (also [`docs/agent/`](docs/agent/INDEX.md))
 - Official drivers: [`clients/python`](clients/python/README.md), [`clients/go`](clients/go/README.md), [`clients/typescript`](clients/typescript/README.md) — each with pooling, retries, and typed errors
 - [`clients/conformance/README.md`](clients/conformance/README.md) — shared wire conformance vectors that keep every driver byte-compatible with the server
 - [`examples/README.md`](examples/README.md) — client and user-backend walkthroughs
