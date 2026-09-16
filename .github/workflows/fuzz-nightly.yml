@@ -49,13 +49,23 @@ jobs:
           )
           # Multi-hour total budget: 11 targets x 900s ~= 2.75h. The corpus
           # cache makes each night start smarter than the last.
+          failed=()
           for t in "${targets[@]}"; do
             echo "==> fuzz $t"
             mkdir -p "corpus/$t"
             # Workspace release LTO + ASAN/sancov + rust-lld drops __sancov_gen_
             # symbols (cargo-fuzz#384/#404), same as the fuzz-smoke gate.
-            cargo +nightly fuzz run "$t" --sanitizer none -- -max_total_time=900 -artifact_prefix="artifacts/${t}-"
+            # -timeout=10: one hung input must not burn 1800s and skip the rest.
+            if ! cargo +nightly fuzz run "$t" --sanitizer none -- \
+              -max_total_time=900 -timeout=10 -artifact_prefix="artifacts/${t}-"; then
+              echo "==> fuzz $t FAILED"
+              failed+=("$t")
+            fi
           done
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "failed targets: ${failed[*]}"
+            exit 1
+          fi
       - name: Save fuzz corpus
         if: always()
         uses: actions/cache/save@v4

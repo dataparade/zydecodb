@@ -56,6 +56,10 @@ fn delete_prefix_removes_only_matching_keys() {
     assert_eq!(engine.get(&uk(b"b:1")).unwrap(), Some(b"z".to_vec()));
 }
 
+#[cfg_attr(
+    miri,
+    ignore = "std::fs::copy uses copy_file_range; Miri does not emulate syscall 326"
+)]
 #[test]
 fn snapshot_is_a_consistent_readable_base() {
     let tmp = tempfile::TempDir::new().unwrap();

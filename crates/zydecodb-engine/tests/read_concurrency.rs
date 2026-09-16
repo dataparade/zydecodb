@@ -29,6 +29,7 @@ fn p50_p99_us(samples: &mut [u128]) -> (f64, f64) {
 
 /// N reader threads capture snapshots via `read()` and point-get while one
 /// writer keeps putting. Prints read latency percentiles for the PR description.
+#[cfg_attr(miri, ignore = "latency p99 gate; Miri cannot meet the 5ms bound")]
 #[test]
 fn concurrent_readers_alongside_writer() {
     let dir = TempDir::new().unwrap();

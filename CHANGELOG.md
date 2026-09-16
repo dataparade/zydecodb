@@ -6,6 +6,17 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+- Miri is a required CI job (90-minute timeout). Tests Miri cannot
+  execute are ignored: OS-thread / latency windows, the 200k-put
+  write-loss probe, and `snapshot_is_a_consistent_readable_base`
+  (`copy_file_range`). `proptest_codecs` runs 16 cases under Miri
+  (1024 on native). Those are not memory-model tests.
+- Fuzz nightly no longer dies on the first target timeout: each input is
+  capped at 10s and the remaining targets still run. `fuzz_dispatch` no
+  longer Sync-fsyncs (this harness never spawned the commit thread, so
+  Sync `commit()` waited forever) and skips Watch / Find / Count /
+  Aggregate.
+
 - rustls `0.23.40` → `0.23.45` (`RUSTSEC-2026-0285`: TLS 1.3 handshake
   messages accepted across encryption-level boundaries).
 - `drain_flush` no longer resubmits a failed flush in the same poll, and

@@ -174,6 +174,7 @@ fn compaction_survives_reopen() {
     }
 }
 
+#[cfg_attr(miri, ignore = "wall-clock flush bound; Miri cannot meet the 2s drain")]
 #[test]
 fn flush_returns_before_background_compaction_finishes() {
     use std::time::{Duration, Instant};

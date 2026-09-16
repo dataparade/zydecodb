@@ -82,6 +82,7 @@ fn load(e: &mut Engine, with_sys: bool) {
     e.sync_wal().unwrap();
 }
 
+#[cfg_attr(miri, ignore = "200k puts; Miri cannot finish this probe")]
 #[test]
 fn live_reads_cover_in_flight_flush_plain_puts() {
     let dir = TempDir::new().unwrap();
@@ -92,6 +93,7 @@ fn live_reads_cover_in_flight_flush_plain_puts() {
     assert_eq!(count_scan(&e), N as usize);
 }
 
+#[cfg_attr(miri, ignore = "200k puts; Miri cannot finish this probe")]
 #[test]
 fn live_reads_cover_in_flight_flush_batch_with_sys() {
     let dir = TempDir::new().unwrap();

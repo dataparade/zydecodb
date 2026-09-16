@@ -722,6 +722,10 @@ mod tests {
     /// reader fds after unlink) and writes duplicate-range outputs — the
     /// 2f84fe2 write-amp regression. Submission must hold off until the
     /// catalog has caught up with the worker.
+    #[cfg_attr(
+        miri,
+        ignore = "OS-thread timing window; Miri cannot meet the 30s drain"
+    )]
     #[test]
     fn no_submission_while_catalog_lags_worker() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -799,6 +803,10 @@ mod tests {
     /// compaction apply must not trigger compaction submission: the gate
     /// cannot see the sibling (already taken from the ready queue), so a
     /// plan made mid-batch names inputs the sibling is about to remove.
+    #[cfg_attr(
+        miri,
+        ignore = "OS-thread timing window; Miri cannot meet the 30s drain"
+    )]
     #[test]
     fn no_submission_mid_apply_batch() {
         let dir = tempfile::TempDir::new().unwrap();

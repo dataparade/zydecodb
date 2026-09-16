@@ -258,7 +258,7 @@ jobs:
           done
   miri:
     runs-on: ubuntu-latest
-    continue-on-error: true
+    timeout-minutes: 90
     env:
       # rust-toolchain.toml pins 1.91; miri is a nightly-only component.
       RUSTUP_TOOLCHAIN: nightly

@@ -27,8 +27,10 @@ use zydecodb_engine::wal::{self, WalRecord};
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        // Pure CPU, no I/O — keep this dense.
-        cases: 1024,
+        // Pure CPU, no I/O — keep this dense. Miri interprets every
+        // instruction; 1024 cases here is hours and would fail the job
+        // as "never finished" the same way the wall-clock tests did.
+        cases: if cfg!(miri) { 16 } else { 1024 },
         .. ProptestConfig::default()
     })]
 
