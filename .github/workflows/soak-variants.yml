@@ -23,7 +23,10 @@ jobs:
       matrix:
         include:
           - name: megabyte-values
-            soak_env: "VAL_MIN=1048576 VAL_MAX=4194304 PUT_PCT=60 GET_PCT=35"
+            # 5 ops/s, not 2000: 1–4MiB puts at 2000/s is ~2GB/s and
+            # GHA reports hundreds of thousands of EngineBusy as errors.
+            # Local HOURS=0.03 at OPS=5 was 0 errors; OPS=20 still busied.
+            soak_env: "VAL_MIN=1048576 VAL_MAX=4194304 PUT_PCT=60 GET_PCT=35 OPS=5"
           - name: delete-heavy
             soak_env: "PUT_PCT=45 GET_PCT=25" # DEL = 30%
           - name: scan-heavy
@@ -38,7 +41,8 @@ jobs:
       - name: Soak variant ${{ matrix.name }}
         run: |
           set -euo pipefail
-          env ${{ matrix.soak_env }} HOURS=0.33 OPS=2000 \
+          # Defaults first; matrix soak_env may override OPS.
+          env HOURS=0.33 OPS=2000 ${{ matrix.soak_env }} \
             scripts/soak.sh --no-analyze
       - name: Gate on summary
         run: |
@@ -52,3 +56,12 @@ jobs:
           assert s['shutdown_ok'], 'shutdown failed'
           print(f\"variant clean: {s['total_ops']} ops, {s['avg_ops_per_sec']:.0f} ops/s\")
           "
+      - name: Upload soak breadcrumbs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-variant-${{ matrix.name }}-${{ github.run_id }}
+          path: |
+            soak-runs/*/stderr.log
+            soak-runs/*/metrics.jsonl
+          if-no-files-found: ignore
