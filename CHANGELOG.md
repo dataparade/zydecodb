@@ -6,6 +6,8 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-19
+
 - Bench nightly p99 compare floor is 1000µs so a laptop 5µs baseline cannot
   fail shared GHA runners (measured 471µs). Soak `megabyte-values` runs at
   5 ops/s; 2000 ops/s of 1–4MiB puts was compaction-backlog EngineBusy,
