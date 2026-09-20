@@ -44,6 +44,7 @@ jobs:
             fuzz_filter
             fuzz_update
             fuzz_aggregate
+            fuzz_aggregate_exec
             fuzz_index_key
             zdoc_valueview
           )
