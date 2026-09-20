@@ -12,7 +12,7 @@
 //! no spill, no silent truncation.
 
 use crate::aggregation::{AggregationLimits, LookupSpec};
-use crate::binary::ValueView;
+use crate::binary::{ValueView, ZDocBuilder};
 use crate::catalog::CollectionMeta;
 use crate::error::{DocError, DocResult};
 use crate::filter::Filter;
@@ -147,12 +147,15 @@ fn stored_to_doc(stored: &[u8], doc_id: &[u8]) -> DocResult<Value> {
 }
 
 /// Fetch the inner documents matching one equality probe, bounded by
-/// `max_matches_per_outer`. Returns their JSON bodies in index order.
+/// `max_matches_per_outer`. Documents rejected by the `$lookup` `filter` are
+/// skipped before the bound is charged. Returns the surviving JSON bodies in
+/// index order.
 fn fetch_inner_matches(
     snap: &SnapshotHandle,
     prefix: &[u8],
     inner: &CollectionMeta,
     path: &AccessPath,
+    filter: &Filter,
     max_matches: usize,
 ) -> DocResult<Vec<Value>> {
     let doc_prefix = keys::doc_prefix(prefix, inner.id);
@@ -166,11 +169,16 @@ fn fetch_inner_matches(
         docs.push(stored_to_doc(stored, doc_id)?);
         Ok(())
     };
+    let keep = |stored: &[u8], doc_id: &[u8]| -> DocResult<bool> {
+        store::with_stored_view(stored, |v| Ok(filter.matches(v, Some(doc_id))))
+    };
     match path {
         AccessPath::ById(id) => {
             let dk = keys::doc_key(prefix, inner.id, id);
             if let Some(stored) = snap.get(&dk)? {
-                push(&stored, id, &mut docs)?;
+                if keep(&stored, id)? {
+                    push(&stored, id, &mut docs)?;
+                }
             }
         }
         AccessPath::IndexScan { lo, hi, .. } => {
@@ -183,7 +191,9 @@ fn fetch_inner_matches(
                 // under one snapshot, but a missing body is a skip, not a
                 // corruption, for parity with the residual-check philosophy).
                 if let Some(stored) = snap.get(&dk)? {
-                    push(&stored, &doc_id, &mut docs)?;
+                    if keep(&stored, &doc_id)? {
+                        push(&stored, &doc_id, &mut docs)?;
+                    }
                 }
             }
         }
@@ -197,9 +207,12 @@ fn fetch_inner_matches(
 }
 
 /// One bounded inner-collection scan into a hash map keyed by the same
-/// scalar encoding the index would use. Missing / non-scalar `foreignField`
-/// values are unjoinable and skipped. Rejects the moment retained state
-/// would exceed `max_hash_bytes`.
+/// scalar encoding the index would use. The `$lookup` `filter` plans and
+/// residual-checks the scan, so rejected documents never enter the map or
+/// count toward `max_hash_bytes`; they still count toward the `max_scan_docs`
+/// candidate bound. Missing / non-scalar `foreignField` values are unjoinable
+/// and skipped. Rejects the moment retained state would exceed
+/// `max_hash_bytes`.
 fn build_hash_side(
     snap: &SnapshotHandle,
     prefix: &[u8],
@@ -213,7 +226,7 @@ fn build_hash_side(
         snap,
         prefix,
         inner,
-        &Filter::MatchAll,
+        &spec.filter,
         limits.max_scan_docs,
         |doc_id, stored| {
             let join_value = if spec.foreign_field == planner::ID_FIELD {
@@ -279,6 +292,7 @@ fn join_value_for_outer(
 
 fn splice_matches(
     spec: &LookupSpec,
+    post_filter: &Filter,
     stored: &[u8],
     doc_id: &[u8],
     matches: Vec<Value>,
@@ -287,11 +301,21 @@ fn splice_matches(
     docs: &mut Vec<Value>,
 ) -> DocResult<()> {
     let mut doc = stored_to_doc(stored, doc_id)?;
-    let estimated = serde_json::to_vec(&doc).map(|v| v.len()).unwrap_or(0)
-        + matches
-            .iter()
-            .map(|m| serde_json::to_vec(m).map(|v| v.len()).unwrap_or(0))
-            .sum::<usize>();
+    match &mut doc {
+        Value::Object(map) => {
+            map.insert(spec.as_field.clone(), Value::Array(matches));
+        }
+        _ => return Err(DocError::Corrupt("stored document is not an object".into())),
+    }
+    // The post-join $match runs on the joined document. Rejected documents
+    // are dropped before the memory bound is charged.
+    if !matches!(post_filter, Filter::MatchAll) {
+        let zdoc = ZDocBuilder::from_value(&doc);
+        if !post_filter.matches(ValueView::new(&zdoc), Some(doc_id)) {
+            return Ok(());
+        }
+    }
+    let estimated = serde_json::to_vec(&doc).map(|v| v.len()).unwrap_or(0);
     let next_memory = memory_bytes
         .checked_add(estimated)
         .ok_or_else(|| lookup_error("memory accounting overflow"))?;
@@ -302,19 +326,14 @@ fn splice_matches(
     }
     *memory_bytes = next_memory;
 
-    match &mut doc {
-        Value::Object(map) => {
-            map.insert(spec.as_field.clone(), Value::Array(matches));
-        }
-        _ => return Err(DocError::Corrupt("stored document is not an object".into())),
-    }
     docs.push(doc);
     Ok(())
 }
 
 /// Execute a `$lookup` stage: pick INLJ or hash, stream the outer collection
-/// (filtered by the pipeline's `$match`, bounded by `max_scan_docs`), and
-/// splice matches into the `as` array.
+/// (filtered by the pipeline's leading `$match`, bounded by `max_scan_docs`),
+/// splice matches into the `as` array, then apply the optional post-join
+/// `$match` to each joined document.
 pub fn execute_lookup(
     snap: &SnapshotHandle,
     prefix: &[u8],
@@ -322,6 +341,7 @@ pub fn execute_lookup(
     inner: &CollectionMeta,
     filter: &Filter,
     spec: &LookupSpec,
+    post_filter: &Filter,
     limits: AggregationLimits,
 ) -> DocResult<JoinResult> {
     let strategy = select_strategy(inner, &spec.foreign_field, limits)?;
@@ -359,6 +379,7 @@ pub fn execute_lookup(
                             prefix,
                             inner,
                             &path,
+                            &spec.filter,
                             limits.max_matches_per_outer,
                         )?
                     }
@@ -371,6 +392,7 @@ pub fn execute_lookup(
             };
             splice_matches(
                 spec,
+                post_filter,
                 stored,
                 &doc_id,
                 matches,

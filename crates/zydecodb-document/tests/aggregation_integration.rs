@@ -250,3 +250,177 @@ fn enforces_result_byte_limit_on_encode_path() {
     let err = zydecodb_document::wire::encode_aggregate_response(&result.rows, 1).unwrap_err();
     assert!(err.to_string().contains("result") || err.to_string().contains("byte"));
 }
+
+#[test]
+fn group_sum_and_size_walk_arrays() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "docs");
+
+    let documents = [
+        json!({"items": [{"price": 1}, {"price": 2}], "amounts": [1, 2, 3], "matrix": [[1, 2], [3]]}),
+        json!({"items": [{"price": 4.5}], "amounts": [], "matrix": []}),
+        json!({"amounts": [10], "other": true}),
+        json!({"items": "not-an-array", "amounts": "not-an-array"}),
+    ];
+    for (index, document) in documents.into_iter().enumerate() {
+        let zdoc = ZDocBuilder::from_value(&document);
+        store::upsert(
+            &mut engine,
+            &mut catalog,
+            PREFIX,
+            "docs",
+            index.to_string().as_bytes(),
+            &zdoc,
+            true,
+        )
+        .unwrap();
+    }
+
+    let pipeline = pipeline(json!([
+        {"$group": {
+            "_id": null,
+            "prices": {"$sum": "$items.price"},
+            "flat": {"$sum": "$amounts"},
+            "deep": {"$sum": "$matrix"},
+            "n_items": {"$size": "$items"},
+            "n_amounts": {"$size": "$amounts"}
+        }}
+    ]));
+    let result = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "docs",
+        &pipeline,
+        AggregationLimits::default(),
+    )
+    .unwrap();
+
+    // Intermediate arrays fan out (prices), terminal arrays sum their
+    // elements (flat), nested terminal arrays reach every numeric leaf
+    // (deep), and mixed int/float promotes to float. Non-array and missing
+    // paths contribute 0 to both accumulators.
+    assert_eq!(
+        result.rows,
+        vec![json!({
+            "_id": null,
+            "prices": 7.5,
+            "flat": 16,
+            "deep": 6,
+            "n_items": 3,
+            "n_amounts": 4
+        })]
+    );
+}
+
+#[test]
+fn sum_beyond_depth_cap_over_stored_doc_is_corrupt_not_a_crash() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "deep");
+
+    // 306 levels of nesting: past the accumulator fan-out cap, built
+    // programmatically because serde_json's own parse cap is lower.
+    let mut doc = Value::from(1);
+    for _ in 0..(zydecodb_document::binary::MAX_ZDOC_DEPTH + 50) {
+        let mut m = serde_json::Map::new();
+        m.insert("d".to_string(), doc);
+        doc = Value::Object(m);
+    }
+    let zdoc = ZDocBuilder::from_value(&doc);
+    store::upsert(
+        &mut engine,
+        &mut catalog,
+        PREFIX,
+        "deep",
+        b"d1",
+        &zdoc,
+        true,
+    )
+    .unwrap();
+
+    let long_path = (0..300).map(|_| "d").collect::<Vec<_>>().join(".");
+    let pipeline = pipeline(json!([
+        {"$group": {"_id": null, "t": {"$sum": format!("${long_path}")}}}
+    ]));
+    let err = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "deep",
+        &pipeline,
+        AggregationLimits::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, zydecodb_document::error::DocError::Corrupt(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn sum_overflow_across_array_elements_is_a_named_error() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "big");
+
+    let zdoc = ZDocBuilder::from_value(&json!({"amounts": [i64::MAX, 1]}));
+    store::upsert(&mut engine, &mut catalog, PREFIX, "big", b"b1", &zdoc, true).unwrap();
+
+    let pipeline = pipeline(json!([
+        {"$group": {"_id": null, "t": {"$sum": "$amounts"}}}
+    ]));
+    let err = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "big",
+        &pipeline,
+        AggregationLimits::default(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("integer overflow"), "got: {err}");
+}
+
+#[test]
+fn large_terminal_array_sums_correctly() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "wide");
+
+    let amounts: Vec<i64> = (1..=50_000).collect();
+    let expected: i64 = amounts.iter().sum();
+    let zdoc = ZDocBuilder::from_value(&json!({"amounts": amounts}));
+    store::upsert(
+        &mut engine,
+        &mut catalog,
+        PREFIX,
+        "wide",
+        b"w1",
+        &zdoc,
+        true,
+    )
+    .unwrap();
+
+    let pipeline = pipeline(json!([
+        {"$group": {"_id": null, "t": {"$sum": "$amounts"}, "n": {"$size": "$amounts"}}}
+    ]));
+    let result = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "wide",
+        &pipeline,
+        AggregationLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![json!({"_id": null, "t": expected, "n": 50_000})]
+    );
+}

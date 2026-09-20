@@ -1,9 +1,13 @@
 //! `$lookup` benchmark: N-fact x K-dimension join, doc-layer.
 //!
-//! Three scenarios:
-//!   id-probe    — INLJ, foreignField "_id" (virtual index)
-//!   k-probe     — INLJ, foreignField "k"   (secondary index)
-//!   hash        — bounded hash join on "k" (no inner index)
+//! Scenarios:
+//!   id-probe       — INLJ, foreignField "_id" (virtual index)
+//!   k-probe        — INLJ, foreignField "k"   (secondary index)
+//!   hash           — bounded hash join on "k" (no inner index)
+//!   k-probe-filter — INLJ on "k", inner filter keeps ~10% of dims
+//!   hash-filter    — hash join, inner filter keeps ~10% of dims
+//!   post-match     — INLJ on "k" + post-join anti-join {"dim": []}
+//!   group-sum      — INLJ on "k" + $group with $sum "$dim.v" / $size "$dim"
 //!
 //! Emits one JSON object per scenario:
 //! `{scenario, fact_docs, dim_docs, runs, elapsed_ms, docs_sec,
@@ -128,26 +132,15 @@ enum ProbeKind {
 fn run_scenario(
     e: &Engine,
     cat: &Catalog,
+    scenario: &str,
+    pipeline_json: &str,
     kind: ProbeKind,
+    expected_rows: usize,
     args: &Args,
     load_ms: u64,
     backfill_ms: u64,
 ) -> serde_json::Value {
-    let foreign_field = match kind {
-        ProbeKind::Inlj { foreign_field } => foreign_field,
-        ProbeKind::Hash => "k",
-    };
-    let scenario = match kind {
-        ProbeKind::Inlj { foreign_field } => format!("{foreign_field}-probe"),
-        ProbeKind::Hash => "hash".into(),
-    };
-    let pipeline = AggregationPipeline::parse(
-        format!(
-            r#"[{{"$lookup":{{"from":"dims","localField":"k","foreignField":"{foreign_field}","as":"dim"}}}}]"#
-        )
-        .as_bytes(),
-    )
-    .unwrap();
+    let pipeline = AggregationPipeline::parse(pipeline_json.as_bytes()).unwrap();
     let limits = AggregationLimits {
         max_scan_docs: args.fact_docs as usize,
         max_matches_per_outer: 16,
@@ -162,7 +155,7 @@ fn run_scenario(
     // Warmup: one full pass to populate block cache / bloom filters.
     let warm =
         execute_aggregation(&e.snapshot_owned(), cat, PREFIX, "facts", &pipeline, limits).unwrap();
-    assert_eq!(warm.rows.len(), args.fact_docs as usize);
+    assert_eq!(warm.rows.len(), expected_rows);
 
     let mut elapsed_ms = Vec::new();
     let mut rss_peak = rss_bytes();
@@ -171,7 +164,7 @@ fn run_scenario(
         let result =
             execute_aggregation(&e.snapshot_owned(), cat, PREFIX, "facts", &pipeline, limits)
                 .unwrap();
-        assert_eq!(result.rows.len(), args.fact_docs as usize);
+        assert_eq!(result.rows.len(), expected_rows);
         elapsed_ms.push(t0.elapsed().as_millis() as u64);
         rss_peak = rss_peak.max(rss_bytes());
     }
@@ -280,7 +273,12 @@ fn main() {
     };
     let t0 = Instant::now();
     for i in 0..args.dim_docs {
-        let doc = serde_json::json!({"k": format!("d{i}"), "attrs": format!("dim-{i}")});
+        let doc = serde_json::json!({
+            "k": format!("d{i}"),
+            "attrs": format!("dim-{i}"),
+            "v": i,
+            "tier": i % 10,
+        });
         put("dims", &format!("d{i}"), doc, &mut e, &mut cat);
     }
     let pad = "x".repeat(100);
@@ -306,7 +304,28 @@ fn main() {
 
     let mut results = Vec::new();
     if want_hash {
-        results.push(run_scenario(&e, &cat, ProbeKind::Hash, &args, load_ms, 0));
+        results.push(run_scenario(
+            &e,
+            &cat,
+            "hash",
+            r#"[{"$lookup":{"from":"dims","localField":"k","foreignField":"k","as":"dim"}}]"#,
+            ProbeKind::Hash,
+            args.fact_docs as usize,
+            &args,
+            load_ms,
+            0,
+        ));
+        results.push(run_scenario(
+            &e,
+            &cat,
+            "hash-filter",
+            r#"[{"$lookup":{"from":"dims","localField":"k","foreignField":"k","as":"dim","filter":{"tier":0}}}]"#,
+            ProbeKind::Hash,
+            args.fact_docs as usize,
+            &args,
+            load_ms,
+            0,
+        ));
     }
 
     // Backfill: secondary index on dims.k for the INLJ index-probe scenario.
@@ -339,12 +358,51 @@ fn main() {
             results.push(run_scenario(
                 &e,
                 &cat,
+                &format!("{foreign_field}-probe"),
+                &format!(
+                    r#"[{{"$lookup":{{"from":"dims","localField":"k","foreignField":"{foreign_field}","as":"dim"}}}}]"#
+                ),
                 ProbeKind::Inlj { foreign_field },
+                args.fact_docs as usize,
                 &args,
                 load_ms,
                 backfill_ms,
             ));
         }
+        results.push(run_scenario(
+            &e,
+            &cat,
+            "k-probe-filter",
+            r#"[{"$lookup":{"from":"dims","localField":"k","foreignField":"k","as":"dim","filter":{"tier":0}}}]"#,
+            ProbeKind::Inlj { foreign_field: "k" },
+            args.fact_docs as usize,
+            &args,
+            load_ms,
+            backfill_ms,
+        ));
+        // Anti-join: every fact matches a dim, so {"dim": []} rejects all.
+        results.push(run_scenario(
+            &e,
+            &cat,
+            "post-match",
+            r#"[{"$lookup":{"from":"dims","localField":"k","foreignField":"k","as":"dim"}},{"$match":{"dim":[]}}]"#,
+            ProbeKind::Inlj { foreign_field: "k" },
+            0,
+            &args,
+            load_ms,
+            backfill_ms,
+        ));
+        results.push(run_scenario(
+            &e,
+            &cat,
+            "group-sum",
+            r#"[{"$lookup":{"from":"dims","localField":"k","foreignField":"k","as":"dim"}},{"$group":{"_id":null,"spend":{"$sum":"$dim.v"},"n":{"$size":"$dim"}}}]"#,
+            ProbeKind::Inlj { foreign_field: "k" },
+            1,
+            &args,
+            load_ms,
+            backfill_ms,
+        ));
     }
     println!("{}", serde_json::to_string_pretty(&results).unwrap());
 

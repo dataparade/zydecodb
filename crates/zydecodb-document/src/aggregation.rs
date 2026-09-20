@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 use zydecodb_engine::SnapshotHandle;
 
-pub const MAX_PIPELINE_STAGES: usize = 3;
+pub const MAX_PIPELINE_STAGES: usize = 4;
 pub const MAX_ACCUMULATORS: usize = 16;
 pub const MAX_PIPELINE_BYTES: usize = 64 * 1024;
 
@@ -62,12 +62,16 @@ impl Default for AggregationLimits {
 ///
 /// Legal shapes (see `docs/DESIGN-joins.md`):
 /// `[$group]`, `[$match, $group]`, `[$lookup]`, `[$lookup, $group]`,
-/// `[$match, $lookup]`, `[$match, $lookup, $group]`. `$lookup` appears at
-/// most once and never after `$group`.
+/// `[$lookup, $match]`, `[$lookup, $match, $group]`, `[$match, $lookup]`,
+/// `[$match, $lookup, $group]`, `[$match, $lookup, $match]`,
+/// `[$match, $lookup, $match, $group]`. `$lookup` appears at most once and
+/// never after `$group`; a `$match` after `$lookup` runs on the joined
+/// documents (outer plus the `as` array).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregationPipeline {
     pub filter: Filter,
     pub lookup: Option<LookupSpec>,
+    pub post_filter: Filter,
     pub group: Option<GroupSpec>,
 }
 
@@ -79,13 +83,15 @@ impl AggregationPipeline {
 }
 
 /// A parsed `$lookup` stage: equality left-outer join against one collection
-/// under the same tenant prefix.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// under the same tenant prefix, with an optional residual filter applied to
+/// inner documents before they are attached.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LookupSpec {
     pub from: String,
     pub local_field: String,
     pub foreign_field: String,
     pub as_field: String,
+    pub filter: Filter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +116,7 @@ pub struct AccumulatorSpec {
 pub enum AccumulatorOp {
     Sum(String),
     Count,
+    Size(String),
 }
 
 /// Completed aggregation rows and accounting needed by a future wire encoder.
@@ -153,9 +160,10 @@ fn parse_field_reference(value: &Value, context: &str) -> DocResult<String> {
     Ok(path.to_string())
 }
 
-/// Parse the strict pipeline grammar: optional `$match`, optional `$lookup`,
-/// optional `$group` — at least one stage, `$lookup` at most once and never
-/// after `$group`, and a `$lookup`-free pipeline must end in `$group`.
+/// Parse the strict pipeline grammar: optional leading `$match`, optional
+/// `$lookup`, optional post-join `$match`, optional `$group` — at least one
+/// stage, `$lookup` at most once and never after `$group`, `$group` last, and
+/// a `$lookup`-free pipeline must end in `$group`.
 pub fn parse_pipeline(bytes: &[u8]) -> DocResult<AggregationPipeline> {
     if bytes.len() > MAX_PIPELINE_BYTES {
         return Err(bad_aggregation(format!(
@@ -175,15 +183,29 @@ pub fn parse_pipeline(bytes: &[u8]) -> DocResult<AggregationPipeline> {
 
     let mut filter = Filter::MatchAll;
     let mut lookup: Option<LookupSpec> = None;
+    let mut post_filter = Filter::MatchAll;
+    let mut post_filter_seen = false;
     let mut group: Option<GroupSpec> = None;
     for (i, stage) in stages.iter().enumerate() {
         let operator = stage_operator(stage)?;
         match operator {
             "$match" => {
-                if i != 0 {
-                    return Err(bad_aggregation("$match must be the first stage"));
+                if i == 0 {
+                    filter = Filter::parse(one_stage(stage, "$match")?)?;
+                    continue;
                 }
-                filter = Filter::parse(one_stage(stage, "$match")?)?;
+                if lookup.is_none() || group.is_some() {
+                    return Err(bad_aggregation(
+                        "$match must be the first stage or directly follow $lookup",
+                    ));
+                }
+                if post_filter_seen {
+                    return Err(bad_aggregation(
+                        "$match after $lookup may appear at most once",
+                    ));
+                }
+                post_filter = Filter::parse(one_stage(stage, "$match")?)?;
+                post_filter_seen = true;
             }
             "$lookup" => {
                 if lookup.is_some() {
@@ -216,6 +238,7 @@ pub fn parse_pipeline(bytes: &[u8]) -> DocResult<AggregationPipeline> {
     Ok(AggregationPipeline {
         filter,
         lookup,
+        post_filter,
         group,
     })
 }
@@ -233,14 +256,18 @@ fn stage_operator(stage: &Value) -> DocResult<&str> {
     Ok(object.keys().next().unwrap())
 }
 
-/// Parse a `$lookup` body: exactly `from`, `localField`, `foreignField`,
-/// `as` — all required, no extras.
+/// Parse a `$lookup` body: `from`, `localField`, `foreignField`, `as` are
+/// required; `filter` (a normal filter object applied to inner documents) is
+/// optional. No other keys.
 fn parse_lookup(value: &Value) -> DocResult<LookupSpec> {
     let object = value
         .as_object()
         .ok_or_else(|| bad_aggregation("$lookup must be an object"))?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "from" | "localField" | "foreignField" | "as") {
+        if !matches!(
+            key.as_str(),
+            "from" | "localField" | "foreignField" | "as" | "filter"
+        ) {
             return Err(bad_aggregation(format!("$lookup: unknown key '{key}'")));
         }
     }
@@ -268,11 +295,18 @@ fn parse_lookup(value: &Value) -> DocResult<LookupSpec> {
             )));
         }
     }
+    let filter = match object.get("filter") {
+        Some(v) => {
+            Filter::parse(v).map_err(|e| bad_aggregation(format!("$lookup 'filter': {e}")))?
+        }
+        None => Filter::MatchAll,
+    };
     Ok(LookupSpec {
         from: from.to_string(),
         local_field: local_field.to_string(),
         foreign_field: foreign_field.to_string(),
         as_field: as_field.to_string(),
+        filter,
     })
 }
 
@@ -341,6 +375,10 @@ fn parse_group(value: &Value) -> DocResult<GroupSpec> {
                 operand,
                 &format!("'{output_field}.$sum'"),
             )?),
+            "$size" => AccumulatorOp::Size(parse_field_reference(
+                operand,
+                &format!("'{output_field}.$size'"),
+            )?),
             "$count" => {
                 if !matches!(operand, Value::Object(map) if map.is_empty()) {
                     return Err(bad_aggregation(format!(
@@ -374,6 +412,7 @@ struct GroupState {
 enum AccumulatorState {
     Sum(SumState),
     Count(i64),
+    Size(i64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -387,6 +426,7 @@ impl AccumulatorState {
         match spec.op {
             AccumulatorOp::Sum(_) => Self::Sum(SumState::Integer(0)),
             AccumulatorOp::Count => Self::Count(0),
+            AccumulatorOp::Size(_) => Self::Size(0),
         }
     }
 
@@ -398,9 +438,23 @@ impl AccumulatorState {
                     .ok_or_else(|| bad_aggregation("$count integer overflow"))?;
             }
             (AccumulatorState::Sum(sum), AccumulatorOp::Sum(path)) => {
-                if let Some(value) = root.get_path(path) {
-                    sum.add(value)?;
-                }
+                let segments: Vec<&str> = path.split('.').collect();
+                for_each_at_path(root, &segments, 0, &mut |value| {
+                    sum_add_terminal(sum, value, segments.len())
+                })?;
+            }
+            (AccumulatorState::Size(total), AccumulatorOp::Size(path)) => {
+                let segments: Vec<&str> = path.split('.').collect();
+                for_each_at_path(root, &segments, 0, &mut |value| {
+                    if let Some(arr) = value.as_array() {
+                        let len = i64::try_from(arr.len())
+                            .map_err(|_| bad_aggregation("$size array length overflow"))?;
+                        *total = total
+                            .checked_add(len)
+                            .ok_or_else(|| bad_aggregation("$size integer overflow"))?;
+                    }
+                    Ok(())
+                })?;
             }
             _ => return Err(DocError::Corrupt("aggregation accumulator mismatch".into())),
         }
@@ -410,11 +464,83 @@ impl AccumulatorState {
     fn into_value(self) -> DocResult<Value> {
         match self {
             AccumulatorState::Count(count) => Ok(Value::Number(Number::from(count))),
+            AccumulatorState::Size(total) => Ok(Value::Number(Number::from(total))),
             AccumulatorState::Sum(SumState::Integer(sum)) => Ok(Value::Number(Number::from(sum))),
             AccumulatorState::Sum(SumState::Float(sum)) => Number::from_f64(sum)
                 .map(Value::Number)
                 .ok_or_else(|| bad_aggregation("$sum produced a non-finite number")),
         }
+    }
+}
+
+/// Maximum recursion depth for accumulator path fan-out, mirroring the ZDoc
+/// materialization cap in `binary.rs`. Stored bodies that passed the write
+/// path are capped well below this; the guard exists for bodies that reached
+/// the store without a parse cap (raw-KV overlap, legacy data, corruption).
+const MAX_ACCUMULATOR_PATH_DEPTH: usize = crate::binary::MAX_ZDOC_DEPTH;
+
+/// Terminal handler for `$sum`: a scalar adds once; an array fans out
+/// recursively so every numeric leaf reachable at the path contributes.
+fn sum_add_terminal(sum: &mut SumState, value: ValueView<'_>, depth: usize) -> DocResult<()> {
+    if depth > MAX_ACCUMULATOR_PATH_DEPTH {
+        return Err(DocError::Corrupt(
+            "accumulator path exceeds maximum depth".into(),
+        ));
+    }
+    if let Some(arr) = value.as_array() {
+        for i in 0..arr.len() {
+            let Some(elem) = arr.get(i) else {
+                return Err(DocError::Corrupt("truncated ZDoc array element".into()));
+            };
+            sum_add_terminal(sum, elem, depth + 1)?;
+        }
+        Ok(())
+    } else {
+        sum.add(value)
+    }
+}
+
+/// Visit every value reachable at a dotted path, fanning out over arrays at
+/// any segment (including the last). Objects descend by key; a missing key
+/// contributes nothing. This is accumulator semantics only — filter paths and
+/// group keys do not walk arrays.
+fn for_each_at_path(
+    root: ValueView<'_>,
+    segments: &[&str],
+    depth: usize,
+    f: &mut dyn FnMut(ValueView<'_>) -> DocResult<()>,
+) -> DocResult<()> {
+    if depth > MAX_ACCUMULATOR_PATH_DEPTH {
+        return Err(DocError::Corrupt(
+            "accumulator path exceeds maximum depth".into(),
+        ));
+    }
+    if segments.is_empty() {
+        return f(root);
+    }
+    match root.type_byte() {
+        TYPE_OBJECT => {
+            let Some(obj) = root.as_object() else {
+                return Err(DocError::Corrupt("truncated ZDoc object".into()));
+            };
+            match obj.get(segments[0]) {
+                Some(child) => for_each_at_path(child, &segments[1..], depth + 1, f),
+                None => Ok(()),
+            }
+        }
+        TYPE_ARRAY => {
+            let Some(arr) = root.as_array() else {
+                return Err(DocError::Corrupt("truncated ZDoc array".into()));
+            };
+            for i in 0..arr.len() {
+                let Some(elem) = arr.get(i) else {
+                    return Err(DocError::Corrupt("truncated ZDoc array element".into()));
+                };
+                for_each_at_path(elem, segments, depth + 1, f)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -525,23 +651,6 @@ fn estimated_group_bytes(
         .and_then(|n| n.checked_add(string_bytes))
         .and_then(|n| n.checked_add(accumulator_bytes))
         .ok_or_else(|| bad_aggregation("memory accounting overflow"))
-}
-
-fn with_stored_view<T>(
-    stored: &[u8],
-    f: impl FnOnce(ValueView<'_>) -> DocResult<T>,
-) -> DocResult<T> {
-    let Some((&kind, payload)) = stored.split_first() else {
-        return Err(DocError::Corrupt("empty stored document".into()));
-    };
-    if kind == store::VK_ZDOC {
-        return f(ValueView::new(payload));
-    }
-
-    let value: Value = serde_json::from_slice(payload)
-        .map_err(|e| DocError::Corrupt(format!("invalid stored JSON: {e}")))?;
-    let zdoc = ZDocBuilder::from_value(&value);
-    f(ValueView::new(&zdoc))
 }
 
 /// Bounded group-state accumulator for a `$group` stage.
@@ -667,6 +776,7 @@ pub fn execute_aggregation_coll(
                 inner,
                 &pipeline.filter,
                 spec,
+                &pipeline.post_filter,
                 limits,
             )?;
             match &pipeline.group {
@@ -705,7 +815,7 @@ pub fn execute_aggregation_coll(
                 &pipeline.filter,
                 limits.max_scan_docs,
                 |_doc_id, stored| {
-                    with_stored_view(stored, |root| engine.add(root))?;
+                    store::with_stored_view(stored, |root| engine.add(root))?;
                     Ok(true)
                 },
             )?;
@@ -762,12 +872,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_six_legal_lookup_orders() {
+    fn parses_all_ten_legal_pipeline_shapes() {
         let lookup = json!({"$lookup": {
             "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits"
         }});
         let group = json!({"$group": {"_id": null, "n": {"$count": {}}}});
         let match_stage = json!({"$match": {"active": true}});
+        let post_match = json!({"$match": {"hits": {"$ne": []}}});
 
         // [$group], [$match, $group] still parse with no lookup.
         assert!(parse(json!([group.clone()])).unwrap().lookup.is_none());
@@ -784,6 +895,7 @@ mod tests {
         assert_eq!(spec.foreign_field, "user_id");
         assert_eq!(spec.as_field, "hits");
         assert!(p.group.is_none());
+        assert_eq!(p.post_filter, Filter::MatchAll);
 
         // [$lookup, $group]
         let p = parse(json!([lookup.clone(), group.clone()])).unwrap();
@@ -794,6 +906,33 @@ mod tests {
         // [$match, $lookup, $group]
         let p = parse(json!([match_stage.clone(), lookup.clone(), group.clone()])).unwrap();
         assert!(p.lookup.is_some() && p.group.is_some());
+        // [$lookup, $match]
+        let p = parse(json!([lookup.clone(), post_match.clone()])).unwrap();
+        assert!(p.lookup.is_some() && p.group.is_none());
+        assert_ne!(p.post_filter, Filter::MatchAll);
+        // [$lookup, $match, $group]
+        let p = parse(json!([lookup.clone(), post_match.clone(), group.clone()])).unwrap();
+        assert!(p.lookup.is_some() && p.group.is_some());
+        assert_ne!(p.post_filter, Filter::MatchAll);
+        // [$match, $lookup, $match]
+        let p = parse(json!([
+            match_stage.clone(),
+            lookup.clone(),
+            post_match.clone()
+        ]))
+        .unwrap();
+        assert!(p.lookup.is_some() && p.group.is_none());
+        assert_ne!(p.post_filter, Filter::MatchAll);
+        // [$match, $lookup, $match, $group]
+        let p = parse(json!([
+            match_stage.clone(),
+            lookup.clone(),
+            post_match.clone(),
+            group.clone()
+        ]))
+        .unwrap();
+        assert!(p.lookup.is_some() && p.group.is_some());
+        assert_ne!(p.post_filter, Filter::MatchAll);
     }
 
     #[test]
@@ -808,12 +947,27 @@ mod tests {
         assert!(parse(json!([group.clone(), lookup.clone()])).is_err());
         // second $lookup
         assert!(parse(json!([lookup.clone(), lookup.clone()])).is_err());
-        // $match after $lookup
-        assert!(parse(json!([lookup.clone(), match_stage.clone()])).is_err());
-        // four stages
+        // $match after $group
+        assert!(parse(json!([lookup.clone(), group.clone(), match_stage.clone()])).is_err());
+        // two $match stages after $lookup
+        assert!(parse(json!([
+            lookup.clone(),
+            match_stage.clone(),
+            match_stage.clone()
+        ]))
+        .is_err());
+        // non-first $match with no $lookup
+        assert!(parse(json!([
+            match_stage.clone(),
+            match_stage.clone(),
+            group.clone()
+        ]))
+        .is_err());
+        // five stages
         assert!(parse(json!([
             match_stage.clone(),
             lookup.clone(),
+            match_stage.clone(),
             group.clone(),
             group.clone()
         ]))
@@ -882,5 +1036,191 @@ mod tests {
             .collect();
         assert!(parse(Value::Array(vec![json!({"$group": accumulators})])).is_err());
         assert!(parse_pipeline(&vec![b' '; MAX_PIPELINE_BYTES + 1]).is_err());
+    }
+
+    fn run_group(docs: &[Value], group_stage: Value) -> DocResult<Vec<Value>> {
+        let pipeline = parse(json!([group_stage]))?;
+        let spec = pipeline.group.as_ref().unwrap();
+        let mut engine = GroupEngine::new(spec, AggregationLimits::default());
+        for doc in docs {
+            let zdoc = ZDocBuilder::from_value(doc);
+            engine.add(ValueView::new(&zdoc))?;
+        }
+        let (rows, _) = engine.finish()?;
+        Ok(rows)
+    }
+
+    #[test]
+    fn sum_walks_intermediate_arrays() {
+        let rows = run_group(
+            &[json!({"items": [{"price": 1}, {"price": 2}, {"price": 3}]})],
+            json!({"$group": {"_id": null, "t": {"$sum": "$items.price"}}}),
+        )
+        .unwrap();
+        assert_eq!(rows, vec![json!({"_id": null, "t": 6})]);
+    }
+
+    #[test]
+    fn sum_walks_terminal_array() {
+        let rows = run_group(
+            &[json!({"amounts": [1, 2, 3]})],
+            json!({"$group": {"_id": null, "t": {"$sum": "$amounts"}}}),
+        )
+        .unwrap();
+        assert_eq!(rows, vec![json!({"_id": null, "t": 6})]);
+    }
+
+    #[test]
+    fn sum_reaches_numeric_leaves_through_nested_arrays() {
+        let rows = run_group(
+            &[json!({"a": [[1, 2], [3]]})],
+            json!({"$group": {"_id": null, "t": {"$sum": "$a"}}}),
+        )
+        .unwrap();
+        assert_eq!(rows, vec![json!({"_id": null, "t": 6})]);
+    }
+
+    #[test]
+    fn sum_skips_non_numeric_leaves_and_missing_paths() {
+        let rows = run_group(
+            &[
+                json!({"amounts": [1, "x", null, true, 2.5]}),
+                json!({"other": 9}),
+            ],
+            json!({"$group": {"_id": null, "t": {"$sum": "$amounts"}}}),
+        )
+        .unwrap();
+        assert_eq!(rows, vec![json!({"_id": null, "t": 3.5})]);
+    }
+
+    #[test]
+    fn size_counts_array_at_path() {
+        let rows = run_group(
+            &[
+                json!({"orders": [1, 2]}),
+                json!({"orders": "not-an-array"}),
+                json!({"other": 1}),
+            ],
+            json!({"$group": {"_id": null, "n": {"$size": "$orders"}}}),
+        )
+        .unwrap();
+        assert_eq!(rows, vec![json!({"_id": null, "n": 2})]);
+    }
+
+    #[test]
+    fn size_walks_intermediate_arrays() {
+        let rows = run_group(
+            &[json!({"a": [{"b": [1, 2]}, {"b": [3]}, {"c": 0}]})],
+            json!({"$group": {"_id": null, "n": {"$size": "$a.b"}}}),
+        )
+        .unwrap();
+        assert_eq!(rows, vec![json!({"_id": null, "n": 3})]);
+    }
+
+    #[test]
+    fn accumulator_path_longer_than_document_is_zero() {
+        let long_path = (0..300).map(|_| "d").collect::<Vec<_>>().join(".");
+        let rows = run_group(
+            &[json!({"d": {"d": {"d": 1}}})],
+            json!({"$group": {"_id": null, "t": {"$sum": format!("${long_path}")}}}),
+        )
+        .unwrap();
+        assert_eq!(rows, vec![json!({"_id": null, "t": 0})]);
+    }
+
+    #[test]
+    fn accumulator_path_beyond_depth_cap_is_corrupt_not_a_crash() {
+        let mut doc = Value::from(1);
+        for _ in 0..(MAX_ACCUMULATOR_PATH_DEPTH + 50) {
+            let mut m = Map::new();
+            m.insert("d".to_string(), doc);
+            doc = Value::Object(m);
+        }
+        let long_path = (0..300).map(|_| "d").collect::<Vec<_>>().join(".");
+        let err = run_group(
+            &[doc],
+            json!({"$group": {"_id": null, "t": {"$sum": format!("${long_path}")}}}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DocError::Corrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_malformed_lookup_filters() {
+        let lookup = |filter: Value| {
+            json!([{"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+                "filter": filter
+            }}])
+        };
+
+        // filter is not an object
+        let err = parse(lookup(json!(5))).unwrap_err();
+        assert!(err.to_string().contains("$lookup 'filter'"), "got: {err}");
+        // unknown operator inside the filter
+        assert!(parse(lookup(json!({"total": {"$bogus": 1}}))).is_err());
+        // over-length regex inside the filter
+        assert!(parse(lookup(json!({"_id": {"$regex": "x".repeat(257)}}))).is_err());
+        // unknown top-level $-key inside the filter
+        assert!(parse(lookup(json!({"$weird": 1}))).is_err());
+        // same rules in the post-join $match position
+        assert!(parse(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits"
+            }},
+            {"$match": {"hits": {"$bogus": 1}}}
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn deeply_nested_lookup_filter_errors_cleanly() {
+        // 200 levels of $and nesting blows serde_json's parse recursion cap:
+        // a named error, not a crash.
+        let mut deep = json!({"a": 1});
+        for _ in 0..200 {
+            deep = json!({"$and": [deep]});
+        }
+        assert!(parse(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+            "filter": deep
+        }}]))
+        .is_err());
+
+        // 50 levels parses fine.
+        let mut shallow = json!({"a": 1});
+        for _ in 0..50 {
+            shallow = json!({"$and": [shallow]});
+        }
+        assert!(parse(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+            "filter": shallow
+        }}]))
+        .is_ok());
+
+        // A filter that pushes the pipeline past the byte cap is rejected.
+        let big = json!({"note": "x".repeat(MAX_PIPELINE_BYTES)});
+        let err = parse(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+            "filter": big
+        }}]))
+        .unwrap_err();
+        assert!(err.to_string().contains("pipeline exceeds"), "got: {err}");
+    }
+
+    #[test]
+    fn parses_size_accumulator() {
+        let pipeline =
+            parse(json!([{"$group": {"_id": null, "n": {"$size": "$orders"}}}])).unwrap();
+        let group = pipeline.group.as_ref().unwrap();
+        assert_eq!(
+            group.accumulators,
+            vec![AccumulatorSpec {
+                output_field: "n".into(),
+                op: AccumulatorOp::Size("orders".into()),
+            }]
+        );
+        // $size still requires a '$path' string.
+        assert!(parse(json!([{"$group": {"_id": null, "n": {"$size": 1}}}])).is_err());
     }
 }

@@ -47,6 +47,10 @@ Applications should still pin explicit versions (not `@latest`).
 - New config keys with safe defaults
 - New metrics and CLI subcommands
 - New on-disk format versions that preserve the N/N−1 SSTable policy
+- New aggregation pipeline shapes carried inside existing opcodes (e.g. the
+  `$lookup` `filter` key, a post-join `$match`, new accumulators). Older
+  servers reject them with `InvalidValue` (`InvalidRequestError`); the
+  connection stays open.
 
 ### Not part of the driver contract
 

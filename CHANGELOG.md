@@ -10,6 +10,26 @@ here. Version numbers are unified across artifacts; see
   fail shared GHA runners (measured 471µs). Soak `megabyte-values` runs at
   5 ops/s; 2000 ops/s of 1–4MiB puts was compaction-backlog EngineBusy,
   not a crash.
+- `$lookup` gains an optional `filter` key: a normal filter object applied
+  to inner documents before they are attached. Rejected documents do not
+  count toward `max_matches_per_outer` or `max_hash_bytes`; the
+  `max_scan_docs` hash-build gate still applies. Strategy selection is
+  unchanged.
+- A `$match` directly after `$lookup` is now legal (at most one) and
+  filters the joined documents — outer plus the `as` array. Pipeline
+  shapes grow from six to ten; `MAX_PIPELINE_STAGES` is now 4. Rejected
+  documents are dropped before the `max_memory_bytes` charge. Filter paths
+  keep the shipped `find` semantics and do not walk arrays — use
+  `$elemMatch`, `{"as": []}`, or `{"as": {"$ne": []}}` on joined children.
+- New `$size` accumulator (`{"$size": "$path"}`): adds the length of each
+  array found at the path. `$sum` and `$size` paths now walk into arrays
+  at every segment, including the last, so `[$lookup, $group]` can
+  aggregate over joined children (`{"$sum": "$orders.total"}`).
+  **Behavior change:** `{"$sum": "$amounts"}` with `amounts: [1,2,3]`
+  returned `0` in 1.0–1.2; it now returns `6`.
+- Servers that predate these shapes reject them with `InvalidValue`
+  (`InvalidRequestError` in the drivers); the connection stays open. No
+  wire format or driver changes.
 
 ## [1.2.0] - 2026-09-16
 

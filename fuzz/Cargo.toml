@@ -73,6 +73,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_aggregate_exec"
+path = "fuzz_targets/fuzz_aggregate_exec.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_index_key"
 path = "fuzz_targets/fuzz_index_key.rs"
 test = false

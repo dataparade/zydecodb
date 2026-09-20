@@ -97,6 +97,26 @@ pub fn stored_to_json_vec(stored: &[u8]) -> DocResult<Vec<u8>> {
     }
 }
 
+/// Borrow a stored body as a ZDoc [`crate::binary::ValueView`]. ZDoc bodies are
+/// viewed zero-copy; legacy JSON bodies are parsed and re-encoded so callers
+/// get one representation either way.
+pub(crate) fn with_stored_view<T>(
+    stored: &[u8],
+    f: impl FnOnce(crate::binary::ValueView<'_>) -> DocResult<T>,
+) -> DocResult<T> {
+    let Some((&kind, payload)) = stored.split_first() else {
+        return Err(DocError::Corrupt("empty stored document".into()));
+    };
+    if kind == VK_ZDOC {
+        return f(crate::binary::ValueView::new(payload));
+    }
+
+    let value: Value = serde_json::from_slice(payload)
+        .map_err(|e| DocError::Corrupt(format!("invalid stored JSON: {e}")))?;
+    let zdoc = crate::binary::ZDocBuilder::from_value(&value);
+    f(crate::binary::ValueView::new(&zdoc))
+}
+
 /// Current opaque revision (`InternalKey.seq`) for a document, if it exists.
 pub fn doc_revision(
     engine: &Engine,

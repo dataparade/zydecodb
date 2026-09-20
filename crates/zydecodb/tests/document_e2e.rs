@@ -530,6 +530,106 @@ fn lookup_join_over_wire() {
     handle.join().unwrap();
 }
 
+fn aggregate_raw(s: &mut TcpStream, collection: &str, pipeline: &str) -> ResponseEnvelope {
+    let p = wire::AggregatePayload {
+        collection: collection.into(),
+        pipeline: pipeline.as_bytes().to_vec(),
+    };
+    roundtrip(s, &RequestEnvelope::new(Command::Aggregate, p.encode()))
+}
+
+#[test]
+fn lookup_filters_over_wire() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    define_index(&mut s, "orders", "by_user", &["user_id"]);
+    doc_put(&mut s, "users", b"u1", r#"{"name":"alice"}"#);
+    doc_put(&mut s, "users", b"u2", r#"{"name":"bob"}"#);
+    doc_put(&mut s, "users", b"u3", r#"{"name":"carol"}"#);
+    doc_put(&mut s, "orders", b"o1", r#"{"user_id":"u1","total":10}"#);
+    doc_put(&mut s, "orders", b"o2", r#"{"user_id":"u1","total":20}"#);
+    doc_put(&mut s, "orders", b"o3", r#"{"user_id":"u2","total":5}"#);
+
+    // $lookup with an inner filter: only qualifying orders attach.
+    let rows = aggregate(
+        &mut s,
+        "users",
+        r#"[{"$lookup":{"from":"orders","localField":"_id","foreignField":"user_id","as":"orders","filter":{"total":{"$gte":10}}}}]"#,
+    );
+    let orders_of = |id: &str| {
+        rows.iter()
+            .find(|r| r["_id"] == serde_json::json!(id))
+            .unwrap()["orders"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(orders_of("u1"), 2);
+    assert_eq!(orders_of("u2"), 0);
+    assert_eq!(orders_of("u3"), 0);
+
+    // Post-join $match: anti-join keeps only users with no orders.
+    let rows = aggregate(
+        &mut s,
+        "users",
+        r#"[{"$lookup":{"from":"orders","localField":"_id","foreignField":"user_id","as":"orders"}},{"$match":{"orders":[]}}]"#,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["_id"], serde_json::json!("u3"));
+
+    // Four stages end to end: pre-filter, join, post-filter, group over the
+    // joined array with $sum and $size.
+    let rows = aggregate(
+        &mut s,
+        "users",
+        r#"[{"$match":{"name":{"$ne":"bob"}}},{"$lookup":{"from":"orders","localField":"_id","foreignField":"user_id","as":"orders"}},{"$match":{"orders":{"$ne":[]}}},{"$group":{"_id":null,"spend":{"$sum":"$orders.total"},"n":{"$size":"$orders"}}}]"#,
+    );
+    assert_eq!(
+        rows,
+        vec![serde_json::json!({"_id": null, "spend": 30, "n": 2})]
+    );
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
+#[test]
+fn malformed_lookup_shapes_error_and_connection_survives() {
+    let (addr, shutdown, handle) = spawn_ephemeral_server();
+    let mut s = connect(addr);
+
+    doc_put(&mut s, "users", b"u1", r#"{"name":"alice"}"#);
+    let valid = r#"[{"$group":{"_id":null,"n":{"$count":{}}}}]"#;
+
+    let malformed = [
+        // filter is not an object
+        r#"[{"$lookup":{"from":"o","localField":"_id","foreignField":"u","as":"h","filter":5}}]"#,
+        // unknown operator inside the filter
+        r#"[{"$lookup":{"from":"o","localField":"_id","foreignField":"u","as":"h","filter":{"u":{"$bogus":1}}}}]"#,
+        // unknown $lookup key
+        r#"[{"$lookup":{"from":"o","localField":"_id","foreignField":"u","as":"h","pipeline":[]}}]"#,
+        // two $match stages after $lookup
+        r#"[{"$lookup":{"from":"o","localField":"_id","foreignField":"u","as":"h"}},{"$match":{}},{"$match":{}}]"#,
+        // $match after $group
+        r#"[{"$lookup":{"from":"o","localField":"_id","foreignField":"u","as":"h"}},{"$group":{"_id":null}},{"$match":{}}]"#,
+        // five stages
+        r#"[{"$match":{}},{"$lookup":{"from":"o","localField":"_id","foreignField":"u","as":"h"}},{"$match":{}},{"$group":{"_id":null}},{"$group":{"_id":null}}]"#,
+    ];
+    for (i, pipeline) in malformed.iter().enumerate() {
+        let resp = aggregate_raw(&mut s, "users", pipeline);
+        assert_ne!(resp.status, Status::Ok, "shape {i} must be rejected");
+        // The connection stays usable after a rejected pipeline.
+        let resp = aggregate_raw(&mut s, "users", valid);
+        assert_eq!(resp.status, Status::Ok, "connection broke after shape {i}");
+    }
+
+    drop(s);
+    *shutdown.lock().unwrap() = true;
+    handle.join().unwrap();
+}
+
 #[test]
 fn filter_type_array_regex_over_wire() {
     let (addr, shutdown, handle) = spawn_ephemeral_server();
