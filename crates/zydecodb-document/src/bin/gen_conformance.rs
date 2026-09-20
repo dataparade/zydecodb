@@ -592,6 +592,36 @@ fn payload_vectors() -> Vec<Value> {
         Command::Aggregate,
         p.encode(),
     ));
+    let lookup_filter_pipeline = br#"[{"$lookup":{"from":"orders","localField":"_id","foreignField":"user_id","as":"orders","filter":{"total":{"$gte":10}}}}]"#;
+    let p = AggregatePayload {
+        collection: "users".into(),
+        pipeline: lookup_filter_pipeline.to_vec(),
+    };
+    v.push(req(
+        "aggregate_lookup_filter",
+        "Aggregate",
+        json!({
+            "collection":"users",
+            "pipeline_json":"[{\"$lookup\":{\"from\":\"orders\",\"localField\":\"_id\",\"foreignField\":\"user_id\",\"as\":\"orders\",\"filter\":{\"total\":{\"$gte\":10}}}}]"
+        }),
+        Command::Aggregate,
+        p.encode(),
+    ));
+    let lookup_match_group_pipeline = br#"[{"$match":{"active":true}},{"$lookup":{"from":"orders","localField":"_id","foreignField":"user_id","as":"orders"}},{"$match":{"orders":{"$ne":[]}}},{"$group":{"_id":"$_id","spend":{"$sum":"$orders.total"},"n":{"$size":"$orders"}}}]"#;
+    let p = AggregatePayload {
+        collection: "users".into(),
+        pipeline: lookup_match_group_pipeline.to_vec(),
+    };
+    v.push(req(
+        "aggregate_lookup_match_group",
+        "Aggregate",
+        json!({
+            "collection":"users",
+            "pipeline_json":"[{\"$match\":{\"active\":true}},{\"$lookup\":{\"from\":\"orders\",\"localField\":\"_id\",\"foreignField\":\"user_id\",\"as\":\"orders\"}},{\"$match\":{\"orders\":{\"$ne\":[]}}},{\"$group\":{\"_id\":\"$_id\",\"spend\":{\"$sum\":\"$orders.total\"},\"n\":{\"$size\":\"$orders\"}}}]"
+        }),
+        Command::Aggregate,
+        p.encode(),
+    ));
 
     // ---- Begin / Commit / Rollback (empty payloads) ----
     v.push(req(
