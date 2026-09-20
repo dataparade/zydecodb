@@ -977,6 +977,225 @@ fn compound_non_leading_field_falls_to_hash() {
 }
 
 #[test]
+fn lookup_group_sums_joined_totals() {
+    for (strategy, seeded) in [("inlj", seed()), ("hash", seed_unindexed())] {
+        let (_dir, engine, catalog) = seeded;
+        let rows = run(
+            &engine,
+            &catalog,
+            "users",
+            &pipeline(json!([
+                {"$lookup": {
+                    "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+                }},
+                {"$group": {
+                    "_id": "$_id",
+                    "spend": {"$sum": "$orders.total"},
+                    "n": {"$size": "$orders"}
+                }}
+            ])),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                json!({"_id": "u1", "spend": 30, "n": 2}),
+                json!({"_id": "u2", "spend": 5, "n": 1}),
+                json!({"_id": "u3", "spend": 0, "n": 0}),
+            ],
+            "{strategy}"
+        );
+    }
+}
+
+#[test]
+fn lookup_filter_limits_inner_side() {
+    for (strategy, seeded) in [("inlj", seed()), ("hash", seed_unindexed())] {
+        let (_dir, engine, catalog) = seeded;
+        let rows = run(
+            &engine,
+            &catalog,
+            "users",
+            &pipeline(json!([
+                {"$lookup": {
+                    "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+                    "filter": {"total": {"$gte": 10}}
+                }}
+            ])),
+        );
+        let orders_of = |id: &str| {
+            rows.iter()
+                .find(|r| r["_id"] == json!(id))
+                .unwrap()["orders"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(orders_of("u1").len(), 2, "{strategy}");
+        assert_eq!(orders_of("u2"), Vec::<Value>::new(), "{strategy}");
+        assert_eq!(orders_of("u3"), Vec::<Value>::new(), "{strategy}");
+    }
+}
+
+#[test]
+fn lookup_filter_on_inner_id_and_empty_filter() {
+    let (_dir, engine, catalog) = seed();
+
+    // `_id` predicates on the inner side match the document id.
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+                "filter": {"_id": "o1"}
+            }}
+        ])),
+    );
+    let u1 = rows.iter().find(|r| r["_id"] == json!("u1")).unwrap();
+    assert_eq!(u1["orders"].as_array().unwrap().len(), 1);
+    assert_eq!(u1["orders"][0]["_id"], json!("o1"));
+
+    // An empty filter object is identical to no filter at all.
+    let unfiltered = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }}
+        ])),
+    );
+    let empty_filter = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+                "filter": {}
+            }}
+        ])),
+    );
+    assert_eq!(unfiltered, empty_filter);
+}
+
+#[test]
+fn lookup_filter_supports_regex_and_in() {
+    let (_dir, engine, catalog) = seed();
+
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+                "filter": {"_id": {"$regex": "^o[12]$"}}
+            }}
+        ])),
+    );
+    let u1 = rows.iter().find(|r| r["_id"] == json!("u1")).unwrap();
+    assert_eq!(u1["orders"].as_array().unwrap().len(), 2);
+    let u2 = rows.iter().find(|r| r["_id"] == json!("u2")).unwrap();
+    assert_eq!(u2["orders"], json!([]));
+
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+                "filter": {"total": {"$in": [5, 20]}}
+            }}
+        ])),
+    );
+    let u1 = rows.iter().find(|r| r["_id"] == json!("u1")).unwrap();
+    assert_eq!(u1["orders"].as_array().unwrap().len(), 1);
+    assert_eq!(u1["orders"][0]["total"], json!(20));
+    let u2 = rows.iter().find(|r| r["_id"] == json!("u2")).unwrap();
+    assert_eq!(u2["orders"].as_array().unwrap().len(), 1);
+    assert_eq!(u2["orders"][0]["total"], json!(5));
+}
+
+#[test]
+fn post_match_anti_join() {
+    let (_dir, engine, catalog) = seed();
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }},
+            {"$match": {"orders": []}}
+        ])),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["_id"], json!("u3"));
+    assert_eq!(rows[0]["orders"], json!([]));
+}
+
+#[test]
+fn post_match_elem_match_on_children() {
+    let (_dir, engine, catalog) = seed();
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }},
+            {"$match": {"orders": {"$elemMatch": {"total": {"$gt": 15}}}}}
+        ])),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["_id"], json!("u1"));
+    assert_eq!(rows[0]["orders"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn post_match_then_group_counts_survivors() {
+    let (_dir, engine, catalog) = seed();
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }},
+            {"$match": {"orders": {"$ne": []}}},
+            {"$group": {"_id": null, "n": {"$count": {}}, "spend": {"$sum": "$orders.total"}}}
+        ])),
+    );
+    assert_eq!(rows, vec![json!({"_id": null, "n": 2, "spend": 35})]);
+}
+
+#[test]
+fn match_lookup_match_group_end_to_end() {
+    let (_dir, engine, catalog) = seed();
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([
+            {"$match": {"name": {"$ne": "bob"}}},
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }},
+            {"$match": {"orders": []}},
+            {"$group": {"_id": null, "n": {"$count": {}}}}
+        ])),
+    );
+    assert_eq!(rows, vec![json!({"_id": null, "n": 1})]);
+}
+
+#[test]
 fn held_snapshot_misses_post_snap_inner_write() {
     let (_dir, mut engine, mut catalog) = seed();
     let pipe = pipeline(json!([{"$lookup": {
