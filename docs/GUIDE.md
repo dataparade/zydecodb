@@ -1134,10 +1134,20 @@ compaction write amp ~1.9. Stability analyzer exit 0. Repro and gates:
 
 ### Release checklist (pre-tag)
 
-Do **not** tag an RC or `1.0.0` until these are green (local equivalent OK).
+Scope by version tier:
+
+- **RCs and majors (`x.0.0`):** every gate below is mandatory. Do **not** tag
+  until they are green (local equivalent OK). After `1.0.0-rc.N`, also complete
+  the [RC bake](#rc-bake) before the final `1.0.0` tag.
+- **Minors (`1.x.0`):** the merge gate (`cargo fmt --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --all`),
+  wire conformance, bench compare, fuzz-smoke, and green CI on the release
+  commit. The long soaks are not re-run per minor — they gate the next RC and
+  run nightly in between.
+- **Patches (`1.x.y`):** targeted tests for the fix plus green CI.
+
 Tag publish (`release.yml`) does **not** re-run the long soaks — gates are
-pre-tag only. After `1.0.0-rc.N`, also complete the [RC bake](#rc-bake) before
-the final `1.0.0` tag.
+pre-tag only.
 
 **Stability / capacity**
 

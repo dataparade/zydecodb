@@ -177,7 +177,8 @@ but runtime compatibility is the wire — not lockstep minors. Full policy:
 
 ## Cutting a release
 
-**Pre-tag gates** (mandatory before any RC / 1.0 tag) — full list in
+**Pre-tag gates** (mandatory before any RC or `x.0.0` tag; `1.x.0` minors and
+patches follow the lighter tiers) — full list in
 [`GUIDE.md` Release checklist](GUIDE.md#release-checklist-pre-tag):
 
 - [ ] 90m paced soak + `analyze-soak.py --mode stability` exit 0
