@@ -1196,6 +1196,374 @@ fn match_lookup_match_group_end_to_end() {
 }
 
 #[test]
+fn inlj_filter_rescues_hot_key_under_match_bound() {
+    let (_dir, mut engine, mut catalog) = seed();
+    for i in 0..1500 {
+        put(
+            &mut engine,
+            &mut catalog,
+            "orders",
+            &format!("x{i:04}"),
+            json!({"user_id": "u1", "batch": 1, "n": i}),
+        );
+    }
+    let limits = AggregationLimits {
+        max_matches_per_outer: 1000,
+        ..Default::default()
+    };
+
+    // 1,500 index hits for one outer document, but the filter keeps 10:
+    // rejected documents are skipped before the bound is charged.
+    let rows = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([
+            {"$match": {"_id": "u1"}},
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+                "filter": {"batch": 1, "n": {"$lt": 10}}
+            }}
+        ])),
+        limits,
+    )
+    .unwrap()
+    .rows;
+    assert_eq!(rows[0]["orders"].as_array().unwrap().len(), 10);
+
+    // One survivor over the bound is still a named error, not a truncation.
+    let err = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([
+            {"$match": {"_id": "u1"}},
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+                "filter": {"batch": 1, "n": {"$lt": 1001}}
+            }}
+        ])),
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("more than 1000 matches"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn hash_filter_keeps_build_under_hash_bytes_cap() {
+    let (_dir, engine, catalog) = seed_unindexed();
+    let limits = AggregationLimits {
+        max_hash_bytes: 150,
+        ..Default::default()
+    };
+
+    // Unfiltered, all three orders exceed the cap.
+    let err = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+        }}])),
+        limits,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("hash join exceeds"), "got: {err}");
+
+    // The filter keeps one document out of the map entirely.
+    let rows = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+            "filter": {"_id": "o1"}
+        }}])),
+        limits,
+    )
+    .unwrap()
+    .rows;
+    let u1 = rows.iter().find(|r| r["_id"] == json!("u1")).unwrap();
+    assert_eq!(u1["orders"].as_array().unwrap().len(), 1);
+    let u2 = rows.iter().find(|r| r["_id"] == json!("u2")).unwrap();
+    assert_eq!(u2["orders"], json!([]));
+}
+
+#[test]
+fn hash_scan_gate_not_bypassed_by_selective_filter() {
+    let (_dir, engine, catalog) = seed_unindexed();
+    // The filter would keep nothing, but the inner doc_count (3) is over the
+    // scan gate (2): strategy selection fails before any scan.
+    let err = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+            "filter": {"_id": "nope"}
+        }}])),
+        AggregationLimits {
+            max_scan_docs: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("no index on 'user_id'"), "got: {err}");
+}
+
+#[test]
+fn post_filter_rejected_docs_do_not_consume_memory_bound() {
+    let (_dir, engine, catalog) = seed();
+    let limits = AggregationLimits {
+        max_memory_bytes: 1,
+        ..Default::default()
+    };
+
+    // Every joined document is rejected: nothing is charged, zero rows.
+    let rows = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }},
+            {"$match": {"name": "nobody"}}
+        ])),
+        limits,
+    )
+    .unwrap()
+    .rows;
+    assert_eq!(rows, Vec::<Value>::new());
+
+    // One survivor over the byte budget is a named error.
+    let err = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }},
+            {"$match": {"name": "alice"}}
+        ])),
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("join state exceeds 1 bytes"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn max_result_bytes_enforced_on_post_filtered_output() {
+    let (_dir, engine, catalog) = seed();
+    let result = execute_aggregation(
+        &engine.snapshot_owned(),
+        &catalog,
+        PREFIX,
+        "users",
+        &pipeline(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"
+            }},
+            {"$match": {"orders": {"$ne": []}}}
+        ])),
+        AggregationLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    let err =
+        zydecodb_document::wire::encode_aggregate_response(&result.rows, 1).unwrap_err();
+    assert!(err.to_string().contains("result"), "got: {err}");
+}
+
+#[test]
+fn held_snapshot_with_filters_misses_post_snap_writes() {
+    let (_dir, mut engine, mut catalog) = seed();
+    let pipe = pipeline(json!([
+        {"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+            "filter": {"total": {"$gte": 10}}
+        }},
+        {"$match": {"orders": {"$ne": []}}}
+    ]));
+    let snap = engine.snapshot_owned();
+
+    // After the snapshot: insert a doc that WOULD pass the filter, and
+    // delete one that DID.
+    put(
+        &mut engine,
+        &mut catalog,
+        "orders",
+        "o4",
+        json!({"user_id": "u1", "total": 99}),
+    );
+    store::delete(&mut engine, &mut catalog, PREFIX, "orders", b"o1").unwrap();
+
+    let order_ids = |rows: &[Value], id: &str| {
+        rows.iter()
+            .find(|r| r["_id"] == json!(id))
+            .map(|r| {
+                r["orders"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|o| o["_id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    let held = execute_aggregation(
+        &snap,
+        &catalog,
+        PREFIX,
+        "users",
+        &pipe,
+        AggregationLimits::default(),
+    )
+    .unwrap()
+    .rows;
+    assert_eq!(held.len(), 1);
+    assert_eq!(order_ids(&held, "u1"), vec!["o1", "o2"]);
+
+    let fresh = run(&engine, &catalog, "users", &pipe);
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(order_ids(&fresh, "u1"), vec!["o2", "o4"]);
+}
+
+#[test]
+fn filtered_join_stable_across_flush_and_compaction() {
+    let (_dir, mut engine, mut catalog) = seed();
+    let pipe = pipeline(json!([
+        {"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+            "filter": {"total": {"$gte": 10}}
+        }},
+        {"$match": {"orders": {"$ne": []}}}
+    ]));
+    let expected = run(&engine, &catalog, "users", &pipe);
+
+    // Pin a snapshot, then move every byte out from under it.
+    let snap = engine.snapshot_owned();
+    engine.flush().unwrap();
+    engine.compact_all().unwrap();
+
+    let held = execute_aggregation(
+        &snap,
+        &catalog,
+        PREFIX,
+        "users",
+        &pipe,
+        AggregationLimits::default(),
+    )
+    .unwrap()
+    .rows;
+    assert_eq!(held, expected, "held snapshot across flush+compact");
+
+    let fresh = run(&engine, &catalog, "users", &pipe);
+    assert_eq!(fresh, expected, "fresh snapshot after flush+compact");
+}
+
+#[test]
+fn lookup_filter_still_hides_ttl_inner_docs() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "users");
+    catalog.ensure_collection(PREFIX, "sessions");
+    catalog.persist(&mut engine).unwrap();
+
+    put(&mut engine, &mut catalog, "users", "u1", json!({}));
+    let live = ZDocBuilder::from_value(&json!({"user_id": "u1", "kind": "live"}));
+    store::upsert(
+        &mut engine,
+        &mut catalog,
+        PREFIX,
+        "sessions",
+        b"s1",
+        &live,
+        true,
+    )
+    .unwrap();
+    // Expired, but would pass the filter if TTL did not hide it first.
+    let dead = ZDocBuilder::from_value(&json!({"user_id": "u1", "kind": "live"}));
+    store::upsert_with_expiry(
+        &mut engine,
+        &mut catalog,
+        PREFIX,
+        "sessions",
+        b"s2",
+        &dead,
+        true,
+        1,
+    )
+    .unwrap();
+
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "sessions", "localField": "_id", "foreignField": "user_id", "as": "sessions",
+            "filter": {"kind": "live"}
+        }}])),
+    );
+    assert_eq!(rows[0]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["sessions"][0]["_id"], json!("s1"));
+}
+
+#[test]
+fn lookup_filter_cannot_widen_tenant_scope() {
+    let (_dir, mut engine, mut catalog) = seed();
+    // Same collection name under another tenant, with a doc that would pass
+    // the filter and match the join key.
+    catalog.ensure_collection(OTHER_PREFIX, "orders");
+    catalog.persist(&mut engine).unwrap();
+    let zdoc = ZDocBuilder::from_value(&json!({"user_id": "u1", "total": 1000}));
+    store::upsert(
+        &mut engine,
+        &mut catalog,
+        OTHER_PREFIX,
+        "orders",
+        b"other1",
+        &zdoc,
+        true,
+    )
+    .unwrap();
+
+    let rows = run(
+        &engine,
+        &catalog,
+        "users",
+        &pipeline(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+            "filter": {"total": {"$gte": 0}}
+        }}])),
+    );
+    let u1 = rows.iter().find(|r| r["_id"] == json!("u1")).unwrap();
+    let ids: Vec<&str> = u1["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["o1", "o2"]);
+}
+
+#[test]
 fn held_snapshot_misses_post_snap_inner_write() {
     let (_dir, mut engine, mut catalog) = seed();
     let pipe = pipeline(json!([{"$lookup": {

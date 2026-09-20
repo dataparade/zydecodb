@@ -1128,6 +1128,69 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_lookup_filters() {
+        let lookup = |filter: Value| {
+            json!([{"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+                "filter": filter
+            }}])
+        };
+
+        // filter is not an object
+        let err = parse(lookup(json!(5))).unwrap_err();
+        assert!(err.to_string().contains("$lookup 'filter'"), "got: {err}");
+        // unknown operator inside the filter
+        assert!(parse(lookup(json!({"total": {"$bogus": 1}}))).is_err());
+        // over-length regex inside the filter
+        assert!(parse(lookup(json!({"_id": {"$regex": "x".repeat(257)}}))).is_err());
+        // unknown top-level $-key inside the filter
+        assert!(parse(lookup(json!({"$weird": 1}))).is_err());
+        // same rules in the post-join $match position
+        assert!(parse(json!([
+            {"$lookup": {
+                "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits"
+            }},
+            {"$match": {"hits": {"$bogus": 1}}}
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn deeply_nested_lookup_filter_errors_cleanly() {
+        // 200 levels of $and nesting blows serde_json's parse recursion cap:
+        // a named error, not a crash.
+        let mut deep = json!({"a": 1});
+        for _ in 0..200 {
+            deep = json!({"$and": [deep]});
+        }
+        assert!(parse(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+            "filter": deep
+        }}]))
+        .is_err());
+
+        // 50 levels parses fine.
+        let mut shallow = json!({"a": 1});
+        for _ in 0..50 {
+            shallow = json!({"$and": [shallow]});
+        }
+        assert!(parse(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+            "filter": shallow
+        }}]))
+        .is_ok());
+
+        // A filter that pushes the pipeline past the byte cap is rejected.
+        let big = json!({"note": "x".repeat(MAX_PIPELINE_BYTES)});
+        let err = parse(json!([{"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits",
+            "filter": big
+        }}]))
+        .unwrap_err();
+        assert!(err.to_string().contains("pipeline exceeds"), "got: {err}");
+    }
+
+    #[test]
     fn parses_size_accumulator() {
         let pipeline = parse(json!([{"$group": {"_id": null, "n": {"$size": "$orders"}}}]))
             .unwrap();
