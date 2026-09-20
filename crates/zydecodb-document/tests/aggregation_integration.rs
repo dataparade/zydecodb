@@ -369,16 +369,7 @@ fn sum_overflow_across_array_elements_is_a_named_error() {
     catalog.ensure_collection(PREFIX, "big");
 
     let zdoc = ZDocBuilder::from_value(&json!({"amounts": [i64::MAX, 1]}));
-    store::upsert(
-        &mut engine,
-        &mut catalog,
-        PREFIX,
-        "big",
-        b"b1",
-        &zdoc,
-        true,
-    )
-    .unwrap();
+    store::upsert(&mut engine, &mut catalog, PREFIX, "big", b"b1", &zdoc, true).unwrap();
 
     let pipeline = pipeline(json!([
         {"$group": {"_id": null, "t": {"$sum": "$amounts"}}}

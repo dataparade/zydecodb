@@ -264,7 +264,10 @@ fn parse_lookup(value: &Value) -> DocResult<LookupSpec> {
         .as_object()
         .ok_or_else(|| bad_aggregation("$lookup must be an object"))?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "from" | "localField" | "foreignField" | "as" | "filter") {
+        if !matches!(
+            key.as_str(),
+            "from" | "localField" | "foreignField" | "as" | "filter"
+        ) {
             return Err(bad_aggregation(format!("$lookup: unknown key '{key}'")));
         }
     }
@@ -912,7 +915,12 @@ mod tests {
         assert!(p.lookup.is_some() && p.group.is_some());
         assert_ne!(p.post_filter, Filter::MatchAll);
         // [$match, $lookup, $match]
-        let p = parse(json!([match_stage.clone(), lookup.clone(), post_match.clone()])).unwrap();
+        let p = parse(json!([
+            match_stage.clone(),
+            lookup.clone(),
+            post_match.clone()
+        ]))
+        .unwrap();
         assert!(p.lookup.is_some() && p.group.is_none());
         assert_ne!(p.post_filter, Filter::MatchAll);
         // [$match, $lookup, $match, $group]
@@ -942,9 +950,19 @@ mod tests {
         // $match after $group
         assert!(parse(json!([lookup.clone(), group.clone(), match_stage.clone()])).is_err());
         // two $match stages after $lookup
-        assert!(parse(json!([lookup.clone(), match_stage.clone(), match_stage.clone()])).is_err());
+        assert!(parse(json!([
+            lookup.clone(),
+            match_stage.clone(),
+            match_stage.clone()
+        ]))
+        .is_err());
         // non-first $match with no $lookup
-        assert!(parse(json!([match_stage.clone(), match_stage.clone(), group.clone()])).is_err());
+        assert!(parse(json!([
+            match_stage.clone(),
+            match_stage.clone(),
+            group.clone()
+        ]))
+        .is_err());
         // five stages
         assert!(parse(json!([
             match_stage.clone(),
@@ -1192,8 +1210,8 @@ mod tests {
 
     #[test]
     fn parses_size_accumulator() {
-        let pipeline = parse(json!([{"$group": {"_id": null, "n": {"$size": "$orders"}}}]))
-            .unwrap();
+        let pipeline =
+            parse(json!([{"$group": {"_id": null, "n": {"$size": "$orders"}}}])).unwrap();
         let group = pipeline.group.as_ref().unwrap();
         assert_eq!(
             group.accumulators,

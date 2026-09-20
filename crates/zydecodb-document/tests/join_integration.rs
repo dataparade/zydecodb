@@ -1026,9 +1026,7 @@ fn lookup_filter_limits_inner_side() {
             ])),
         );
         let orders_of = |id: &str| {
-            rows.iter()
-                .find(|r| r["_id"] == json!(id))
-                .unwrap()["orders"]
+            rows.iter().find(|r| r["_id"] == json!(id)).unwrap()["orders"]
                 .as_array()
                 .unwrap()
                 .clone()
@@ -1319,7 +1317,10 @@ fn hash_scan_gate_not_bypassed_by_selective_filter() {
         },
     )
     .unwrap_err();
-    assert!(err.to_string().contains("no index on 'user_id'"), "got: {err}");
+    assert!(
+        err.to_string().contains("no index on 'user_id'"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -1387,8 +1388,7 @@ fn max_result_bytes_enforced_on_post_filtered_output() {
     )
     .unwrap();
     assert_eq!(result.rows.len(), 2);
-    let err =
-        zydecodb_document::wire::encode_aggregate_response(&result.rows, 1).unwrap_err();
+    let err = zydecodb_document::wire::encode_aggregate_response(&result.rows, 1).unwrap_err();
     assert!(err.to_string().contains("result"), "got: {err}");
 }
 
@@ -1449,7 +1449,7 @@ fn held_snapshot_with_filters_misses_post_snap_writes() {
 
 #[test]
 fn filtered_join_stable_across_flush_and_compaction() {
-    let (_dir, mut engine, mut catalog) = seed();
+    let (_dir, mut engine, catalog) = seed();
     let pipe = pipeline(json!([
         {"$lookup": {
             "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
@@ -1664,23 +1664,20 @@ fn reference_sum(orders: &[Value]) -> Value {
     let mut float_sum: f64 = 0.0;
     let mut is_float = false;
     for order in orders {
-        match order.get("total") {
-            Some(Value::Number(n)) => {
-                if let Some(i) = n.as_i64() {
-                    if is_float {
-                        float_sum += i as f64;
-                    } else {
-                        int_sum += i;
-                    }
-                } else if let Some(f) = n.as_f64() {
-                    if !is_float {
-                        float_sum = int_sum as f64;
-                        is_float = true;
-                    }
-                    float_sum += f;
+        if let Some(Value::Number(n)) = order.get("total") {
+            if let Some(i) = n.as_i64() {
+                if is_float {
+                    float_sum += i as f64;
+                } else {
+                    int_sum += i;
                 }
+            } else if let Some(f) = n.as_f64() {
+                if !is_float {
+                    float_sum = int_sum as f64;
+                    is_float = true;
+                }
+                float_sum += f;
             }
-            _ => {}
         }
     }
     if is_float {
@@ -1762,7 +1759,9 @@ fn arb_total() -> impl Strategy<Value = Option<Value>> {
     ]
 }
 
-fn arb_order(n_users: usize) -> impl Strategy<Value = (Option<Value>, Option<Value>, Option<Value>)> {
+fn arb_order(
+    n_users: usize,
+) -> impl Strategy<Value = (Option<Value>, Option<Value>, Option<Value>)> {
     (
         prop_oneof![
             6 => (0..n_users).prop_map(|i| Some(json!(format!("u{i:02}")))),
