@@ -381,18 +381,18 @@ impl SstableReader {
     pub fn open(data: Vec<u8>) -> EngineResult<SstableReader> {
         let footer = parse_footer(&data)?;
         let idx_start = footer.index_offset as usize;
-        let idx_end = idx_start + footer.index_length as usize;
-        if idx_end > data.len() {
-            return Err(EngineError::Io("sstable: index out of bounds".into()));
-        }
+        let idx_end = idx_start
+            .checked_add(footer.index_length as usize)
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| EngineError::Io("sstable: index out of bounds".into()))?;
         let idx_body = verify_block_crc(footer.version, &data[idx_start..idx_end], "index")?;
         let index = decode_index(&idx_body)?;
         let bloom = if footer.bloom_length > 0 {
             let bs = footer.bloom_offset as usize;
-            let be = bs + footer.bloom_length as usize;
-            if be > data.len() {
-                return Err(EngineError::Io("sstable: bloom out of bounds".into()));
-            }
+            let be = bs
+                .checked_add(footer.bloom_length as usize)
+                .filter(|&end| end <= data.len())
+                .ok_or_else(|| EngineError::Io("sstable: bloom out of bounds".into()))?;
             let bloom_body = verify_block_crc(footer.version, &data[bs..be], "bloom")?;
             BloomFilter::decode(&bloom_body)
         } else {
@@ -427,7 +427,11 @@ impl SstableReader {
         f.read_exact(&mut footer_buf)?;
         let footer = parse_footer(&footer_buf)?;
 
-        if footer.index_offset + footer.index_length > file_len {
+        if footer
+            .index_offset
+            .checked_add(footer.index_length)
+            .is_none_or(|end| end > file_len)
+        {
             return Err(EngineError::Io("sstable: index out of bounds".into()));
         }
         let idx_buf = read_file_range(&f, footer.index_offset, footer.index_length as usize)?;
@@ -435,7 +439,11 @@ impl SstableReader {
         let index = Arc::new(decode_index(&idx_body)?);
 
         let bloom = if footer.bloom_length > 0 {
-            if footer.bloom_offset + footer.bloom_length > file_len {
+            if footer
+                .bloom_offset
+                .checked_add(footer.bloom_length)
+                .is_none_or(|end| end > file_len)
+            {
                 return Err(EngineError::Io("sstable: bloom out of bounds".into()));
             }
             let bloom_buf = read_file_range(&f, footer.bloom_offset, footer.bloom_length as usize)?;
@@ -503,10 +511,10 @@ impl SstableReader {
         match &self.source {
             Source::Memory { data, version, .. } => {
                 let start = idx.offset as usize;
-                let end = start + idx.length as usize;
-                if end > data.len() {
-                    return Err(EngineError::Io("sstable: block out of bounds".into()));
-                }
+                let end = start
+                    .checked_add(idx.length as usize)
+                    .filter(|&end| end <= data.len())
+                    .ok_or_else(|| EngineError::Io("sstable: block out of bounds".into()))?;
                 let body = verify_block_crc(*version, &data[start..end], "data")?;
                 Ok(BlockBytes::Borrowed(body))
             }
@@ -910,6 +918,74 @@ mod tests {
         let (k, e) = reader.get_latest(&uk(b"k")).unwrap().unwrap();
         assert_eq!(k.seq, 5);
         assert_eq!(e.value.as_deref(), Some(b"new".as_ref()));
+    }
+
+    #[test]
+    fn fuzz_artifact_huge_footer_offsets_error_instead_of_panicking() {
+        // Crash artifact from fuzz-nightly (sstable_reader-crash-3676ff...):
+        // near-u64::MAX footer offsets must be a named error, never an
+        // overflow panic.
+        let artifact: &[u8] = &[
+            0x4e, 0xff, 0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0x18, 0xe8, 0x18, 0x18, 0xff, 0x18,
+            0xff, 0xf0, 0xff, 0x4e, 0x18, 0x18, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0x50, 0x52, 0x41, 0x44, 0x00, 0x00, 0x00, 0x02,
+        ];
+        assert!(SstableReader::open(artifact.to_vec()).is_err());
+    }
+
+    #[test]
+    fn huge_index_offset_in_footer_is_an_error_not_a_panic() {
+        let pairs = sorted_pairs(vec![(
+            InternalKey::new(uk(b"a"), 1, EntryKind::Value),
+            Entry::value(b"1".to_vec(), None),
+        )]);
+        let mut bytes = build(&pairs, false).bytes;
+        let n = bytes.len();
+        bytes[n - FOOTER_LEN..n - FOOTER_LEN + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        let err = SstableReader::open(bytes).err().unwrap();
+        assert!(err.to_string().contains("index out of bounds"));
+    }
+
+    #[test]
+    fn huge_bloom_offset_in_footer_is_an_error_not_a_panic() {
+        let pairs = sorted_pairs(vec![(
+            InternalKey::new(uk(b"a"), 1, EntryKind::Value),
+            Entry::value(b"1".to_vec(), None),
+        )]);
+        let mut bytes = build(&pairs, true).bytes;
+        assert!(parse_footer(&bytes).unwrap().bloom_length > 0);
+        let n = bytes.len();
+        // bloom_offset is the third u64 in the footer.
+        bytes[n - FOOTER_LEN + 16..n - FOOTER_LEN + 24].copy_from_slice(&u64::MAX.to_be_bytes());
+        let err = SstableReader::open(bytes).err().unwrap();
+        assert!(err.to_string().contains("bloom out of bounds"));
+    }
+
+    #[test]
+    fn huge_block_offset_in_index_is_an_error_not_a_panic() {
+        let pairs = sorted_pairs(vec![(
+            InternalKey::new(uk(b"a"), 1, EntryKind::Value),
+            Entry::value(b"1".to_vec(), None),
+        )]);
+        let mut bytes = build(&pairs, false).bytes;
+        let footer = parse_footer(&bytes).unwrap();
+        let idx_start = footer.index_offset as usize;
+        let idx_len = footer.index_length as usize;
+        // Index body: count u32, then per entry key_len u32, key, seq u64,
+        // offset u64, length u64. Point the first entry's block offset at
+        // u64::MAX so read_block's offset + length overflows.
+        let key_len =
+            u32::from_be_bytes(bytes[idx_start + 4..idx_start + 8].try_into().unwrap()) as usize;
+        let off_pos = idx_start + 4 + 4 + key_len + 8;
+        bytes[off_pos..off_pos + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        // Recompute the v2 CRC trailer over the patched index body.
+        let body_end = idx_start + idx_len - BLOCK_CRC_LEN;
+        let crc = crc32fast::hash(&bytes[idx_start..body_end]);
+        bytes[body_end..body_end + BLOCK_CRC_LEN].copy_from_slice(&crc.to_be_bytes());
+
+        let reader = SstableReader::open(bytes).unwrap();
+        let err = reader.scan_all().err().unwrap();
+        assert!(err.to_string().contains("block out of bounds"));
     }
 
     #[test]
