@@ -252,7 +252,11 @@ fn decode_index(buf: &[u8]) -> EngineResult<Vec<IndexEntry>> {
     }
     let count = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
     let mut off = 4;
-    let mut out = Vec::with_capacity(count);
+    // Entries encode to at least 28 bytes each (klen + seq + offset +
+    // length), so a corrupt count can never legitimately exceed
+    // buf.len() / 28. Cap the pre-allocation: an untrusted count of
+    // billions must not abort the process on a huge allocation.
+    let mut out = Vec::with_capacity(count.min(buf.len() / 28));
     for _ in 0..count {
         let klen = u32::from_be_bytes(
             buf.get(off..off + 4)
@@ -929,6 +933,19 @@ mod tests {
             0x4e, 0xff, 0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0x18, 0xe8, 0x18, 0x18, 0xff, 0x18,
             0xff, 0xf0, 0xff, 0x4e, 0x18, 0x18, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff, 0x50, 0x52, 0x41, 0x44, 0x00, 0x00, 0x00, 0x02,
+        ];
+        assert!(SstableReader::open(artifact.to_vec()).is_err());
+    }
+
+    #[test]
+    fn huge_index_entry_count_is_an_error_not_an_allocation_abort() {
+        // Second fuzz artifact: v1 footer, index block declaring
+        // 0xC2000000 entries. decode_index must not pre-allocate from the
+        // untrusted count (234 GiB abort); it fails on truncation instead.
+        let artifact: &[u8] = &[
+            0xc2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x28, 0x00, 0x00, 0xf0, 0x31, 0x4e, 0x18, 0x18, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xf7, 0xff, 0xff, 0xff, 0x50, 0x52, 0x41, 0x44, 0x00, 0x00, 0x00, 0x01,
         ];
         assert!(SstableReader::open(artifact.to_vec()).is_err());
     }
