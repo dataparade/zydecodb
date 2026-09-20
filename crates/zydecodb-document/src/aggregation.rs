@@ -527,23 +527,6 @@ fn estimated_group_bytes(
         .ok_or_else(|| bad_aggregation("memory accounting overflow"))
 }
 
-fn with_stored_view<T>(
-    stored: &[u8],
-    f: impl FnOnce(ValueView<'_>) -> DocResult<T>,
-) -> DocResult<T> {
-    let Some((&kind, payload)) = stored.split_first() else {
-        return Err(DocError::Corrupt("empty stored document".into()));
-    };
-    if kind == store::VK_ZDOC {
-        return f(ValueView::new(payload));
-    }
-
-    let value: Value = serde_json::from_slice(payload)
-        .map_err(|e| DocError::Corrupt(format!("invalid stored JSON: {e}")))?;
-    let zdoc = ZDocBuilder::from_value(&value);
-    f(ValueView::new(&zdoc))
-}
-
 /// Bounded group-state accumulator for a `$group` stage.
 struct GroupEngine<'a> {
     spec: &'a GroupSpec,
@@ -705,7 +688,7 @@ pub fn execute_aggregation_coll(
                 &pipeline.filter,
                 limits.max_scan_docs,
                 |_doc_id, stored| {
-                    with_stored_view(stored, |root| engine.add(root))?;
+                    store::with_stored_view(stored, |root| engine.add(root))?;
                     Ok(true)
                 },
             )?;
