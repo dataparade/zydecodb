@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 use zydecodb_engine::SnapshotHandle;
 
-pub const MAX_PIPELINE_STAGES: usize = 3;
+pub const MAX_PIPELINE_STAGES: usize = 4;
 pub const MAX_ACCUMULATORS: usize = 16;
 pub const MAX_PIPELINE_BYTES: usize = 64 * 1024;
 
@@ -62,12 +62,16 @@ impl Default for AggregationLimits {
 ///
 /// Legal shapes (see `docs/DESIGN-joins.md`):
 /// `[$group]`, `[$match, $group]`, `[$lookup]`, `[$lookup, $group]`,
-/// `[$match, $lookup]`, `[$match, $lookup, $group]`. `$lookup` appears at
-/// most once and never after `$group`.
+/// `[$lookup, $match]`, `[$lookup, $match, $group]`, `[$match, $lookup]`,
+/// `[$match, $lookup, $group]`, `[$match, $lookup, $match]`,
+/// `[$match, $lookup, $match, $group]`. `$lookup` appears at most once and
+/// never after `$group`; a `$match` after `$lookup` runs on the joined
+/// documents (outer plus the `as` array).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregationPipeline {
     pub filter: Filter,
     pub lookup: Option<LookupSpec>,
+    pub post_filter: Filter,
     pub group: Option<GroupSpec>,
 }
 
@@ -156,9 +160,10 @@ fn parse_field_reference(value: &Value, context: &str) -> DocResult<String> {
     Ok(path.to_string())
 }
 
-/// Parse the strict pipeline grammar: optional `$match`, optional `$lookup`,
-/// optional `$group` — at least one stage, `$lookup` at most once and never
-/// after `$group`, and a `$lookup`-free pipeline must end in `$group`.
+/// Parse the strict pipeline grammar: optional leading `$match`, optional
+/// `$lookup`, optional post-join `$match`, optional `$group` — at least one
+/// stage, `$lookup` at most once and never after `$group`, `$group` last, and
+/// a `$lookup`-free pipeline must end in `$group`.
 pub fn parse_pipeline(bytes: &[u8]) -> DocResult<AggregationPipeline> {
     if bytes.len() > MAX_PIPELINE_BYTES {
         return Err(bad_aggregation(format!(
@@ -178,15 +183,29 @@ pub fn parse_pipeline(bytes: &[u8]) -> DocResult<AggregationPipeline> {
 
     let mut filter = Filter::MatchAll;
     let mut lookup: Option<LookupSpec> = None;
+    let mut post_filter = Filter::MatchAll;
+    let mut post_filter_seen = false;
     let mut group: Option<GroupSpec> = None;
     for (i, stage) in stages.iter().enumerate() {
         let operator = stage_operator(stage)?;
         match operator {
             "$match" => {
-                if i != 0 {
-                    return Err(bad_aggregation("$match must be the first stage"));
+                if i == 0 {
+                    filter = Filter::parse(one_stage(stage, "$match")?)?;
+                    continue;
                 }
-                filter = Filter::parse(one_stage(stage, "$match")?)?;
+                if lookup.is_none() || group.is_some() {
+                    return Err(bad_aggregation(
+                        "$match must be the first stage or directly follow $lookup",
+                    ));
+                }
+                if post_filter_seen {
+                    return Err(bad_aggregation(
+                        "$match after $lookup may appear at most once",
+                    ));
+                }
+                post_filter = Filter::parse(one_stage(stage, "$match")?)?;
+                post_filter_seen = true;
             }
             "$lookup" => {
                 if lookup.is_some() {
@@ -219,6 +238,7 @@ pub fn parse_pipeline(bytes: &[u8]) -> DocResult<AggregationPipeline> {
     Ok(AggregationPipeline {
         filter,
         lookup,
+        post_filter,
         group,
     })
 }
@@ -753,6 +773,7 @@ pub fn execute_aggregation_coll(
                 inner,
                 &pipeline.filter,
                 spec,
+                &pipeline.post_filter,
                 limits,
             )?;
             match &pipeline.group {
@@ -848,12 +869,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_six_legal_lookup_orders() {
+    fn parses_all_ten_legal_pipeline_shapes() {
         let lookup = json!({"$lookup": {
             "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "hits"
         }});
         let group = json!({"$group": {"_id": null, "n": {"$count": {}}}});
         let match_stage = json!({"$match": {"active": true}});
+        let post_match = json!({"$match": {"hits": {"$ne": []}}});
 
         // [$group], [$match, $group] still parse with no lookup.
         assert!(parse(json!([group.clone()])).unwrap().lookup.is_none());
@@ -870,6 +892,7 @@ mod tests {
         assert_eq!(spec.foreign_field, "user_id");
         assert_eq!(spec.as_field, "hits");
         assert!(p.group.is_none());
+        assert_eq!(p.post_filter, Filter::MatchAll);
 
         // [$lookup, $group]
         let p = parse(json!([lookup.clone(), group.clone()])).unwrap();
@@ -880,6 +903,28 @@ mod tests {
         // [$match, $lookup, $group]
         let p = parse(json!([match_stage.clone(), lookup.clone(), group.clone()])).unwrap();
         assert!(p.lookup.is_some() && p.group.is_some());
+        // [$lookup, $match]
+        let p = parse(json!([lookup.clone(), post_match.clone()])).unwrap();
+        assert!(p.lookup.is_some() && p.group.is_none());
+        assert_ne!(p.post_filter, Filter::MatchAll);
+        // [$lookup, $match, $group]
+        let p = parse(json!([lookup.clone(), post_match.clone(), group.clone()])).unwrap();
+        assert!(p.lookup.is_some() && p.group.is_some());
+        assert_ne!(p.post_filter, Filter::MatchAll);
+        // [$match, $lookup, $match]
+        let p = parse(json!([match_stage.clone(), lookup.clone(), post_match.clone()])).unwrap();
+        assert!(p.lookup.is_some() && p.group.is_none());
+        assert_ne!(p.post_filter, Filter::MatchAll);
+        // [$match, $lookup, $match, $group]
+        let p = parse(json!([
+            match_stage.clone(),
+            lookup.clone(),
+            post_match.clone(),
+            group.clone()
+        ]))
+        .unwrap();
+        assert!(p.lookup.is_some() && p.group.is_some());
+        assert_ne!(p.post_filter, Filter::MatchAll);
     }
 
     #[test]
@@ -894,12 +939,17 @@ mod tests {
         assert!(parse(json!([group.clone(), lookup.clone()])).is_err());
         // second $lookup
         assert!(parse(json!([lookup.clone(), lookup.clone()])).is_err());
-        // $match after $lookup
-        assert!(parse(json!([lookup.clone(), match_stage.clone()])).is_err());
-        // four stages
+        // $match after $group
+        assert!(parse(json!([lookup.clone(), group.clone(), match_stage.clone()])).is_err());
+        // two $match stages after $lookup
+        assert!(parse(json!([lookup.clone(), match_stage.clone(), match_stage.clone()])).is_err());
+        // non-first $match with no $lookup
+        assert!(parse(json!([match_stage.clone(), match_stage.clone(), group.clone()])).is_err());
+        // five stages
         assert!(parse(json!([
             match_stage.clone(),
             lookup.clone(),
+            match_stage.clone(),
             group.clone(),
             group.clone()
         ]))

@@ -130,6 +130,7 @@ fn run_join(
         catalog.collection(PREFIX, &spec.from).unwrap(),
         &pipeline.filter,
         spec,
+        &pipeline.post_filter,
         limits,
     )
     .unwrap()
@@ -999,6 +1000,7 @@ fn held_snapshot_misses_post_snap_inner_write() {
         catalog.collection(PREFIX, "orders").unwrap(),
         &pipe.filter,
         spec,
+        &pipe.post_filter,
         AggregationLimits::default(),
     )
     .unwrap();

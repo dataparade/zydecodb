@@ -12,7 +12,7 @@
 //! no spill, no silent truncation.
 
 use crate::aggregation::{AggregationLimits, LookupSpec};
-use crate::binary::ValueView;
+use crate::binary::{ValueView, ZDocBuilder};
 use crate::catalog::CollectionMeta;
 use crate::error::{DocError, DocResult};
 use crate::filter::Filter;
@@ -292,6 +292,7 @@ fn join_value_for_outer(
 
 fn splice_matches(
     spec: &LookupSpec,
+    post_filter: &Filter,
     stored: &[u8],
     doc_id: &[u8],
     matches: Vec<Value>,
@@ -300,11 +301,21 @@ fn splice_matches(
     docs: &mut Vec<Value>,
 ) -> DocResult<()> {
     let mut doc = stored_to_doc(stored, doc_id)?;
-    let estimated = serde_json::to_vec(&doc).map(|v| v.len()).unwrap_or(0)
-        + matches
-            .iter()
-            .map(|m| serde_json::to_vec(m).map(|v| v.len()).unwrap_or(0))
-            .sum::<usize>();
+    match &mut doc {
+        Value::Object(map) => {
+            map.insert(spec.as_field.clone(), Value::Array(matches));
+        }
+        _ => return Err(DocError::Corrupt("stored document is not an object".into())),
+    }
+    // The post-join $match runs on the joined document. Rejected documents
+    // are dropped before the memory bound is charged.
+    if !matches!(post_filter, Filter::MatchAll) {
+        let zdoc = ZDocBuilder::from_value(&doc);
+        if !post_filter.matches(ValueView::new(&zdoc), Some(doc_id)) {
+            return Ok(());
+        }
+    }
+    let estimated = serde_json::to_vec(&doc).map(|v| v.len()).unwrap_or(0);
     let next_memory = memory_bytes
         .checked_add(estimated)
         .ok_or_else(|| lookup_error("memory accounting overflow"))?;
@@ -315,19 +326,14 @@ fn splice_matches(
     }
     *memory_bytes = next_memory;
 
-    match &mut doc {
-        Value::Object(map) => {
-            map.insert(spec.as_field.clone(), Value::Array(matches));
-        }
-        _ => return Err(DocError::Corrupt("stored document is not an object".into())),
-    }
     docs.push(doc);
     Ok(())
 }
 
 /// Execute a `$lookup` stage: pick INLJ or hash, stream the outer collection
-/// (filtered by the pipeline's `$match`, bounded by `max_scan_docs`), and
-/// splice matches into the `as` array.
+/// (filtered by the pipeline's leading `$match`, bounded by `max_scan_docs`),
+/// splice matches into the `as` array, then apply the optional post-join
+/// `$match` to each joined document.
 pub fn execute_lookup(
     snap: &SnapshotHandle,
     prefix: &[u8],
@@ -335,6 +341,7 @@ pub fn execute_lookup(
     inner: &CollectionMeta,
     filter: &Filter,
     spec: &LookupSpec,
+    post_filter: &Filter,
     limits: AggregationLimits,
 ) -> DocResult<JoinResult> {
     let strategy = select_strategy(inner, &spec.foreign_field, limits)?;
@@ -385,6 +392,7 @@ pub fn execute_lookup(
             };
             splice_matches(
                 spec,
+                post_filter,
                 stored,
                 &doc_id,
                 matches,
