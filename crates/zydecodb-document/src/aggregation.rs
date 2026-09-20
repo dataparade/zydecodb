@@ -79,13 +79,15 @@ impl AggregationPipeline {
 }
 
 /// A parsed `$lookup` stage: equality left-outer join against one collection
-/// under the same tenant prefix.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// under the same tenant prefix, with an optional residual filter applied to
+/// inner documents before they are attached.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LookupSpec {
     pub from: String,
     pub local_field: String,
     pub foreign_field: String,
     pub as_field: String,
+    pub filter: Filter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,14 +236,15 @@ fn stage_operator(stage: &Value) -> DocResult<&str> {
     Ok(object.keys().next().unwrap())
 }
 
-/// Parse a `$lookup` body: exactly `from`, `localField`, `foreignField`,
-/// `as` — all required, no extras.
+/// Parse a `$lookup` body: `from`, `localField`, `foreignField`, `as` are
+/// required; `filter` (a normal filter object applied to inner documents) is
+/// optional. No other keys.
 fn parse_lookup(value: &Value) -> DocResult<LookupSpec> {
     let object = value
         .as_object()
         .ok_or_else(|| bad_aggregation("$lookup must be an object"))?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "from" | "localField" | "foreignField" | "as") {
+        if !matches!(key.as_str(), "from" | "localField" | "foreignField" | "as" | "filter") {
             return Err(bad_aggregation(format!("$lookup: unknown key '{key}'")));
         }
     }
@@ -269,11 +272,18 @@ fn parse_lookup(value: &Value) -> DocResult<LookupSpec> {
             )));
         }
     }
+    let filter = match object.get("filter") {
+        Some(v) => {
+            Filter::parse(v).map_err(|e| bad_aggregation(format!("$lookup 'filter': {e}")))?
+        }
+        None => Filter::MatchAll,
+    };
     Ok(LookupSpec {
         from: from.to_string(),
         local_field: local_field.to_string(),
         foreign_field: foreign_field.to_string(),
         as_field: as_field.to_string(),
+        filter,
     })
 }
 
