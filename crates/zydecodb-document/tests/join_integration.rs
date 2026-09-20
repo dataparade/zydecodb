@@ -3,11 +3,14 @@
 //! `$group`, and the adversarial cases (missing inner index, unknown/cross-
 //! tenant `from`, per-outer match bound, TTL'd inner data).
 
+use proptest::prelude::*;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 use zydecodb_document::aggregation::{execute_aggregation, AggregationLimits, AggregationPipeline};
-use zydecodb_document::binary::ZDocBuilder;
+use zydecodb_document::binary::{ValueView, ZDocBuilder};
 use zydecodb_document::catalog::Catalog;
+use zydecodb_document::filter::Filter;
 use zydecodb_document::join::{execute_lookup, JoinStrategy};
 use zydecodb_document::store;
 use zydecodb_engine::engine::{Engine, EngineConfig};
@@ -1603,4 +1606,261 @@ fn held_snapshot_misses_post_snap_inner_write() {
     );
     let u1 = fresh.docs.iter().find(|r| r["_id"] == json!("u1")).unwrap();
     assert_eq!(u1["orders"].as_array().unwrap().len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Equivalence oracle: a naive nested-loop reference join (real Filter engine,
+// no index, no hash map) must produce exactly what INLJ and hash produce.
+// ---------------------------------------------------------------------------
+
+fn seed_scenario(
+    indexed: bool,
+    n_users: usize,
+    orders: &[(String, Value)],
+) -> (TempDir, Engine, Catalog) {
+    let dir = TempDir::new().unwrap();
+    let mut engine = open(&dir);
+    let mut catalog = Catalog::default();
+    catalog.ensure_collection(PREFIX, "users");
+    catalog.ensure_collection(PREFIX, "orders");
+    if indexed {
+        catalog
+            .add_index(
+                PREFIX,
+                "orders",
+                "by_user",
+                vec!["user_id".into()],
+                false,
+                None,
+            )
+            .unwrap();
+    }
+    catalog.persist(&mut engine).unwrap();
+    for u in 0..n_users {
+        put(
+            &mut engine,
+            &mut catalog,
+            "users",
+            &format!("u{u:02}"),
+            json!({"name": format!("user{u}")}),
+        );
+    }
+    for (oid, body) in orders {
+        put(&mut engine, &mut catalog, "orders", oid, body.clone());
+    }
+    (dir, engine, catalog)
+}
+
+/// Evaluate a filter the way the storage layer would: against the ZDoc view
+/// of the body, with the document id available for `_id` predicates.
+fn filter_matches_doc(filter: &Filter, doc: &Value, doc_id: &str) -> bool {
+    let zdoc = ZDocBuilder::from_value(doc);
+    filter.matches(ValueView::new(&zdoc), Some(doc_id.as_bytes()))
+}
+
+/// Mirror of `SumState`: integers stay integers until a float shows up.
+fn reference_sum(orders: &[Value]) -> Value {
+    let mut int_sum: i64 = 0;
+    let mut float_sum: f64 = 0.0;
+    let mut is_float = false;
+    for order in orders {
+        match order.get("total") {
+            Some(Value::Number(n)) => {
+                if let Some(i) = n.as_i64() {
+                    if is_float {
+                        float_sum += i as f64;
+                    } else {
+                        int_sum += i;
+                    }
+                } else if let Some(f) = n.as_f64() {
+                    if !is_float {
+                        float_sum = int_sum as f64;
+                        is_float = true;
+                    }
+                    float_sum += f;
+                }
+            }
+            _ => {}
+        }
+    }
+    if is_float {
+        json!(float_sum)
+    } else {
+        json!(int_sum)
+    }
+}
+
+/// The store's read path (`stored_to_doc`) decodes a body through JSON text,
+/// and serde_json's default float parser is not correctly rounded (1 ULP on
+/// some values). Documents returned by the real join carry that shift, so the
+/// reference applies the same text roundtrip to anything it splices in.
+fn json_read_roundtrip(v: &Value) -> Value {
+    serde_json::from_slice(&serde_json::to_vec(v).unwrap()).unwrap()
+}
+
+/// Naive left-outer equi-join: for each user (id order), attach every order
+/// (id order) whose string `user_id` equals the user id and that passes the
+/// inner filter; then apply the post filter to the spliced document; then
+/// optionally group by user id with $sum/$size over the attached array.
+fn reference_rows(
+    n_users: usize,
+    orders: &[(String, Value)],
+    inner: &Filter,
+    post: &Filter,
+    group: bool,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for u in 0..n_users {
+        let uid = format!("u{u:02}");
+        let mut attached = Vec::new();
+        for (oid, body) in orders {
+            let key_matches = matches!(body.get("user_id"), Some(Value::String(s)) if *s == uid);
+            // The inner filter runs against the stored body (original float
+            // bits); only the spliced output goes through the read roundtrip.
+            if !key_matches || !filter_matches_doc(inner, body, oid) {
+                continue;
+            }
+            let mut doc = json_read_roundtrip(body);
+            doc.as_object_mut()
+                .unwrap()
+                .insert("_id".into(), json!(oid));
+            attached.push(doc);
+        }
+        let mut joined = json_read_roundtrip(&json!({"name": format!("user{u}")}));
+        let map = joined.as_object_mut().unwrap();
+        map.insert("_id".into(), json!(uid));
+        map.insert("orders".into(), Value::Array(attached));
+        if !filter_matches_doc(post, &joined, &uid) {
+            continue;
+        }
+        rows.push(joined);
+    }
+    if !group {
+        return rows;
+    }
+    rows.iter()
+        .map(|r| {
+            let orders = r["orders"].as_array().unwrap();
+            json!({"_id": r["_id"].clone(), "spend": reference_sum(orders), "n": orders.len()})
+        })
+        .collect()
+}
+
+fn rows_by_id(rows: &[Value]) -> BTreeMap<String, Value> {
+    rows.iter()
+        .map(|r| (r["_id"].as_str().unwrap().to_string(), r.clone()))
+        .collect()
+}
+
+fn arb_total() -> impl Strategy<Value = Option<Value>> {
+    prop_oneof![
+        3 => (0..1000i64).prop_map(|i| Some(json!(i))),
+        2 => (-500.0f64..500.0).prop_map(|f| Some(json!(f))),
+        1 => Just(Some(json!("oops"))),
+        1 => Just(Some(Value::Null)),
+        1 => Just(None),
+    ]
+}
+
+fn arb_order(n_users: usize) -> impl Strategy<Value = (Option<Value>, Option<Value>, Option<Value>)> {
+    (
+        prop_oneof![
+            6 => (0..n_users).prop_map(|i| Some(json!(format!("u{i:02}")))),
+            1 => Just(Some(json!("u99"))),
+            1 => Just(Some(json!(7))),
+            1 => Just(Some(json!(["u00"]))),
+            1 => Just(None),
+        ],
+        arb_total(),
+        prop_oneof![
+            2 => Just(Some(json!(true))),
+            1 => Just(Some(json!(false))),
+            1 => Just(None),
+        ],
+    )
+}
+
+fn arb_inner_filter() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        2 => Just(json!({})),
+        2 => Just(json!({"flag": true})),
+        2 => (0..100i64).prop_map(|k| json!({"total": {"$gt": k}})),
+        1 => (0..100i64).prop_map(|k| json!({"$and": [{"flag": true}, {"total": {"$gt": k}}]})),
+    ]
+}
+
+fn arb_post_filter() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        2 => Just(json!({})),
+        1 => Just(json!({"orders": []})),
+        1 => Just(json!({"orders": {"$ne": []}})),
+        1 => Just(json!({"orders": {"$elemMatch": {"total": {"$gt": 50}}}})),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn reference_join_matches_inlj_and_hash(
+        (n_users, orders, inner_json, post_json, group) in (1..=12usize).prop_flat_map(|n| {
+            (
+                Just(n),
+                prop::collection::vec(arb_order(n), 0..=40),
+                arb_inner_filter(),
+                arb_post_filter(),
+                any::<bool>(),
+            )
+        }),
+    ) {
+        let orders: Vec<(String, Value)> = orders
+            .into_iter()
+            .enumerate()
+            .map(|(i, (user_id, total, flag))| {
+                let mut body = serde_json::Map::new();
+                if let Some(v) = user_id {
+                    body.insert("user_id".into(), v);
+                }
+                if let Some(v) = total {
+                    body.insert("total".into(), v);
+                }
+                if let Some(v) = flag {
+                    body.insert("flag".into(), v);
+                }
+                (format!("o{i:02}"), Value::Object(body))
+            })
+            .collect();
+
+        let inner = Filter::parse(&inner_json).unwrap();
+        let post = Filter::parse(&post_json).unwrap();
+
+        let mut stages = vec![json!({"$lookup": {
+            "from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders",
+            "filter": inner_json,
+        }})];
+        if post_json != json!({}) {
+            stages.push(json!({"$match": post_json}));
+        }
+        if group {
+            stages.push(json!({"$group": {
+                "_id": "$_id",
+                "spend": {"$sum": "$orders.total"},
+                "n": {"$size": "$orders"}
+            }}));
+        }
+        let pipe = pipeline(Value::Array(stages));
+
+        let expected = reference_rows(n_users, &orders, &inner, &post, group);
+
+        let (_d1, engine, catalog) = seed_scenario(true, n_users, &orders);
+        let inlj = run(&engine, &catalog, "users", &pipe);
+        prop_assert_eq!(rows_by_id(&inlj), rows_by_id(&expected), "INLJ mismatch");
+
+        let (_d2, engine, catalog) = seed_scenario(false, n_users, &orders);
+        let hash = run(&engine, &catalog, "users", &pipe);
+        prop_assert_eq!(rows_by_id(&hash), rows_by_id(&expected), "hash mismatch");
+    }
 }
