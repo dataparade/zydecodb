@@ -464,14 +464,19 @@ Legal shapes:
 - `[$match, $group]`
 - `[$lookup]`
 - `[$lookup, $group]`
+- `[$lookup, $match]`
+- `[$lookup, $match, $group]`
 - `[$match, $lookup]`
 - `[$match, $lookup, $group]`
+- `[$match, $lookup, $match]`
+- `[$match, $lookup, $match, $group]`
 
-`$lookup` appears at most once and never after `$group`. Bare `[$lookup]` (and `[$lookup, $group]`) is a collection scan of the outer side, bounded by `max_scan_docs`.
+`$lookup` appears at most once and never after `$group`. A `$match` directly after `$lookup` runs on the joined documents (outer plus the `as` array); rejected documents are dropped before the `max_memory_bytes` join-state charge and never reach `$group`. Bare `[$lookup]` is a collection scan of the outer side, bounded by `max_scan_docs`.
 
 `$lookup` rules (equality left-outer, same tenant prefix, one snapshot):
 
-- Required keys only: `from`, `localField`, `foreignField`, `as`
+- Required keys: `from`, `localField`, `foreignField`, `as`
+- Optional key: `filter` — a normal filter object applied to inner documents before they are attached. Rejected documents do not count toward `max_matches_per_outer` or `max_hash_bytes`; they still count toward the `max_scan_docs` candidate bound on the hash build.
 - Missing or non-scalar `localField` → empty `as` array
 - Strategy, chosen once before the outer scan:
   - usable inner index (`_id` or leading-field) → indexed nested-loop
@@ -480,15 +485,18 @@ Legal shapes:
 
 `$group` rules:
 
-- `_id` must be JSON `null` (one global bucket) or a single field reference `"$dotted.path"`
+- `_id` must be JSON `null` (one global bucket) or a single field reference `"$dotted.path"`. Group-key paths do NOT walk arrays; the key must resolve to a scalar or `null`.
 - Accumulator fields may only be:
-  - `{"$sum":"$path"}` — missing/non-numeric inputs contribute `0`
+  - `{"$sum":"$path"}` — walks into arrays at every path segment, including the last, and adds every numeric leaf reachable; missing/non-numeric inputs contribute `0`
+  - `{"$size":"$path"}` — adds the length of each array found at the path (non-array or missing contributes `0`)
   - `{"$count":{}}` — counts every document that reaches `$group`
-- After `$lookup`, `$group` sees join-output documents (outer plus the `as` array)
+- After `$lookup`, `$group` sees join-output documents (outer plus the `as` array), so `{"$sum":"$orders.total"}` sums over the joined children
+
+**Path asymmetry:** accumulator paths walk arrays; filter paths (in `$match` and `$lookup filter`) do NOT — that is the shipped `find` contract. To test joined children in a filter use `$elemMatch` (`{"orders": {"$elemMatch": {"total": {"$gt": 500}}}}`), `{"orders": []}` for "no children", or `{"orders": {"$ne": []}}` for "at least one".
 
 Hard parser ceilings (not configurable):
 
-- At most three stages
+- At most four stages
 - At most 16 accumulators
 - Pipeline JSON ≤ 64 KiB
 
@@ -519,8 +527,13 @@ The following remain unsupported and are rejected by the parser:
 
 - `$unwind`, multi-`$lookup`, `pipeline:` / `let:` form
 - Expression languages, window functions, `$facet`
-- Pipelines outside the six legal shapes above
+- `$match` after `$group`, `$limit` / `$sort`
+- Pipelines outside the ten legal shapes above
 - Spilling to disk / unbounded group or hash maps
+
+Servers that predate the `filter` key and post-join `$match` reject those
+shapes with `InvalidValue` (`InvalidRequestError` in the drivers); the
+connection stays open.
 
 ### Client APIs
 
