@@ -6,6 +6,17 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-21
+
+- SSTable reader: footer and index offsets use `checked_add`. A corrupt
+  table with near-`u64::MAX` offsets now returns a named out-of-bounds
+  error instead of panicking in debug or wrapping in release. `decode_index`
+  caps its pre-allocation against the untrusted entry count so a huge
+  count cannot abort the process. Both inputs are seeded in the
+  `sstable_reader` fuzz corpus.
+- Agent pages (`zydecodb --agent`) pin `zydecodb:` to the crate version
+  again. The 1.3.0 tag left them at 1.2.0 and failed `every_topic_renders_under_cap`.
+
 ## [1.3.0] - 2026-09-19
 
 - Bench nightly p99 compare floor is 1000µs so a laptop 5µs baseline cannot

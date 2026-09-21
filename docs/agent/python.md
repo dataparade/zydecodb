@@ -1,5 +1,5 @@
 zydecodb-agent-docs: 1
-zydecodb: 1.3.0
+zydecodb: 1.3.1
 topic: python
 next: query, kv, tx, pitfalls
 
