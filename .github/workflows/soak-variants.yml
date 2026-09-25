@@ -35,15 +35,23 @@ jobs:
             soak_env: "HOT_PCT=100"
           - name: cold-wide
             soak_env: "HOT_PCT=5"
+          - name: join-lookup
+            # Document layer, not KV: $lookup pipelines against a live Engine
+            # while a writer mutates the inner collection. Different harness,
+            # different script. OPS here is the writer pace (upserts/sec), not
+            # the KV op rate — keep it low so readers dominate.
+            soak_script: "scripts/soak-join.sh"
+            soak_env: "OPS=200"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Soak variant ${{ matrix.name }}
         run: |
           set -euo pipefail
-          # Defaults first; matrix soak_env may override OPS.
+          # Defaults first; matrix soak_env may override OPS. join-lookup uses
+          # its own document-layer harness and ignores soak_env.
           env HOURS=0.33 OPS=2000 ${{ matrix.soak_env }} \
-            scripts/soak.sh --no-analyze
+            ${{ matrix.soak_script || 'scripts/soak.sh --no-analyze' }}
       - name: Gate on summary
         run: |
           set -euo pipefail
@@ -54,7 +62,8 @@ jobs:
           s = json.loads(sys.stdin.read())
           assert s['errors'] == 0, f\"op errors: {s['errors']}\"
           assert s['shutdown_ok'], 'shutdown failed'
-          print(f\"variant clean: {s['total_ops']} ops, {s['avg_ops_per_sec']:.0f} ops/s\")
+          rate = f\", {s['avg_ops_per_sec']:.0f} ops/s\" if 'avg_ops_per_sec' in s else ''
+          print(f\"variant clean: {s['total_ops']} ops{rate}\")
           "
       - name: Upload soak breadcrumbs
         if: failure()

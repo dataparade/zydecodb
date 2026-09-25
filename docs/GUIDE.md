@@ -1146,6 +1146,16 @@ Scope by version tier:
   run nightly in between.
 - **Patches (`1.x.y`):** targeted tests for the fix plus green CI.
 
+Every tier, no exceptions:
+
+- [ ] Version bump done with `scripts/bump-version.sh X.Y.Z` (never hand-edits)
+      — it covers the workspace `Cargo.toml`, all three driver manifests, the
+      Go install tag, and the `zydecodb:` header on every `docs/agent/*.md`.
+- [ ] `cargo test -p zydecodb --lib agent::tests::every_topic_renders_under_cap`
+      green **on the release commit** (not only on the feature branch — the
+      1.3.0 tag shipped agent pages pinned at 1.2.0 because this ran before
+      the bump, not after).
+
 Tag publish (`release.yml`) does **not** re-run the long soaks — gates are
 pre-tag only.
 

@@ -134,11 +134,23 @@ fn view_to_scalar(v: &ValueView<'_>) -> DocResult<Option<Value>> {
 }
 
 /// Decode a stored body to a JSON document with the virtual `_id` field
-/// injected (same convention as the find path).
+/// injected (same convention as the find path). ZDoc bodies go through
+/// `ValueView::to_value()` directly — never JSON text — so f64 fields keep
+/// their exact bits. Legacy raw-JSON bodies parse with the workspace
+/// `float_roundtrip` decoder.
 fn stored_to_doc(stored: &[u8], doc_id: &[u8]) -> DocResult<Value> {
-    let bytes = store::stored_to_json_vec(stored)?;
-    let mut doc: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| DocError::Corrupt(format!("invalid stored JSON: {e}")))?;
+    let kind = store::value_kind(stored)?;
+    let payload = store::strip_value_kind(stored);
+    let mut doc = if kind == store::VK_ZDOC {
+        crate::binary::ValueView::new(payload)
+            .to_value()
+            .map_err(|e| {
+                DocError::Corrupt(format!("document {}: {e}", String::from_utf8_lossy(doc_id)))
+            })?
+    } else {
+        serde_json::from_slice(payload)
+            .map_err(|e| DocError::Corrupt(format!("invalid stored JSON: {e}")))?
+    };
     if let Value::Object(map) = &mut doc {
         map.entry(planner::ID_FIELD.to_string())
             .or_insert_with(|| Value::String(String::from_utf8_lossy(doc_id).into_owned()));
@@ -410,4 +422,40 @@ pub fn execute_lookup(
         memory_bytes,
         strategy,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stored ZDoc f64 must survive every server read path with its exact
+    /// bits: the join splice (`stored_to_doc`), the wire emit
+    /// (`stored_to_json_vec`), and a JSON text re-parse (workspace serde_json
+    /// uses `float_roundtrip`). The value below is one the default serde_json
+    /// parser shifts by 1 ULP (verified: bits ...b9 parse as ...b8 without
+    /// the feature).
+    #[test]
+    fn f64_bits_survive_stored_doc_and_json_text_roundtrip() {
+        let f = 6.625958084293548e-77f64;
+        let doc = serde_json::json!({"total": f, "name": "o1"});
+        let zdoc = ZDocBuilder::from_value(&doc);
+        let mut stored = vec![store::VK_ZDOC];
+        stored.extend_from_slice(&zdoc);
+
+        // Join splice path: no JSON text involved.
+        let spliced = stored_to_doc(&stored, b"o1").unwrap();
+        let got = spliced["total"].as_f64().unwrap();
+        assert_eq!(got.to_bits(), f.to_bits(), "stored_to_doc shifted bits");
+        assert_eq!(spliced["_id"], serde_json::json!("o1"));
+
+        // Wire emit + client-side parse of that text.
+        let text = store::stored_to_json_vec(&stored).unwrap();
+        let reparsed: Value = serde_json::from_slice(&text).unwrap();
+        let got = reparsed["total"].as_f64().unwrap();
+        assert_eq!(
+            got.to_bits(),
+            f.to_bits(),
+            "JSON text roundtrip shifted bits"
+        );
+    }
 }

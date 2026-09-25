@@ -72,6 +72,8 @@ tls.key
 !/scripts/run-agent-python-fences.py
 !/scripts/tenant-isolation-soak.sh
 !/scripts/soak.sh
+!/scripts/soak-join.sh
+!/scripts/bump-version.sh
 !/scripts/analyze-soak.py
 !/scripts/vps-soak.sh
 !/scripts/run-engine-ga-24h.sh
