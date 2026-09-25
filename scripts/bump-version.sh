@@ -65,14 +65,25 @@ replace_in_file clients/typescript/package.json \
     '^  "version": "[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?",$' \
     "  \"version\": \"$VER\","
 
-# Lockfile carries the version twice: top-level and packages[""]. Both are
-# 2-space and 6-space indented respectively; rewrite both.
+# Lockfile carries the version twice: top-level and packages[""]. The
+# top-level line is the only 2-space "version" in the file. The packages[""]
+# entry is 6-space indented — but so is every node_modules/* entry, so a
+# bare indented match rewrites dependency versions (this broke the 1.4.0
+# npm publish). Scope the second edit to the `    "": {` block only.
 replace_in_file clients/typescript/package-lock.json \
     '^  "version": "[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?",$' \
     "  \"version\": \"$VER\","
-replace_in_file clients/typescript/package-lock.json \
-    '^      "version": "[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?",$' \
-    "      \"version\": \"$VER\","
+LOCK=clients/typescript/package-lock.json
+if ! grep -qE '^    "": \{$' "$LOCK"; then
+    echo "ERROR: $LOCK: packages[\"\"] block not found" >&2
+    exit 1
+fi
+sed -i -E '/^    "": \{$/,/^    \},?$/ s|^      "version": "[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?",$|      "version": "'"$VER"'",|' "$LOCK"
+# Guard: no node_modules/* dependency entry may carry the release version.
+if grep -A1 '^    "node_modules/' "$LOCK" | grep -qE '^      "version": "'"$VER"'",$'; then
+    echo "ERROR: $LOCK: a dependency entry was rewritten to $VER — refusing" >&2
+    exit 1
+fi
 
 replace_in_file clients/go/README.md \
     'go get github\.com/dataparade/zydecodb/clients/go@v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?' \
