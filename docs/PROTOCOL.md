@@ -232,6 +232,7 @@ indexer.
 | `0x40` | `SessionInit` | Implemented (API-key auth handshake) |
 | `0x41` | `SetContext` | Implemented (admin tenant switch) |
 | `0x42` | `AdminDropTenant` | Implemented (live tenant offboard; admin path) |
+| `0x43` | `AdminSealWal` | Implemented (live WAL seal: rotate + ship; admin path) |
 | `0xF0` | `Ping` | Implemented |
 | `0xF1` | `Stats` | Implemented |
 
@@ -387,6 +388,30 @@ acknowledge before its fsync (see `crates/zydecodb/src/commit.rs`). `relaxed` is
 available on every user write — inserts, replaces, filter-based updates, and
 filter-based deletes. DDL (`IndexDef`) and delete-by-id (`DocDel`) are always
 made durable before acknowledging.
+
+### Shutdown never lies about durability
+
+On shutdown (SIGTERM or the shutdown flag) the server fsyncs everything
+buffered in the WAL **before** releasing connections blocked in a durability
+wait. A `sync`-mode write covered by that final fsync is acknowledged `Ok`. A
+write past that point is answered `EngineBusy` (`server shutting down; write
+not acknowledged; retry`) — never a false `Ok`. Clients and platform tooling
+should retry EngineBusy writes against the new primary; such a write may or
+may not have landed.
+
+### `AdminSealWal` (0x43)
+
+Empty payload; admin role required. Seals the active WAL segment on a live
+server: the segment is rotated, shipped (when `shipping.ship_dir` is
+configured), and archived for change-stream retention. The `Ok` response
+payload is JSON:
+
+- Sealed: `{"sealed":true,"segment":<id>,"seal_seq":<n>,"shipped":<bool>}`
+- Active segment held no records (no-op): `{"sealed":false,"reason":"empty segment"}`
+
+Backup orchestration seals, then snapshots: the snapshot plus shipped WAL is
+current to `seal_seq`. Replicas reject `AdminSealWal` like every write
+command. The CLI equivalent is `zydecodb admin seal --config <path>`.
 
 ---
 
