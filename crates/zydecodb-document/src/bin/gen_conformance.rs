@@ -680,6 +680,13 @@ fn payload_vectors() -> Vec<Value> {
         drop_payload,
     ));
     v.push(req(
+        "admin_seal_wal",
+        "AdminSealWal",
+        json!({}),
+        Command::AdminSealWal,
+        Vec::new(),
+    ));
+    v.push(req(
         "schema_def_reserved",
         "SchemaDef",
         json!({}),

@@ -617,6 +617,14 @@
       "payload_hex": "1111111111111111111111111111111101"
     },
     {
+      "command": 67,
+      "envelope_hex": "014300000000",
+      "input": {},
+      "kind": "AdminSealWal",
+      "name": "admin_seal_wal",
+      "payload_hex": ""
+    },
+    {
       "command": 49,
       "envelope_hex": "013100000000",
       "input": {},

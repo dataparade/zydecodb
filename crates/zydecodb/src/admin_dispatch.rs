@@ -52,6 +52,50 @@ pub fn handle_admin_drop_tenant(
     }
 }
 
+/// `AdminSealWal` payload: empty. Seals the active WAL segment (rotate +
+/// ship) so a following snapshot/backup is current to the seal point.
+pub fn handle_admin_seal_wal(
+    engine: &SharedEngine,
+    req: &RequestEnvelope,
+    session: &SessionState,
+    security: &SecurityRuntime,
+) -> ResponseEnvelope {
+    if security.require_auth && !session.authenticated {
+        return ResponseEnvelope::error(Status::Unauthorized, "authentication required");
+    }
+    if !session.is_admin() {
+        return ResponseEnvelope::error(Status::Forbidden, "admin role required");
+    }
+    if !req.payload.is_empty() {
+        return ResponseEnvelope::error(
+            Status::ProtocolError,
+            "AdminSealWal payload must be empty",
+        );
+    }
+
+    let result = {
+        let mut guard = engine.write();
+        let r = guard.force_roll_wal();
+        let s = guard.take_write_slowdown();
+        (r, s)
+    };
+    Engine::apply_write_slowdown(result.1);
+
+    match result.0 {
+        Ok(Some(out)) => ResponseEnvelope::ok(
+            format!(
+                "{{\"sealed\":true,\"segment\":{},\"seal_seq\":{},\"shipped\":{}}}",
+                out.sealed_segment_id, out.sealed_max_seq, out.shipped
+            )
+            .into_bytes(),
+        ),
+        Ok(None) => {
+            ResponseEnvelope::ok(b"{\"sealed\":false,\"reason\":\"empty segment\"}".to_vec())
+        }
+        Err(e) => ResponseEnvelope::error(Status::Error, &e.to_string()),
+    }
+}
+
 pub fn is_admin_command(cmd: Command) -> bool {
-    matches!(cmd, Command::AdminDropTenant)
+    matches!(cmd, Command::AdminDropTenant | Command::AdminSealWal)
 }

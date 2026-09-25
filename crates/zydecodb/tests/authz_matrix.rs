@@ -278,6 +278,7 @@ fn payload(cmd: Command) -> Vec<u8> {
             p.push(0);
             p
         }
+        Command::AdminSealWal => vec![],
     }
 }
 
@@ -299,7 +300,10 @@ fn is_write(cmd: Command) -> bool {
 }
 
 fn is_admin_only(cmd: Command) -> bool {
-    matches!(cmd, Command::SetContext | Command::AdminDropTenant)
+    matches!(
+        cmd,
+        Command::SetContext | Command::AdminDropTenant | Command::AdminSealWal
+    )
 }
 
 #[test]
@@ -623,6 +627,7 @@ fn all_commands() -> Vec<Command> {
         Command::SessionInit,
         Command::SetContext,
         Command::AdminDropTenant,
+        Command::AdminSealWal,
         Command::Ping,
         Command::Stats,
     ]
@@ -631,7 +636,7 @@ fn all_commands() -> Vec<Command> {
 #[test]
 fn authz_matrix_covers_every_command_variant() {
     // Compile-time-ish exhaustiveness: if Command gains a variant, update all_commands.
-    assert_eq!(all_commands().len(), 26);
+    assert_eq!(all_commands().len(), 27);
     for b in 0u8..=255 {
         if let Some(cmd) = Command::from_u8(b) {
             assert!(

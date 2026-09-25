@@ -66,6 +66,9 @@ pub enum Command {
     SetContext = 0x41,
     /// Admin: drop a tenant's data on a live server (prefix delete + catalog).
     AdminDropTenant = 0x42,
+    /// Admin: seal the active WAL segment on a live server (rotate + ship).
+    /// Empty payload; the response carries a JSON `SealOutcome`.
+    AdminSealWal = 0x43,
     Ping = 0xF0,
     Stats = 0xF1,
 }
@@ -101,6 +104,7 @@ impl Command {
             0x40 => Command::SessionInit,
             0x41 => Command::SetContext,
             0x42 => Command::AdminDropTenant,
+            0x43 => Command::AdminSealWal,
             0xF0 => Command::Ping,
             0xF1 => Command::Stats,
             _ => return None,
@@ -118,6 +122,7 @@ impl Command {
                 | Command::SessionInit
                 | Command::SetContext
                 | Command::AdminDropTenant
+                | Command::AdminSealWal
                 | Command::Ping
                 | Command::Stats
         )

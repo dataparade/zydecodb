@@ -203,6 +203,7 @@ function encodeRequest(v: ReqVector): Buffer {
     case "Ping":
     case "Stats":
     case "SchemaDef":
+    case "AdminSealWal":
       return Buffer.alloc(0);
     case "SetContext":
       return fromHex(s(i, "tenant_hex"));

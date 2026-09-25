@@ -301,6 +301,8 @@ func encodeRequest(t *testing.T, v reqVector) []byte {
 			out = append(out, 0)
 		}
 		return out
+	case "AdminSealWal":
+		return []byte{}
 	default:
 		t.Fatalf("unhandled request kind: %s", v.Kind)
 		return nil

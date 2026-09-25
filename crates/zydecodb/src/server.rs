@@ -1,4 +1,4 @@
-use crate::admin_dispatch::{handle_admin_drop_tenant, is_admin_command};
+use crate::admin_dispatch::{handle_admin_drop_tenant, handle_admin_seal_wal, is_admin_command};
 use crate::commit::CommitCoordinator;
 use crate::config::Config;
 use crate::dispatch::{handle_request, write_response};
@@ -1018,6 +1018,7 @@ fn is_write_command(cmd: Command) -> bool {
             | Command::DocUpdateIfMatch
             | Command::IndexDef
             | Command::AdminDropTenant
+            | Command::AdminSealWal
             | Command::Begin
             | Command::Commit
             | Command::Rollback
@@ -1196,6 +1197,7 @@ fn serve_stream<S: Read + Write>(
                 Command::SessionInit
                     | Command::SetContext
                     | Command::AdminDropTenant
+                    | Command::AdminSealWal
                     | Command::IndexDef
             )
         {
@@ -1278,7 +1280,15 @@ fn serve_stream<S: Read + Write>(
                 }
             }
         } else if is_admin_command(req.command) {
-            handle_admin_drop_tenant(engine, catalog, &req, &session, security)
+            match req.command {
+                Command::AdminDropTenant => {
+                    handle_admin_drop_tenant(engine, catalog, &req, &session, security)
+                }
+                Command::AdminSealWal => {
+                    handle_admin_seal_wal(engine, &req, &session, security)
+                }
+                _ => unreachable!("is_admin_command covered"),
+            }
         } else if req.command.is_document_command() {
             handle_document(engine, catalog, commit, &req, &session, security)
         } else {
