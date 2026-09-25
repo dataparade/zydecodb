@@ -1,5 +1,5 @@
 zydecodb-agent-docs: 1
-zydecodb: 1.3.1
+zydecodb: 1.4.0
 topic: index
 next: python, query, pitfalls
 

@@ -4,7 +4,7 @@ All notable changes to the ZydecoDB server and official drivers are recorded
 here. Version numbers are unified across artifacts; see
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md#releases-and-tagging).
 
-## [Unreleased]
+## [1.4.0] - 2026-09-24
 
 - **New wire opcode `AdminSealWal` (0x43)** and matching CLI `zydecodb admin
   seal --config <path>`: seal the active WAL segment on a live primary
