@@ -145,6 +145,13 @@ enum AdminCommands {
         #[arg(long)]
         live: bool,
     },
+    /// Seal the active WAL segment on a running server (rotate + ship) so a
+    /// following snapshot/backup is current to the seal point. Prints the
+    /// server's JSON outcome. Requires `ZYDECODB_API_KEY` (admin role).
+    Seal {
+        #[arg(long, short)]
+        config: PathBuf,
+    },
     /// Manage per-tenant resource limits (byte cap, request rate).
     Tenant {
         #[command(subcommand)]
@@ -384,6 +391,7 @@ fn main() {
                     zydecodb::admin::drop_tenant(&config, &tenant, compact)
                 }
             }
+            AdminCommands::Seal { config } => zydecodb::admin::seal_live(&config),
             AdminCommands::Tenant { command } => match command {
                 TenantCommands::SetLimit {
                     tenant,
