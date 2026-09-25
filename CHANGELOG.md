@@ -6,6 +6,19 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+- **Behavior change:** JSON floats that previously shifted 1 ULP on a
+  server-side text roundtrip now round-trip exactly. ZDoc f64 fields were
+  always stored bit-exact; the bug was in-process decode through JSON text
+  (the `$lookup` splice re-parsed what it had just serialized). The join
+  splice now decodes ZDoc directly, and workspace serde_json uses its
+  correctly-rounded `float_roundtrip` parser for every JSON text parse
+  (filters, updates, legacy stored bodies, wire decode).
+- CI fuzz-smoke now runs `sstable_reader` and `fuzz_aggregate_exec` on every
+  PR instead of waiting for nightly.
+- New document-layer soak variant `join-lookup` (`scripts/soak-join.sh`):
+  `$lookup` pipelines against a live engine while a writer mutates the inner
+  collection. Runs in the Wednesday soak-variants rotation.
+
 ## [1.3.1] - 2026-09-21
 
 - SSTable reader: footer and index offsets use `checked_add`. A corrupt

@@ -52,6 +52,14 @@ Applications should still pin explicit versions (not `@latest`).
   servers reject them with `InvalidValue` (`InvalidRequestError`); the
   connection stays open.
 
+### Bugfixes that change observable output (allowed in 1.x patches)
+
+A bugfix that makes the server match its own documented semantics may ship in
+a patch even when the wrong behavior was observable. Precedents: the `$sum`
+terminal-array correction, and the JSON float roundtrip fix (stored ZDoc f64
+was always bit-exact; some in-process JSON text decodes shifted values by
+1 ULP — they no longer do).
+
 ### Not part of the driver contract
 
 - Go `internal/proto` wire codecs and opcode constants — applications must not
@@ -190,8 +198,13 @@ patches follow the lighter tiers) — full list in
 - [ ] Wire conformance + restore drill + failover drill + `cargo audit` clean
 - [ ] After `rc.N`: [RC bake](GUIDE.md#rc-bake) (≥1 week) before final `1.0.0`
 
-Bump versions in `Cargo.toml`, `clients/python/pyproject.toml`, and
-`clients/typescript/package.json` on the release commit. Update
+Bump versions on the release commit with `scripts/bump-version.sh X.Y.Z` —
+never by hand. Version identity lives in more places than the crate manifest:
+the workspace `Cargo.toml`, `clients/python/pyproject.toml` +
+`zydecodb/__init__.py`, `clients/typescript/package.json` + lock, the Go
+README install tag, and the `zydecodb:` header on every `docs/agent/*.md`
+(those pages are embedded in the binary via `include_str!`; a mismatch fails
+`agent::tests::every_topic_renders_under_cap`). Update
 [`CHANGELOG.md`](../CHANGELOG.md). Then tag **both** the root and Go module
 tags at that commit and push them together:
 

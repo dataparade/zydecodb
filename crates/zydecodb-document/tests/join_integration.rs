@@ -1687,14 +1687,6 @@ fn reference_sum(orders: &[Value]) -> Value {
     }
 }
 
-/// The store's read path (`stored_to_doc`) decodes a body through JSON text,
-/// and serde_json's default float parser is not correctly rounded (1 ULP on
-/// some values). Documents returned by the real join carry that shift, so the
-/// reference applies the same text roundtrip to anything it splices in.
-fn json_read_roundtrip(v: &Value) -> Value {
-    serde_json::from_slice(&serde_json::to_vec(v).unwrap()).unwrap()
-}
-
 /// Naive left-outer equi-join: for each user (id order), attach every order
 /// (id order) whose string `user_id` equals the user id and that passes the
 /// inner filter; then apply the post filter to the spliced document; then
@@ -1712,18 +1704,16 @@ fn reference_rows(
         let mut attached = Vec::new();
         for (oid, body) in orders {
             let key_matches = matches!(body.get("user_id"), Some(Value::String(s)) if *s == uid);
-            // The inner filter runs against the stored body (original float
-            // bits); only the spliced output goes through the read roundtrip.
             if !key_matches || !filter_matches_doc(inner, body, oid) {
                 continue;
             }
-            let mut doc = json_read_roundtrip(body);
+            let mut doc = body.clone();
             doc.as_object_mut()
                 .unwrap()
                 .insert("_id".into(), json!(oid));
             attached.push(doc);
         }
-        let mut joined = json_read_roundtrip(&json!({"name": format!("user{u}")}));
+        let mut joined = json!({"name": format!("user{u}")});
         let map = joined.as_object_mut().unwrap();
         map.insert("_id".into(), json!(uid));
         map.insert("orders".into(), Value::Array(attached));

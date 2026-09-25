@@ -410,6 +410,11 @@ body.
 The first byte of every stored document value is a `value_kind` tag owned by the
 document layer (`VK_ZDOC = 0x01` = ZDoc binary format, `VK_RAW = 0x00` = Legacy JSON). The new ZDoc format stores nested objects and arrays with length prefixes and sorted key offsets, allowing O(log N) zero-copy field extraction during query filtering.
 
+On-disk ZDoc f64 fields are bit-exact (IEEE 754 bits stored verbatim), and every
+server-side JSON text parse uses serde_json's correctly-rounded `float_roundtrip`
+parser, so a float survives store → read → wire emit → client parse with its
+original bits.
+
 ### ZDoc Performance Trade-offs
 
 There is a slight CPU cost during initial ingestion to compile incoming JSON to the ZDoc binary byte array. However, this unlocks massive CPU and memory savings on read and update paths, as filters can be evaluated directly against binary slices (`ValueView`) without allocating `serde_json::Value` trees. In the future, the ZDoc binary protocol could be exposed directly to the client drivers (Go, TypeScript, Python) to eliminate JSON serialization edge-to-edge.
