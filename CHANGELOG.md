@@ -4,6 +4,14 @@ All notable changes to the ZydecoDB server and official drivers are recorded
 here. Version numbers are unified across artifacts; see
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md#releases-and-tagging).
 
+## [1.4.1] - 2026-09-25
+
+- Release infrastructure only. `scripts/bump-version.sh` over-matched
+  `package-lock.json` (rewrote dependency entries, not just the root
+  version), which broke `npm ci` in the 1.4.0 release job. Lock file
+  repaired; the script now scopes the edit and guards against recurrence.
+  No server or driver changes. 1.4.0 was never published to npm — use 1.4.1.
+
 ## [1.4.0] - 2026-09-24
 
 - **New wire opcode `AdminSealWal` (0x43)** and matching CLI `zydecodb admin
