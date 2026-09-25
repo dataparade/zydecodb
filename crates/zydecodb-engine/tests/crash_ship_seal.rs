@@ -69,7 +69,7 @@ fn run_ship_failpoint(fp: &str) {
     {
         let mut e = open(&dir, hmac);
         e.put(uk(b"mid"), b"2".to_vec(), 0).unwrap();
-        let _ = e.force_roll_wal_for_test();
+        let _ = e.force_roll_wal();
     }
     fail::remove(fp);
 
@@ -77,7 +77,7 @@ fn run_ship_failpoint(fp: &str) {
     {
         let mut e = open(&dir, hmac);
         e.put(uk(b"post"), b"3".to_vec(), 0).unwrap();
-        let _ = e.force_roll_wal_for_test();
+        let _ = e.force_roll_wal();
     }
 
     assert_shipped_log_consistent(&dir.path().join("ship"), hmac);
