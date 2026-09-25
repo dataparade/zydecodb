@@ -417,8 +417,9 @@ fn live_admin_connect(config: &Path, op: &str) -> Result<LiveConn, String> {
     use zydecodb_engine::frame::{Command, RequestEnvelope};
 
     let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
-    let admin_key = std::env::var("ZYDECODB_API_KEY")
-        .map_err(|_| format!("live {op} requires ZYDECODB_API_KEY (admin role) in the environment"))?;
+    let admin_key = std::env::var("ZYDECODB_API_KEY").map_err(|_| {
+        format!("live {op} requires ZYDECODB_API_KEY (admin role) in the environment")
+    })?;
 
     let mut stream = if let Some(ref uds) = cfg.listen_unix {
         LiveConn::Unix(

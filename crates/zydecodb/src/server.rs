@@ -826,8 +826,6 @@ impl Server {
         // (closing the handle unblocks it if no signal ever arrived), then wake any
         // connection threads blocked on durability so they can observe shutdown and
         // exit, drain them and the background threads, and perform the final flush.
-        // `Engine::shutdown` performs the final fsync, so writes that a waiter
-        // unblocked from on shutdown are still made durable before the process exits.
         let _ = poller.delete(&listener);
         if let Some((ref l, ref path)) = uds_listener {
             let _ = poller.delete(l);
@@ -838,6 +836,15 @@ impl Server {
         // Wake the timer threads now so they exit immediately rather than at their
         // next tick, regardless of how shutdown was triggered.
         self.wake.notify_all();
+        // Final durability point BEFORE releasing durability waiters: fsync
+        // everything buffered so a waiter whose seq made it can be
+        // acknowledged honestly (via the WalSync watermark). A waiter past
+        // that point is released by `commit.stop()` with a retryable
+        // EngineBusy, never a false Ok. Log and continue on error — shutdown
+        // must proceed.
+        if let Err(e) = engine.write().sync_wal() {
+            error!(error = %e, "final WAL sync during shutdown failed");
+        }
         commit.stop();
         for h in conns {
             let _ = h.join();
@@ -1284,9 +1291,7 @@ fn serve_stream<S: Read + Write>(
                 Command::AdminDropTenant => {
                     handle_admin_drop_tenant(engine, catalog, &req, &session, security)
                 }
-                Command::AdminSealWal => {
-                    handle_admin_seal_wal(engine, &req, &session, security)
-                }
+                Command::AdminSealWal => handle_admin_seal_wal(engine, &req, &session, security),
                 _ => unreachable!("is_admin_command covered"),
             }
         } else if req.command.is_document_command() {
