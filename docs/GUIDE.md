@@ -850,6 +850,25 @@ target share a filesystem; use copy across mounts (slower, byte-proportional).
 For capacity planning, time a restore of a production-sized snapshot + your
 typical shipped-WAL lag on the restore host; do not extrapolate only from CI.
 
+### Sealing the WAL before a backup
+
+`admin snapshot` captures SSTables; the **active** WAL segment is not shipped
+until it fills and rotates on its own. To make a backup current to a known
+point, seal first:
+
+```bash
+export ZYDECODB_API_KEY="zdk_..."   # admin role
+zydecodb admin seal --config /etc/zydecodb/config.toml
+# {"sealed":true,"segment":41,"seal_seq":189222,"shipped":true}
+```
+
+The seal rotates the active segment, ships it to `ship_dir`, and archives it
+for change-stream retention, then prints the outcome as JSON. Gate the
+snapshot on `"sealed":true`; `"sealed":false` means the active segment was
+empty (nothing to ship — the previous seal already covers you). Restore with
+`admin restore --base <snapshot> --wal <ship_dir>` and the backup is current
+to `seal_seq`. Replicas reject seal requests like every write command.
+
 ### What this does NOT do (scope)
 
 - No object-store client, no async uploader, no encryption — the sidecar owns

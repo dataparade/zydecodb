@@ -156,6 +156,7 @@ fn forbidden_on_replica() -> Vec<(Command, Vec<u8>)> {
             p.push(0);
             p
         }),
+        (Command::AdminSealWal, vec![]),
         (Command::Begin, vec![]),
         (Command::Commit, vec![]),
         (Command::Rollback, vec![]),
@@ -254,6 +255,7 @@ fn replica_forbidden_list_is_complete() {
         Command::DocUpdateIfMatch,
         Command::IndexDef,
         Command::AdminDropTenant,
+        Command::AdminSealWal,
         Command::Begin,
         Command::Commit,
         Command::Rollback,
@@ -262,5 +264,5 @@ fn replica_forbidden_list_is_complete() {
     ] {
         assert!(cmds.contains(&expected), "missing {expected:?}");
     }
-    assert_eq!(cmds.len(), 15);
+    assert_eq!(cmds.len(), 16);
 }

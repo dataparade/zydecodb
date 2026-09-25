@@ -42,15 +42,15 @@ fn restore_to_seq_lands_on_exact_sequence() {
 
     e.put(uk(b"a"), b"1".to_vec(), 0).unwrap();
     let s_a = e.current_seq();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
 
     e.put(uk(b"b"), b"2".to_vec(), 0).unwrap();
     let s_b = e.current_seq();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
 
     e.put(uk(b"c"), b"3".to_vec(), 0).unwrap();
     let _s_c = e.current_seq();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
     e.shutdown().unwrap();
 
     admin::restore(&snap, &ship, Some(s_b), None, &out).expect("restore to-seq");
@@ -87,10 +87,10 @@ fn restore_clears_marker_and_wipes_ceiling_wal() {
     e.snapshot_to(&snap).unwrap();
 
     e.put(uk(b"a"), b"1".to_vec(), 0).unwrap();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
     e.put(uk(b"b"), b"2".to_vec(), 0).unwrap();
     let s_b = e.current_seq();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
     e.shutdown().unwrap();
 
     // Stale junk in the output WAL dir must be wiped, not silently kept.
@@ -138,17 +138,17 @@ fn restore_to_time_is_best_effort_via_timeindex() {
 
     e.put(uk(b"a"), b"1".to_vec(), 0).unwrap();
     let s_a = e.current_seq();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
     shipping::append_timeindex(&ship, t0, s_a).unwrap();
 
     e.put(uk(b"b"), b"2".to_vec(), 0).unwrap();
     let s_b = e.current_seq();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
     shipping::append_timeindex(&ship, t0 + 5_000, s_b).unwrap();
 
     e.put(uk(b"c"), b"3".to_vec(), 0).unwrap();
     let s_c = e.current_seq();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
     shipping::append_timeindex(&ship, t0 + 10_000, s_c).unwrap();
     e.shutdown().unwrap();
 

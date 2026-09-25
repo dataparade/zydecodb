@@ -122,7 +122,7 @@ def _encode_request(kind: str, inp: dict) -> bytes:
         return proto.encode_watch(inp["collection"], resume)
     if kind == "SessionInit":
         return inp["api_key"].encode("utf-8")
-    if kind in ("Ping", "Stats", "SchemaDef", "Begin", "Commit", "Rollback"):
+    if kind in ("Ping", "Stats", "SchemaDef", "Begin", "Commit", "Rollback", "AdminSealWal"):
         return b""
     if kind == "SetContext":
         return bytes.fromhex(inp["tenant_hex"])

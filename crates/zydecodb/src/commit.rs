@@ -39,37 +39,67 @@ use zydecodb_engine::errors::{EngineError, Status};
 use zydecodb_engine::frame::ResponseEnvelope;
 use zydecodb_engine::wal_sync::WalSync;
 
-/// The WAL fsync thread failed. The write this was returned for is not known
-/// to be durable, and the coordinator refuses all further writes.
+/// A write could not be acknowledged as durable. Two flavors, distinguished
+/// by `status`:
+/// - the WAL fsync thread failed (`Status::IoError`): the write is not known
+///   to be durable, and the coordinator refuses all further writes;
+/// - the server shut down before the write was fsynced (`Status::EngineBusy`):
+///   the write was not acknowledged and the client should retry against the
+///   new primary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitError {
-    /// The underlying I/O error text from the first failed fsync.
+    /// The underlying I/O error text from the first failed fsync, or the
+    /// shutdown explanation.
     pub reason: String,
+    /// Wire status for this failure.
+    pub status: Status,
 }
 
 impl fmt::Display for CommitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "WAL fsync failed ({}); write not durable; writes refused until restart",
-            self.reason
-        )
+        match self.status {
+            Status::EngineBusy => write!(f, "{}", self.reason),
+            _ => write!(
+                f,
+                "WAL fsync failed ({}); write not durable; writes refused until restart",
+                self.reason
+            ),
+        }
     }
 }
 
 impl std::error::Error for CommitError {}
 
 impl CommitError {
+    fn io(reason: String) -> Self {
+        CommitError {
+            reason,
+            status: Status::IoError,
+        }
+    }
+
+    /// Shutdown released a durability waiter whose seq never made it to disk.
+    /// Retryable: the client (or platform) must re-issue the write.
+    fn shutdown() -> Self {
+        CommitError {
+            reason: "server shutting down; write not acknowledged; retry".to_string(),
+            status: Status::EngineBusy,
+        }
+    }
+
     /// Wire response for a write refused or unacknowledged because of a
-    /// coordinator failure.
+    /// coordinator failure or shutdown.
     pub fn to_response(&self) -> ResponseEnvelope {
-        ResponseEnvelope::error(Status::IoError, &self.to_string())
+        ResponseEnvelope::error(self.status, &self.to_string())
     }
 }
 
 impl From<CommitError> for EngineError {
     fn from(e: CommitError) -> Self {
-        EngineError::Io(e.to_string())
+        match e.status {
+            Status::EngineBusy => EngineError::EngineBusy(e.to_string()),
+            _ => EngineError::Io(e.to_string()),
+        }
     }
 }
 
@@ -169,9 +199,9 @@ impl CommitCoordinator {
             return None;
         }
         let st = self.state.lock().unwrap();
-        st.failed.as_ref().map(|reason| CommitError {
-            reason: reason.clone(),
-        })
+        st.failed
+            .as_ref()
+            .map(|reason| CommitError::io(reason.clone()))
     }
 
     /// Lock-free check for the server's per-request write gate.
@@ -245,34 +275,42 @@ impl CommitCoordinator {
         durable
     }
 
-    /// Block until `seq` is fsynced, or the coordinator is shutting down (in
-    /// which case `Engine::shutdown` provides the final durability point), or
+    /// Block until `seq` is fsynced, or the coordinator is shutting down, or
     /// the fsync thread has failed (`Err`: `seq` is not known to be durable).
+    ///
+    /// Shutdown is not a durability point: a waiter released by `stop()`
+    /// whose seq was never fsynced gets a retryable `EngineBusy` error, never
+    /// a false `Ok`. The durable watermark consults `WalSync` directly because
+    /// the shutdown path's final `Engine::sync_wal` advances only that
+    /// watermark, not `st.synced_seq` — a write covered by the final sync must
+    /// still be acknowledged.
     fn await_durable(&self, seq: u64) -> Result<(), CommitError> {
         let mut st = self.state.lock().unwrap();
-        if st.synced_seq >= seq {
+        if st.synced_seq.max(self.wal_sync.synced_seq()) >= seq {
             return Ok(());
         }
         if let Some(reason) = &st.failed {
-            return Err(CommitError {
-                reason: reason.clone(),
-            });
+            return Err(CommitError::io(reason.clone()));
+        }
+        if st.shutdown {
+            return Err(CommitError::shutdown());
         }
         if seq > st.requested_seq {
             st.requested_seq = seq;
         }
         self.work.notify_one();
-        while st.synced_seq < seq && !st.shutdown && st.failed.is_none() {
+        while st.synced_seq.max(self.wal_sync.synced_seq()) < seq
+            && !st.shutdown
+            && st.failed.is_none()
+        {
             st = self.done.wait(st).unwrap();
         }
-        if st.synced_seq >= seq {
+        if st.synced_seq.max(self.wal_sync.synced_seq()) >= seq {
             return Ok(());
         }
         match &st.failed {
-            Some(reason) => Err(CommitError {
-                reason: reason.clone(),
-            }),
-            None => Ok(()),
+            Some(reason) => Err(CommitError::io(reason.clone())),
+            None => Err(CommitError::shutdown()),
         }
     }
 
@@ -524,6 +562,71 @@ mod tests {
         }
         assert!(durable, "periodic coordinator never fsynced the write");
         coord.stop();
+    }
+
+    /// F5: shutdown with a buffered, never-fsynced write must NOT acknowledge
+    /// it. The client gets a retryable EngineBusy, not a false Ok.
+    #[test]
+    fn stop_with_unsynced_write_errors_instead_of_acknowledging() {
+        let engine = temp_engine();
+        let coord = CommitCoordinator::new(&engine, DurabilityMode::Sync);
+        let _h = coord.spawn().unwrap();
+        let seq = {
+            let mut e = engine.write();
+            e.put(b"\x01k".to_vec(), b"v".to_vec(), 0).unwrap()
+        };
+        // Shutdown before any fsync: the write is buffered, not durable. The
+        // coordinator thread never synced (nothing nudged it), so this is
+        // deterministic.
+        coord.stop();
+        let err = coord.commit(seq, false).unwrap_err();
+        assert_eq!(err.to_response().status, Status::EngineBusy);
+    }
+
+    /// F5: a waiter blocked in `await_durable` when `stop()` fires must be
+    /// released with a retryable error, not a false Ok.
+    #[test]
+    fn blocked_waiter_released_by_stop_gets_retryable_error() {
+        // No coordinator thread: nothing ever fsyncs, so the waiter stays
+        // blocked until stop() releases it.
+        let engine = temp_engine();
+        let coord = CommitCoordinator::new(&engine, DurabilityMode::Sync);
+        let seq = {
+            let mut e = engine.write();
+            e.put(b"\x01k".to_vec(), b"v".to_vec(), 0).unwrap()
+        };
+        let c2 = Arc::clone(&coord);
+        let waiter = thread::spawn(move || c2.commit(seq, false));
+        // Wait until the waiter has registered its request before stopping.
+        for _ in 0..100 {
+            if coord.state.lock().unwrap().requested_seq >= seq {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        coord.stop();
+        let err = waiter.join().unwrap().unwrap_err();
+        assert_eq!(err.to_response().status, Status::EngineBusy);
+        assert!(err.to_string().contains("retry"));
+    }
+
+    /// The honest-ack counterpart: the server's shutdown path fsyncs through
+    /// the engine BEFORE stopping the coordinator, which advances only the
+    /// `WalSync` watermark. A write covered by that final sync is durable, so
+    /// its ack must still be Ok even though the coordinator never published
+    /// the seq into its own state.
+    #[test]
+    fn stop_after_final_engine_sync_still_acknowledges_durable_write() {
+        let engine = temp_engine();
+        let coord = CommitCoordinator::new(&engine, DurabilityMode::Sync);
+        let _h = coord.spawn().unwrap();
+        let seq = {
+            let mut e = engine.write();
+            e.put(b"\x01k".to_vec(), b"v".to_vec(), 0).unwrap()
+        };
+        engine.write().sync_wal().unwrap();
+        coord.stop();
+        coord.commit(seq, false).unwrap();
     }
 
     #[test]

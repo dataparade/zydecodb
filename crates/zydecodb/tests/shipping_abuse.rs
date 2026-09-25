@@ -82,7 +82,7 @@ fn test_shipping_abuse_corrupted_segment() {
             expires_at: 0,
         }])
         .unwrap();
-    primary_engine.force_roll_wal_for_test().unwrap(); // Forces segment rotation and shipping
+    primary_engine.force_roll_wal().unwrap(); // Forces segment rotation and shipping
 
     // Write segment 2
     primary_engine
@@ -92,7 +92,7 @@ fn test_shipping_abuse_corrupted_segment() {
             expires_at: 0,
         }])
         .unwrap();
-    primary_engine.force_roll_wal_for_test().unwrap();
+    primary_engine.force_roll_wal().unwrap();
 
     // 2. Adversary corrupts segment 2
     let ship_dir = primary_cfg.shipping.ship_dir.as_ref().unwrap();
@@ -154,7 +154,7 @@ fn test_shipping_abuse_out_of_order_manifest() {
             expires_at: 0,
         }])
         .unwrap();
-    primary_engine.force_roll_wal_for_test().unwrap(); // seg 1
+    primary_engine.force_roll_wal().unwrap(); // seg 1
 
     primary_engine
         .write_batch(vec![zydecodb_engine::engine::BatchOp::Put {
@@ -163,7 +163,7 @@ fn test_shipping_abuse_out_of_order_manifest() {
             expires_at: 0,
         }])
         .unwrap();
-    primary_engine.force_roll_wal_for_test().unwrap(); // seg 2
+    primary_engine.force_roll_wal().unwrap(); // seg 2
 
     // Adversary modifies shipped.log to list segment 2 before segment 1
     let ship_dir = &primary_cfg.shipping.ship_dir;

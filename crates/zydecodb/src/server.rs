@@ -1,4 +1,4 @@
-use crate::admin_dispatch::{handle_admin_drop_tenant, is_admin_command};
+use crate::admin_dispatch::{handle_admin_drop_tenant, handle_admin_seal_wal, is_admin_command};
 use crate::commit::CommitCoordinator;
 use crate::config::Config;
 use crate::dispatch::{handle_request, write_response};
@@ -826,8 +826,6 @@ impl Server {
         // (closing the handle unblocks it if no signal ever arrived), then wake any
         // connection threads blocked on durability so they can observe shutdown and
         // exit, drain them and the background threads, and perform the final flush.
-        // `Engine::shutdown` performs the final fsync, so writes that a waiter
-        // unblocked from on shutdown are still made durable before the process exits.
         let _ = poller.delete(&listener);
         if let Some((ref l, ref path)) = uds_listener {
             let _ = poller.delete(l);
@@ -838,6 +836,15 @@ impl Server {
         // Wake the timer threads now so they exit immediately rather than at their
         // next tick, regardless of how shutdown was triggered.
         self.wake.notify_all();
+        // Final durability point BEFORE releasing durability waiters: fsync
+        // everything buffered so a waiter whose seq made it can be
+        // acknowledged honestly (via the WalSync watermark). A waiter past
+        // that point is released by `commit.stop()` with a retryable
+        // EngineBusy, never a false Ok. Log and continue on error — shutdown
+        // must proceed.
+        if let Err(e) = engine.write().sync_wal() {
+            error!(error = %e, "final WAL sync during shutdown failed");
+        }
         commit.stop();
         for h in conns {
             let _ = h.join();
@@ -1018,6 +1025,7 @@ fn is_write_command(cmd: Command) -> bool {
             | Command::DocUpdateIfMatch
             | Command::IndexDef
             | Command::AdminDropTenant
+            | Command::AdminSealWal
             | Command::Begin
             | Command::Commit
             | Command::Rollback
@@ -1196,6 +1204,7 @@ fn serve_stream<S: Read + Write>(
                 Command::SessionInit
                     | Command::SetContext
                     | Command::AdminDropTenant
+                    | Command::AdminSealWal
                     | Command::IndexDef
             )
         {
@@ -1278,7 +1287,13 @@ fn serve_stream<S: Read + Write>(
                 }
             }
         } else if is_admin_command(req.command) {
-            handle_admin_drop_tenant(engine, catalog, &req, &session, security)
+            match req.command {
+                Command::AdminDropTenant => {
+                    handle_admin_drop_tenant(engine, catalog, &req, &session, security)
+                }
+                Command::AdminSealWal => handle_admin_seal_wal(engine, &req, &session, security),
+                _ => unreachable!("is_admin_command covered"),
+            }
         } else if req.command.is_document_command() {
             handle_document(engine, catalog, commit, &req, &session, security)
         } else {

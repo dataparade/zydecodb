@@ -45,6 +45,7 @@ const (
 	CmdSessionInit      byte = 0x40
 	CmdSetContext       byte = 0x41
 	CmdAdminDropTenant  byte = 0x42
+	CmdAdminSealWal     byte = 0x43
 	CmdPing             byte = 0xF0
 	CmdStats            byte = 0xF1
 )

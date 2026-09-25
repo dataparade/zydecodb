@@ -130,7 +130,7 @@ fn batch_crash_after_wal_append_is_all_or_nothing() {
     let _ = batch_err;
 
     let mut e = open(&dir);
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
     let ids = logical_docs(&e);
     let has_a = ids.iter().any(|id| id.as_slice() == b"a");
     let has_b = ids.iter().any(|id| id.as_slice() == b"b");

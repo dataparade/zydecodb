@@ -38,7 +38,7 @@ fn ttl_compaction_does_not_drop_retained_changelog_segments() {
     // Durable user writes, then seal so they land in the change-log archive.
     e.put(uk(b"keep"), b"v".to_vec(), 0).unwrap();
     e.sync_wal().unwrap();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
 
     let token_seq = e.current_seq();
     let db_id = e.database_id_for_change_log();
@@ -57,7 +57,7 @@ fn ttl_compaction_does_not_drop_retained_changelog_segments() {
     e.force_flush().unwrap();
     let _ = e.compact_once();
     e.drain_compaction().unwrap();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
 
     let cfg = e.change_log_config().unwrap().clone();
     let mut manifest = e.change_log_manifest().unwrap().clone();

@@ -273,13 +273,13 @@ fn sealed_segment_max_seq_cache_drives_truncation() {
     e.put(uk(b"b"), b"2".to_vec(), 0).unwrap();
     let seq_after_seg1 = e.seq_peek().saturating_sub(1);
     let seg1_id = e.active_wal_id;
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
 
     // Segment 2.
     e.put(uk(b"c"), b"3".to_vec(), 0).unwrap();
     let seq_after_seg2 = e.seq_peek().saturating_sub(1);
     let seg2_id = e.active_wal_id;
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
 
     // Segment 3 is the new active; nothing in it yet.
     let snap = e.sealed_segment_max_seq_snapshot();
@@ -301,6 +301,61 @@ fn sealed_segment_max_seq_cache_drives_truncation() {
     );
     // Active segment id must not change across flush; flush does not roll.
     assert_eq!(e.active_wal_id, active_before_flush);
+}
+
+#[test]
+fn on_demand_seal_empty_segment_is_noop_and_ships_verifiable_entry() {
+    let dir = TempDir::new().unwrap();
+    let ship = dir.path().join("ship");
+    std::fs::create_dir_all(&ship).unwrap();
+    let mut e = Engine::open(EngineConfig {
+        data_dir: dir.path().join("data"),
+        wal_dir: dir.path().join("data/wal"),
+        ..Default::default()
+    })
+    .unwrap()
+    .with_shipping(Some(ship.clone()), crate::shipping::ShipMode::Copy);
+
+    // A brand-new engine's active segment holds only its 9-byte header:
+    // sealing it must be a no-op (no roll, no shipped entry).
+    let fresh_id = e.active_wal_id;
+    e.force_roll_wal().unwrap();
+    assert_eq!(e.active_wal_id, fresh_id, "empty seal must not roll");
+    assert!(
+        crate::shipping::read_shipped_log(&ship).unwrap().is_empty(),
+        "empty seal must not append to shipped.log"
+    );
+
+    e.put(uk(b"k1"), b"v1".to_vec(), 0).unwrap();
+    e.put(uk(b"k2"), b"v2".to_vec(), 0).unwrap();
+    e.force_roll_wal().unwrap();
+
+    let entries = crate::shipping::read_shipped_log(&ship).unwrap();
+    assert_eq!(entries.len(), 1, "seal must append one shipped.log entry");
+    let entry = &entries[0];
+    let shipped_seg = ship.join(crate::wal::segment_filename(entry.segment_id));
+    assert!(shipped_seg.is_file(), "shipped segment must exist");
+    assert!(
+        crate::shipping::verify_entry(&shipped_seg, entry, None).unwrap(),
+        "shipped segment sha256 must verify"
+    );
+
+    // Second seal with no intervening writes: no new shipped entry.
+    e.force_roll_wal().unwrap();
+    let entries = crate::shipping::read_shipped_log(&ship).unwrap();
+    assert_eq!(entries.len(), 1, "seal of an empty segment must be a no-op");
+
+    // Everything written up to the seal replays on reopen.
+    drop(e);
+    let mut e2 = Engine::open(EngineConfig {
+        data_dir: dir.path().join("data"),
+        wal_dir: dir.path().join("data/wal"),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(e2.get(&uk(b"k1")).unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(e2.get(&uk(b"k2")).unwrap(), Some(b"v2".to_vec()));
+    e2.shutdown().unwrap();
 }
 
 #[test]
@@ -506,11 +561,11 @@ fn recovery_rebuilds_sealed_segment_cache() {
         e.put(uk(b"a"), b"1".to_vec(), 0).unwrap();
         let s1 = e.active_wal_id;
         let m1 = e.seq_peek().saturating_sub(1);
-        e.force_roll_wal_for_test().unwrap();
+        e.force_roll_wal().unwrap();
         e.put(uk(b"b"), b"2".to_vec(), 0).unwrap();
         let s2 = e.active_wal_id;
         let m2 = e.seq_peek().saturating_sub(1);
-        e.force_roll_wal_for_test().unwrap();
+        e.force_roll_wal().unwrap();
         // leave a write in the new active too, no flush
         e.put(uk(b"c"), b"3".to_vec(), 0).unwrap();
         (s1, m1, s2, m2)

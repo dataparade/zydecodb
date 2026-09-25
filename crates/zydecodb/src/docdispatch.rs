@@ -941,9 +941,13 @@ mod tests {
             "durable update must block while no fsync thread is running"
         );
 
-        // Releasing the coordinator unblocks the parked durable write.
+        // Stopping the coordinator releases the parked durable write with a
+        // retryable EngineBusy — the write was never fsynced, so acknowledging
+        // it would be a lie (F5). The error may surface as the response status
+        // or as an Err; either way the wire-visible status is EngineBusy.
         fx.commit.stop();
-        assert_eq!(h.join().unwrap().unwrap(), Status::Ok);
+        let status = h.join().unwrap().unwrap_or_else(|e| e.status());
+        assert_eq!(status, Status::EngineBusy);
         assert!(done.load(Ordering::SeqCst));
     }
 

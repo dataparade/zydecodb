@@ -686,24 +686,41 @@ impl Engine {
         Ok(())
     }
 
-    /// Test-only: force the active WAL segment to seal as if it had hit the
-    /// size threshold. Mirrors the roll path in `append_wal_buffered` so the
-    /// `sealed_segment_max_seq` cache and ship-out semantics get exercised
-    /// without needing to actually write `WAL_SEGMENT_SIZE` bytes.
-    pub fn force_roll_wal_for_test(&mut self) -> EngineResult<()> {
-        if self.active_wal_size == 0 {
-            return Ok(()); // mirror should_roll: empty segments don't roll
+    /// Force the active WAL segment to seal as if it had hit the size
+    /// threshold: sync, record the sealed max seq, ship, archive, then open
+    /// the next segment. This is the production on-demand seal behind
+    /// `admin seal` — callers gate backups on the ship having happened, so
+    /// ship/archive errors propagate instead of being logged and dropped.
+    /// Seal is file rotation only: it does not freeze or flush the memtable
+    /// and does not touch the MANIFEST.
+    ///
+    /// Returns `None` when the active segment holds no records (header only):
+    /// sealing an empty segment would ship a 9-byte file and append a useless
+    /// `shipped.log` entry, so it is a no-op.
+    ///
+    /// Must be called with the engine write lock held; concurrent appends
+    /// serialize on that lock, so a roll loses nothing.
+    pub fn force_roll_wal(&mut self) -> EngineResult<Option<SealOutcome>> {
+        // `active_wal_size` starts at SEGMENT_HEADER_LEN (the 9-byte header),
+        // never 0 — the empty check must compare against the header.
+        if self.active_wal_size <= wal::SEGMENT_HEADER_LEN {
+            return Ok(None);
         }
         self.sync_wal()?;
         let sealed_id = self.active_wal_id;
         let sealed_max = self.wal_sync.buffered_seq();
         self.sealed_segment_max_seq.insert(sealed_id, sealed_max);
-        // Propagate ship/archive errors so failpoint return-mode is observable.
-        // Production roll paths keep best-effort logging via ship_sealed_segment.
+        let shipped = self.ship_dir.is_some();
         self.ship_sealed_segment_result(sealed_id)?;
         self.archive_sealed_segment_result(sealed_id, sealed_max)?;
         self.active_wal_id += 1;
-        self.open_new_wal_segment()
+        self.open_new_wal_segment()?;
+        self.refresh_topology_gauges();
+        Ok(Some(SealOutcome {
+            sealed_segment_id: sealed_id,
+            sealed_max_seq: sealed_max,
+            shipped,
+        }))
     }
 }
 

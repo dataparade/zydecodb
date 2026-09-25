@@ -117,6 +117,20 @@ struct LoadedSstable {
     reader: Arc<SstableReader>,
 }
 
+/// What a successful on-demand seal (`Engine::force_roll_wal`) did. Callers
+/// that gate backups on a seal (the `admin seal` path) need all three fields:
+/// which segment, up to which seq, and whether it left the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealOutcome {
+    /// The segment that was sealed and rotated away from.
+    pub sealed_segment_id: u64,
+    /// Highest seq contained in the sealed segment.
+    pub sealed_max_seq: u64,
+    /// Whether the sealed segment was shipped into `ship_dir` (false when
+    /// shipping is not configured — the seal still happened).
+    pub shipped: bool,
+}
+
 /// One operation in an atomic [`Engine::write_batch`]: a put (with optional
 /// `expires_at`, `0` = none) or a delete. Keys are full storage keys in the
 /// user keyspace, exactly as for [`Engine::put`] / [`Engine::del`].

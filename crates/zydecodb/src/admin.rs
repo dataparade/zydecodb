@@ -382,60 +382,54 @@ pub fn drop_tenant(config: &Path, tenant_hex: &str, compact: bool) -> Result<(),
     Ok(())
 }
 
-/// Live offboard: connect to a running server and issue `AdminDropTenant`.
-/// Prefers `listen_unix` from the config when set; otherwise TCP `listen`.
-/// Requires `ZYDECODB_API_KEY` (admin role) in the environment.
-pub fn drop_tenant_live(config: &Path, tenant_hex: &str, compact: bool) -> Result<(), String> {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::os::unix::net::UnixStream;
+enum LiveConn {
+    Tcp(std::net::TcpStream),
+    Unix(std::os::unix::net::UnixStream),
+}
+impl std::io::Read for LiveConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            LiveConn::Tcp(s) => s.read(buf),
+            LiveConn::Unix(s) => s.read(buf),
+        }
+    }
+}
+impl std::io::Write for LiveConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            LiveConn::Tcp(s) => s.write(buf),
+            LiveConn::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            LiveConn::Tcp(s) => s.flush(),
+            LiveConn::Unix(s) => s.flush(),
+        }
+    }
+}
+
+/// Connect to a running server (UDS from `listen_unix` when set, else TCP
+/// `listen`) and authenticate with `ZYDECODB_API_KEY` (admin role).
+fn live_admin_connect(config: &Path, op: &str) -> Result<LiveConn, String> {
+    use std::io::Write;
     use zydecodb_engine::errors::Status;
     use zydecodb_engine::frame::{Command, RequestEnvelope};
 
-    let tenant = parse_tenant_hex(tenant_hex).map_err(|e| e.to_string())?;
     let cfg = Config::from_file(config).map_err(|e| e.to_string())?;
     let admin_key = std::env::var("ZYDECODB_API_KEY").map_err(|_| {
-        "live drop-tenant requires ZYDECODB_API_KEY (admin role) in the environment".to_string()
+        format!("live {op} requires ZYDECODB_API_KEY (admin role) in the environment")
     })?;
 
-    let mut payload = Vec::with_capacity(17);
-    payload.extend_from_slice(&tenant);
-    payload.push(if compact { 1 } else { 0 });
-
-    enum Conn {
-        Tcp(TcpStream),
-        Unix(UnixStream),
-    }
-    impl Read for Conn {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            match self {
-                Conn::Tcp(s) => s.read(buf),
-                Conn::Unix(s) => s.read(buf),
-            }
-        }
-    }
-    impl Write for Conn {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            match self {
-                Conn::Tcp(s) => s.write(buf),
-                Conn::Unix(s) => s.write(buf),
-            }
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            match self {
-                Conn::Tcp(s) => s.flush(),
-                Conn::Unix(s) => s.flush(),
-            }
-        }
-    }
-
     let mut stream = if let Some(ref uds) = cfg.listen_unix {
-        Conn::Unix(
-            UnixStream::connect(uds).map_err(|e| format!("connect unix {}: {e}", uds.display()))?,
+        LiveConn::Unix(
+            std::os::unix::net::UnixStream::connect(uds)
+                .map_err(|e| format!("connect unix {}: {e}", uds.display()))?,
         )
     } else {
-        Conn::Tcp(
-            TcpStream::connect(cfg.listen).map_err(|e| format!("connect {}: {e}", cfg.listen))?,
+        LiveConn::Tcp(
+            std::net::TcpStream::connect(cfg.listen)
+                .map_err(|e| format!("connect {}: {e}", cfg.listen))?,
         )
     };
 
@@ -447,7 +441,23 @@ pub fn drop_tenant_live(config: &Path, tenant_hex: &str, compact: bool) -> Resul
     if init_status != Status::Ok {
         return Err(format!("SessionInit failed: {init_status:?}"));
     }
+    Ok(stream)
+}
 
+/// Live offboard: connect to a running server and issue `AdminDropTenant`.
+/// Prefers `listen_unix` from the config when set; otherwise TCP `listen`.
+/// Requires `ZYDECODB_API_KEY` (admin role) in the environment.
+pub fn drop_tenant_live(config: &Path, tenant_hex: &str, compact: bool) -> Result<(), String> {
+    use std::io::Write;
+    use zydecodb_engine::errors::Status;
+    use zydecodb_engine::frame::{Command, RequestEnvelope};
+
+    let tenant = parse_tenant_hex(tenant_hex).map_err(|e| e.to_string())?;
+    let mut payload = Vec::with_capacity(17);
+    payload.extend_from_slice(&tenant);
+    payload.push(if compact { 1 } else { 0 });
+
+    let mut stream = live_admin_connect(config, "drop-tenant")?;
     let drop_req = RequestEnvelope::new(Command::AdminDropTenant, payload);
     stream
         .write_all(&drop_req.encode())
@@ -461,6 +471,28 @@ pub fn drop_tenant_live(config: &Path, tenant_hex: &str, compact: bool) -> Resul
         "live-dropped tenant {tenant_hex}{}",
         if compact { " (compact requested)" } else { "" }
     );
+    Ok(())
+}
+
+/// Live WAL seal: connect to a running server and issue `AdminSealWal`, then
+/// print the server's JSON outcome (`sealed`/`segment`/`seal_seq`/`shipped`).
+/// Platform backup jobs gate the snapshot on this returning `sealed:true`.
+pub fn seal_live(config: &Path) -> Result<(), String> {
+    use std::io::Write;
+    use zydecodb_engine::errors::Status;
+    use zydecodb_engine::frame::{Command, RequestEnvelope};
+
+    let mut stream = live_admin_connect(config, "seal")?;
+    let seal_req = RequestEnvelope::new(Command::AdminSealWal, Vec::new());
+    stream
+        .write_all(&seal_req.encode())
+        .map_err(|e| e.to_string())?;
+    let (seal_status, msg) = read_response_status(&mut stream)?;
+    if seal_status != Status::Ok {
+        return Err(format!("AdminSealWal failed: {seal_status:?} {msg}"));
+    }
+
+    println!("{msg}");
     Ok(())
 }
 

@@ -67,7 +67,7 @@ fn snapshot_restore_byte_and_query_equivalence() {
     }
     e.sync_wal().unwrap();
     e.force_flush().unwrap();
-    e.force_roll_wal_for_test().unwrap();
+    e.force_roll_wal().unwrap();
     let snapshot_seq = e.snapshot_to(&snap).unwrap();
     e.shutdown().unwrap();
     drop(e);
@@ -179,7 +179,7 @@ fn snapshot_under_write_load_restore_respects_watermark() {
     // Seal so post-snapshot writes that made it into sealed segments are shipped.
     {
         let mut e = eng.lock().unwrap();
-        let _ = e.force_roll_wal_for_test();
+        let _ = e.force_roll_wal();
         e.shutdown().unwrap();
     }
 
@@ -227,7 +227,7 @@ fn restore_timing_fixture_sizes() {
             e.sync_wal().unwrap();
             e.force_flush().unwrap();
         }
-        e.force_roll_wal_for_test().unwrap();
+        e.force_roll_wal().unwrap();
         e.snapshot_to(&snap).unwrap();
         e.shutdown().unwrap();
 

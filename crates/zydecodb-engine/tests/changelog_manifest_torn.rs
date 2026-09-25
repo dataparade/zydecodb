@@ -157,6 +157,11 @@ fn failed_persist_never_claims_segment_and_retry_repairs() {
 
 #[test]
 fn partial_tmp_never_opens_as_published_manifest() {
+    // Serializes with the failpoint-arming tests above: without the lock this
+    // test's persist_manifest can consume a sibling's armed failpoint (and be
+    // hit by it), flaking both.
+    let _g = fail_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _scenario = fail::FailScenario::setup();
     let dir = TempDir::new().unwrap();
     let cfg = archive_cfg(&dir);
     let db_id = [9u8; 16];

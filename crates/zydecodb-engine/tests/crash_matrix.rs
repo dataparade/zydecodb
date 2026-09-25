@@ -214,7 +214,7 @@ fn run_case_inner(failpoint: &str, mode: Mode, trigger: Trigger, with_ship_chang
                 }
             }
             Trigger::RollWal => {
-                if let Err(err) = e.force_roll_wal_for_test() {
+                if let Err(err) = e.force_roll_wal() {
                     outcome = Err(EngineError::Io(err.to_string()));
                 }
             }
@@ -548,7 +548,7 @@ crash_case!(
     Trigger::Compaction
 );
 
-// Segment roll via force_roll_wal_for_test (no 64MB write required).
+// Segment roll via force_roll_wal (no 64MB write required).
 crash_case!(
     wal_before_segment_roll_return,
     WAL_BEFORE_SEGMENT_ROLL,

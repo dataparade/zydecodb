@@ -6,6 +6,17 @@ here. Version numbers are unified across artifacts; see
 
 ## [Unreleased]
 
+- **New wire opcode `AdminSealWal` (0x43)** and matching CLI `zydecodb admin
+  seal --config <path>`: seal the active WAL segment on a live primary
+  (rotate + ship + archive) so a following snapshot/backup is current to the
+  returned `seal_seq`. Admin-gated, empty payload, JSON outcome; replicas
+  reject it. Sealing an empty segment is a no-op (`{"sealed":false}`).
+- **Durability fix (F5):** a clean shutdown no longer acknowledges a write
+  before that write is durable. The shutdown path fsyncs the WAL before
+  releasing durability waiters; a write covered by that final fsync gets its
+  honest `Ok`, and a write past it gets a retryable `EngineBusy` (`server
+  shutting down; write not acknowledged; retry`) instead of a false `Ok`.
+  Previously a waiter released by shutdown returned `Ok` without any fsync.
 - **Behavior change:** JSON floats that previously shifted 1 ULP on a
   server-side text roundtrip now round-trip exactly. ZDoc f64 fields were
   always stored bit-exact; the bug was in-process decode through JSON text
